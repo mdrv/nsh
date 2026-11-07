@@ -716,6 +716,9 @@ fn apply(
     if let Some(progress) = &diff.progress {
         launcher_progress(surface, *progress);
     }
+    if diff.screen_anchor.is_some() || diff.screen_margin.is_some() || diff.level.is_some() {
+        crate::layer::sync(window, full);
+    }
 }
 
 fn set_class(window: &gtk::Window, class: &str, on: bool) {

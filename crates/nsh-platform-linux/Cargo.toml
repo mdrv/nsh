@@ -53,6 +53,7 @@ nsh-core = { workspace = true, features = ["svg", "loader"] }
 nsh-engine = { workspace = true, features = ["net"] }
 nsh-base.workspace = true
 gtk4.workspace = true
+gtk4-layer-shell.workspace = true
 gstreamer.workspace = true
 gstreamer-app.workspace = true
 gstreamer-audio.workspace = true

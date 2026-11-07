@@ -36,6 +36,7 @@ mod image;
 mod input;
 mod key_focus;
 mod keymap;
+mod layer;
 mod links;
 mod menu_style;
 mod mount;

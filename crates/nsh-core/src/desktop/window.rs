@@ -45,6 +45,36 @@ pub enum WindowKind {
     Overlay,
 }
 
+/// Which screen edges a window is anchored to (TS `WindowAnchor`): on
+/// Wayland the window becomes a layer surface the compositor pins to the
+/// screen's edges, over every workspace. An edge pair of opposite sides
+/// stretches it, perpendicular sides pin it to a corner. Elsewhere, and
+/// without the compositor's layer shell, it is a hint the platform ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PropEnum)]
+pub enum WindowAnchor {
+    /// The compositor places it (the default).
+    #[default]
+    None,
+    /// A bar or widget docked at the top edge.
+    Top,
+    /// Docked at the bottom edge.
+    Bottom,
+    /// Docked at the left edge.
+    Left,
+    /// Docked at the right edge.
+    Right,
+    /// Pinned to the top left corner.
+    TopLeft,
+    /// Pinned to the top right corner.
+    TopRight,
+    /// Pinned to the bottom left corner.
+    BottomLeft,
+    /// Pinned to the bottom right corner.
+    BottomRight,
+    /// Stretched across the screen, anchored to all four edges.
+    All,
+}
+
 /// A window's mode (TS `WindowMode`). Minimized is apart from it: a
 /// maximized window that is minimized comes back maximized.
 #[derive(
@@ -485,6 +515,15 @@ attributes! {
     close_on_blur: bool = "closeOnBlur", plain;
     /// How high it floats.
     level: WindowLevel = "level", plain;
+    /// The screen edges it is anchored to (Wayland's layer shell; elsewhere
+    /// a hint): a window of the `overlay` kind becomes a surface the
+    /// compositor pins over every workspace, opposite anchored edges
+    /// stretch it, perpendicular ones pin it to a corner.
+    screen_anchor: Option<WindowAnchor> = "screenAnchor", nullable;
+    /// The gap (points) between it and the anchored edges: the width for
+    /// the horizontal ones, the height for the vertical ones. Needs
+    /// `screenAnchor`.
+    screen_margin: Option<Size<Points>> = "screenMargin", nullable;
     /// It shows in the taskbar.
     taskbar: bool = "taskbar", plain;
     /// The workspaces it shows on.
@@ -539,6 +578,8 @@ impl WindowAttributes {
             level: Some(WindowLevel::Normal),
             taskbar: Some(true),
             workspaces: Some(Workspaces::Current),
+            screen_anchor: Some(None),
+            screen_margin: Some(None),
             pointer_events: Some(WindowPointerEvents::Auto),
             transparent: Some(false),
             backdrop: Some(Backdrop::None),
