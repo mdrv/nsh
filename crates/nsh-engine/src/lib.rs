@@ -655,6 +655,19 @@ pub fn parse_capabilities(json: &str) -> Result<Capabilities, String> {
     Ok(capabilities)
 }
 
+/// The policy a Rust app declares (`nsh.json` `capabilities`); `None`
+/// without a declaration. Runners of Rust apps feed it the manifest they
+/// find where the app runs.
+pub fn policy_from_manifest(json: Option<&str>) -> Option<Policy> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(json?).expect("nsh.json is not valid JSON");
+    let capabilities = manifest.get("capabilities")?;
+    Some(Policy {
+        declared: Some(parse_capabilities(&capabilities.to_string()).ok()?),
+        ..Default::default()
+    })
+}
+
 impl Bundle {
     /// The declared capabilities from their JSON form, if any.
     pub fn with_capabilities_json(mut self, json: Option<&str>) -> Result<Self, String> {
@@ -982,6 +995,10 @@ pub struct EngineConfig {
     /// built-in backend, which every desktop backend has, embedded or
     /// standalone. The main window's commands always go to the platform.
     pub windows: Option<Arc<dyn nsh_core::desktop::WindowBackend>>,
+    /// What a Rust app declares (`nsh.json` `capabilities`, read where it
+    /// runs); JS apps carry theirs on the bundle. `None`: no declaration —
+    /// everything but overlays and capture protection.
+    pub policy: Option<Policy>,
 }
 
 /// Values of the environment an engine keeps whatever its platform reports
@@ -1109,6 +1126,7 @@ impl EngineConfig {
             speech: None,
             audio: None,
             windows: None,
+            policy: None,
         }
     }
 
@@ -1183,6 +1201,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("speech", &self.speech.is_some())
             .field("audio", &self.audio.is_some())
             .field("windows", &self.windows.is_some())
+            .field("policy", &self.policy.is_some())
             .finish()
     }
 }
@@ -1822,7 +1841,9 @@ impl<M: TextEngine + 'static> Driver<M> {
         let access = Arc::new(match &config.app {
             App::Js(bundle) => bundle.policy.access(),
             // Native code is trusted: it reaches what the platform allows.
-            App::Rust(_) => Policy::default().access(),
+            // A runner may narrow this to what the app declared
+            // (`nsh.json` `capabilities`).
+            App::Rust(_) => config.policy.clone().unwrap_or_default().access(),
         });
         let mut core = Core::new(text_engine.clone(), config.viewport);
         core.set_tree_order_tracking(sink.needs_tree_order());

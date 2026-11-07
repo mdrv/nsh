@@ -335,6 +335,10 @@ impl AppView {
             audio: None,
             // Windows of the app's own are this backend's (`crate::window`).
             windows: None,
+            // A Rust app declares capabilities like a bundled one would.
+            policy: nsh_engine::policy_from_manifest(
+                std::fs::read_to_string("nsh.json").ok().as_deref(),
+            ),
         };
         crate::image::set_asset_base(&self.surface, options.asset_base.clone());
         self.surface
