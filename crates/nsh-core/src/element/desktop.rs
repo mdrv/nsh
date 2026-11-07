@@ -83,6 +83,33 @@ pub fn set_menu_bar(mode: MenuBarMode) {
     super::desktop_command(DesktopCommand::SetMenuBar(mode));
 }
 
+/// Registers `keystroke` (`"ctrl+alt+b"`) system-wide: `on_press` runs
+/// whichever app has the keyboard. Through the desktop's global shortcuts
+/// (the portal on Linux/Wayland, the system elsewhere); a desktop may ask
+/// its user, and one that refuses drops the handler again. Registering a
+/// keystroke again replaces its handler. `false`: `keystroke` does not
+/// parse.
+pub fn global_shortcut(keystroke: &str, on_press: impl Fn() + 'static) -> bool {
+    let Ok(shortcut) = Shortcut::parse(keystroke, false) else {
+        return false;
+    };
+    let handler: MenuHandler = Rc::new(on_press);
+    let menus = super::ambient::view_menus();
+    let id = {
+        let mut menus = menus.borrow_mut();
+        if let Some((id, _, kept)) = menus.globals.iter_mut().find(|(_, s, _)| *s == shortcut) {
+            *kept = handler;
+            *id
+        } else {
+            let id = menus.next_id();
+            menus.globals.push((id, shortcut, handler));
+            id
+        }
+    };
+    super::desktop_command(DesktopCommand::RegisterGlobalShortcut { id, shortcut });
+    true
+}
+
 /// The current window's state (TS: `windowState()`):
 /// [`WindowHandle::state`] of [`current_window`].
 pub fn window_state() -> Option<WindowState> {

@@ -5783,6 +5783,19 @@ impl<M: TextEngine> Core<M> {
                 if item < crate::element::menus::FIRST_ID {
                     return false;
                 }
+                // The desktop's answer of a view's global shortcut: drop a
+                // refused one; its handler runs at each press, not here.
+                if let EventPayload::Map(entries) = payload
+                    && entries.iter().any(|(k, _)| *k == "registered")
+                {
+                    if !entries
+                        .iter()
+                        .any(|(k, v)| *k == "registered" && *v == crate::PayloadValue::Bool(true))
+                    {
+                        menus.borrow_mut().remove_global(item);
+                    }
+                    return true;
+                }
                 let handler = menus.borrow().handler(item);
                 // An item of a menu replaced since the platform showed it.
                 if let Some(handler) = handler {

@@ -32,6 +32,9 @@ pub(crate) struct ViewMenus {
     pub(crate) popup: Vec<(u32, MenuHandler)>,
     /// Counts the context menus shown, as `app_generation`.
     pub(crate) popup_generation: u64,
+    /// The app's global shortcuts (`global_shortcut`), by id. No menu owns
+    /// them: they survive replaced application and context menus.
+    pub(crate) globals: Vec<(u32, crate::desktop::Shortcut, MenuHandler)>,
     /// Settles the context menu shown, once the platform reports it closed.
     pub(crate) closed: Option<AnswerSlot<()>>,
 }
@@ -51,6 +54,18 @@ impl ViewMenus {
             .chain(&self.popup)
             .find(|(i, _)| *i == id)
             .map(|(_, h)| h.clone())
+            .or_else(|| {
+                self.globals
+                    .iter()
+                    .find(|(i, _, _)| *i == id)
+                    .map(|(_, _, h)| h.clone())
+            })
+    }
+
+    /// Drops the global shortcut registered as `id` (the desktop refused
+    /// it).
+    pub(crate) fn remove_global(&mut self, id: u32) {
+        self.globals.retain(|(i, _, _)| *i != id);
     }
 
     /// Settles the context menu shown, if there is one.
