@@ -103,6 +103,10 @@ pub(crate) struct AppConfig {
     /// Read and checked by the bundler.
     #[serde(default, rename = "theme")]
     _theme: Option<serde_json::Value>,
+    /// The `nsh/base` parts a Rust app serves (`nsh.json` `"baseParts"`);
+    /// the Rust runtimes' generator reads it (`rust_app::base_parts`).
+    #[serde(default, rename = "baseParts")]
+    _base_parts: Option<serde_json::Value>,
     /// Read and checked by the bundler.
     #[serde(default, rename = "resolve")]
     _resolve: Option<serde_json::Value>,

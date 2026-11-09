@@ -124,6 +124,11 @@ pub(crate) struct RustApp {
     /// Its crates ask for another version of nsh: they build from manifests
     /// in the workspace ([`write_retargeted`]), its own left as they are.
     retargeted: bool,
+    /// The `nsh/base` parts the app serves (`nsh.json` `"baseParts"`, a
+    /// Rust app's only): what no part registers is left out of its
+    /// runtimes' binaries. `None` serves every part, as
+    /// `nsh_base::registry` does.
+    base_parts: Option<Vec<String>>,
 }
 
 /// A crate of the app (`nsh.json` `"rust"`).
@@ -342,6 +347,28 @@ pub(crate) fn is_root(entry: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("nsh.json"))
 }
 
+/// The `nsh/base` parts of the app (`nsh.json` `"baseParts"`): their
+/// names, as `nsh_base::parts` names them; a part the app's code mounts
+/// that is not here fails at run time, one misnamed here fails the build.
+fn base_parts(config: &serde_json::Value) -> anyhow::Result<Option<Vec<String>>> {
+    const WHAT: &str = "nsh.json: \"baseParts\" is a non-empty list of the parts of nsh/base to serve (\"core\", \"text_view\"), as nsh_base::parts names them";
+    let Some(parts) = config.get("baseParts") else {
+        return Ok(None);
+    };
+    let Some(names) = parts.as_array() else {
+        bail!(WHAT);
+    };
+    let names: Vec<String> = names
+        .iter()
+        .map(|p| p.as_str().map(str::to_owned))
+        .collect::<Option<_>>()
+        .context(WHAT)?;
+    if names.is_empty() {
+        bail!(WHAT);
+    }
+    Ok(Some(names))
+}
+
 /// The `"rust"` crates of the app whose entry is `entry`, if it has any.
 pub(crate) fn of(entry: &Path) -> anyhow::Result<Option<RustApp>> {
     let entry = dunce::canonicalize(entry)
@@ -359,6 +386,7 @@ pub(crate) fn of(entry: &Path) -> anyhow::Result<Option<RustApp>> {
     let watched = watched(&crates, nsh.source());
     let workspace = dir.join(".nsh/rust");
     let retargeted = retargeted(&crates, &nsh)?;
+    let base_parts = base_parts(&config)?;
     let root = if is_root(&entry) {
         Some(root_config(dir, &config, &workspace)?)
     } else {
@@ -371,6 +399,7 @@ pub(crate) fn of(entry: &Path) -> anyhow::Result<Option<RustApp>> {
         watched,
         root,
         retargeted,
+        base_parts,
     };
     app.write_workspace()?;
     Ok(Some(app))
@@ -2292,9 +2321,28 @@ impl RustApp {
     /// The UI sets of the generated code: `nsh/base`, then the app's, one per
     /// crate ([`Self::app_sets`]).
     fn sets(&self) -> String {
-        let mut sets = vec!["nsh_base::registry()".to_owned()];
+        let mut sets = vec![self.base_set()];
         sets.extend(self.crates.iter().map(|c| format!("{}()", set_fn(c))));
         format!("vec![{}]", sets.join(", "))
+    }
+
+    /// The set expression of `nsh/base` the generated runtimes mount: every
+    /// part (`nsh_base::registry`), or those `nsh.json` `"baseParts"` lists
+    /// (a Rust app's only — an app of TSX keeps every part, as the page
+    /// loads the parts its chunks import by gate). What no part registers
+    /// is left out of the runtimes' binaries.
+    fn base_set(&self) -> String {
+        match (&self.base_parts, self.root.is_some()) {
+            (Some(parts), true) => format!(
+                "nsh_base::registry_of(vec![{}])",
+                parts
+                    .iter()
+                    .map(|p| format!("nsh_base::parts::{p} as nsh_base::parts::Part"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            _ => "nsh_base::registry()".to_owned(),
+        }
     }
 
     /// The web runtime's gates of the app's sets: one
