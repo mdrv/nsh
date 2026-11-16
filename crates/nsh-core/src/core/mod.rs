@@ -825,6 +825,7 @@ impl Node {
         let mut events = self.events;
         if !self.pan_enabled {
             events.set(EventKind::PanStart, false);
+            events.set(EventKind::PanMove, false);
             events.set(EventKind::PanEnd, false);
         }
         if self.overlay_watched != 0 {
@@ -11029,8 +11030,9 @@ fn directed_align(align: TextAlign, rtl: bool) -> TextAlign {
 /// The gestures and touches a view handles besides presses: one with a
 /// handler of them is something the user moves (a draggable ball), which a
 /// terminal keeps (`terminal_layout::Role::interactive`).
-const HANDLED: [EventKind; 7] = [
+const HANDLED: [EventKind; 8] = [
     EventKind::PanStart,
+    EventKind::PanMove,
     EventKind::PanEnd,
     EventKind::PinchStart,
     EventKind::PinchEnd,

@@ -814,6 +814,12 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     ),
     (EventKind::PanStart, on::ALL, "(e: PanEvent) => void", ""),
     (
+        EventKind::PanMove,
+        on::ALL,
+        "(e: PanEvent) => void",
+        "Between start and end; velocity is not tracked.",
+    ),
+    (
         EventKind::PanEnd,
         on::ALL,
         "(e: PanEvent) => void",

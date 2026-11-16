@@ -2200,10 +2200,17 @@ fn pan_start(surface: &Rc<Surface>, view: &NshView, p: &Pointer) {
 }
 
 fn pan_move(surface: &Rc<Surface>, view: &NshView, tx: f32, ty: f32) {
-    let id = view.state().id;
+    let (id, events) = {
+        let s = view.state();
+        (s.id, s.events)
+    };
     surface.anim.borrow_mut().pan_moved(id, tx, ty);
     surface.write_animations();
     surface.ensure_ticking();
+    if events.contains(EventKind::PanMove) {
+        let payload = pan_payload(surface, id, (tx, ty), (0.0, 0.0));
+        surface.event(id, EventKind::PanMove, payload);
+    }
 }
 
 /// Reports the end of a pan (`write`: the values may be written now; not

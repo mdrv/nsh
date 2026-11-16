@@ -184,6 +184,7 @@ events! {
     LongPress = "onLongPress": "A press held for about half a second (payload as `Press`).",
     PanStart = "onPanStart": "A drag started (payload: [`EventPayload::Pan`]).",
     PanEnd = "onPanEnd": "A drag ended (payload: [`EventPayload::Pan`] with velocity).",
+    PanMove = "onPanMove": "A drag moved, between start and end (payload: [`EventPayload::Pan`]; velocity is not tracked: apps derive it from consecutive translations).",
     Refresh = "onRefresh": "Pull-to-refresh was triggered on a scroll or list.",
     LoadMore = "onLoadMore": "A list was scrolled close to its end.",
     ScrollEnd = "onScrollEnd": "Scrolling came to rest (payload: [`EventPayload::Scroll`]).",

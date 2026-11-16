@@ -1937,6 +1937,16 @@ pub trait Interactive: Element {
         )
     }
 
+    /// The drag moved, between start and end: the translation so far at
+    /// each move of the pointer. The platform does not track the velocity
+    /// here; `on_pan_end` carries it for a `decay`.
+    fn on_pan_move<M>(self, listener: impl IntoListener<PanEvent, M>) -> Self {
+        self.on(
+            EventKind::PanMove,
+            events::typed(listener.into_listener(), events::pan),
+        )
+    }
+
     /// The drag ended, with its velocity.
     fn on_pan_end<M>(self, listener: impl IntoListener<PanEvent, M>) -> Self {
         self.on(

@@ -125,6 +125,7 @@ impl Candidate {
         let pans = values.pan_x.is_some()
             || values.pan_y.is_some()
             || events.contains(EventKind::PanStart)
+            || events.contains(EventKind::PanMove)
             || events.contains(EventKind::PanEnd);
         pans.then(|| {
             let (x, y) = match (values.pan_x.is_some(), values.pan_y.is_some()) {
