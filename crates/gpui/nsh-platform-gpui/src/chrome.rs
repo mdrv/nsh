@@ -80,8 +80,8 @@ pub(crate) fn close_menu(surface: &Surface) -> Result<(), String> {
 use nsh_core::{
     EventKind, EventPayload, PayloadValue, ROOT_ID,
     desktop::{
-        CloseReason, DesktopCommand, Key, MenuBarMode, MenuItem, MenuRole, Shortcut, TitleBarStyle,
-        WindowAttributes,
+        CloseReason, DesktopCommand, Key, MenuBarMode, MenuItem, MenuLabels, MenuRole, Shortcut,
+        TitleBarStyle, WindowAttributes, WindowMode,
     },
     geometry::{Edges as Insets, Points},
 };
@@ -204,6 +204,10 @@ pub(crate) struct Chrome {
     standalone: Cell<bool>,
     /// Activation must work even while the window is not rendering.
     window: Cell<Option<AnyWindowHandle>>,
+    /// The mode the window opens in, while it waits hidden since it opened
+    /// (nsh.json `window.defaultVisible: false`): it takes it as it first
+    /// shows, as GPUI would show it to apply it ([`crate::open_app_window`]).
+    pub(crate) opening_mode: Cell<Option<WindowMode>>,
     style: Cell<TitleBarStyle>,
     /// The app's title bar's height (`titleBar.height`).
     height: Cell<Option<f32>>,
@@ -215,6 +219,12 @@ pub(crate) struct Chrome {
     title: RefCell<String>,
     /// The application menu.
     menu: RefCell<Option<Arc<[MenuItem]>>>,
+    /// The labels of the menus NSH builds, in the app's language
+    /// (`SetMenuLabels`).
+    labels: RefCell<MenuLabels>,
+    /// The app's name, which menu labels write where they have `%{app}`
+    /// (the options' title, as the AppKit backend's `app_name`).
+    app_name: RefCell<String>,
     /// The native menus (macOS) must be set again.
     menu_changed: Cell<bool>,
     /// What the native menus' items do, by [`MenuCommand::index`].
@@ -248,6 +258,23 @@ pub(crate) struct Chrome {
     drag: Cell<Option<(f32, f32)>>,
     /// Asked instead of quitting or closing, when set.
     pub(crate) on_close: RefCell<Option<CloseHandler>>,
+}
+
+/// The app's name for menu labels (`AppOptions::title`).
+pub(crate) fn set_app_name(surface: &Surface, name: &str) {
+    *surface.chrome.app_name.borrow_mut() = name.to_owned();
+}
+
+/// The text of a text field's Delete menu item: the core's translation
+/// for the app's language, else English.
+pub(crate) fn delete_label(surface: &Surface) -> String {
+    surface
+        .chrome
+        .labels
+        .borrow()
+        .delete
+        .clone()
+        .unwrap_or_else(|| "Delete".to_owned())
 }
 
 /// The surface fills a window of its own titled `title`: the window's
@@ -363,7 +390,12 @@ fn push(surface: &Surface, op: Op) {
 pub(crate) fn command(surface: &Rc<Surface>, command: &DesktopCommand) {
     let c = &surface.chrome;
     // The embedding app owns its window: only context menus work there.
-    if !c.standalone.get() && !matches!(command, DesktopCommand::PopupMenu { .. }) {
+    if !c.standalone.get()
+        && !matches!(
+            command,
+            DesktopCommand::PopupMenu { .. } | DesktopCommand::SetMenuLabels(_)
+        )
+    {
         return;
     }
     match command {
@@ -379,6 +411,11 @@ pub(crate) fn command(surface: &Rc<Surface>, command: &DesktopCommand) {
             *c.menu.borrow_mut() = menu.clone();
             c.menu_changed.set(true);
             menus::menu_changed(surface);
+            surface.invalidate();
+        }
+        DesktopCommand::SetMenuLabels(labels) => {
+            c.labels.replace((**labels).clone());
+            c.menu_changed.set(true);
             surface.invalidate();
         }
         DesktopCommand::SetMenuBar(mode) => {
@@ -883,6 +920,7 @@ pub(crate) fn own_window_parts(
     height: Option<f32>,
     resizable: bool,
     window: &Window,
+    cx: &gpui::App,
 ) -> Vec<AnyElement> {
     let client = PLATFORM == Platform::Linux
         && matches!(
@@ -903,7 +941,7 @@ pub(crate) fn own_window_parts(
                 surface,
                 Some(root),
                 window.is_maximized(),
-                window.is_window_active(),
+                crate::window::is_active(window, cx),
                 height,
                 &theme,
             ))
@@ -923,7 +961,7 @@ fn observe(surface: &Rc<Surface>, window: &Window, cx: &App) {
         menus::close(surface);
     }
     c.maximized.set(window.is_maximized());
-    c.active.set(window.is_window_active());
+    c.active.set(crate::window::is_active(window, cx));
     c.client_decorated.set(matches!(
         window.window_decorations(),
         gpui::Decorations::Client { .. }
@@ -1063,6 +1101,14 @@ pub(crate) fn drag_area(surface: &Rc<Surface>, root: Option<nsh_core::NodeId>) -
                 if phase != DispatchPhase::Bubble || !h.is_hovered(window) {
                     return;
                 }
+                // Windows moves the window itself from the press it hit
+                // tests as `HTCAPTION`: the platform hands the press to the
+                // app before `DefWindowProc` sees it, so consuming it keeps
+                // the window from moving at all (`start_window_move` does
+                // nothing on Windows).
+                if PLATFORM == Platform::Windows {
+                    return;
+                }
                 let _in = crate::window::enter(&surface, root);
                 let (ox, oy) = surface.origin.get();
                 let (x, y) = (f32::from(e.position.x), f32::from(e.position.y));
@@ -1160,6 +1206,14 @@ fn title_row(surface: &Rc<Surface>, theme: &Theme) -> AnyElement {
         .border_b_1()
         .border_color(theme.bar_border)
         .on_mouse_down(MouseButton::Left, move |e, window, cx| {
+            // Windows moves the window itself for a press on the caption
+            // (its hit test answers `HTCAPTION`, which also maximizes on a
+            // double click and opens the window menu): a press the app
+            // consumes never reaches `DefWindowProc`, so the window would
+            // not move, and `Window::start_window_move` does nothing there.
+            if PLATFORM == Platform::Windows {
+                return;
+            }
             title_press(&s, e, window);
             cx.stop_propagation();
         });
@@ -1452,6 +1506,8 @@ fn default_mac_menu(title: &str) -> Arc<[MenuItem]> {
             role: Some(role),
             when: nsh_core::keymap::When::Always,
             icon: None,
+            symbol: None,
+            destructive: false,
         })
     };
     let submenu = |label: &str, items: Vec<MenuItem>| MenuItem::Submenu {
@@ -1459,6 +1515,8 @@ fn default_mac_menu(title: &str) -> Arc<[MenuItem]> {
         enabled: true,
         items,
         icon: None,
+        symbol: None,
+        inline: false,
     };
     vec![
         submenu(
@@ -1570,7 +1628,7 @@ fn native_items(
                         .unwrap(),
                     );
                 }
-                gpui::MenuItem::action(menus::label(a), action)
+                gpui::MenuItem::action(menus::label_of(a, surface), action)
                     .checked(a.checked == Some(true))
                     .disabled(!a.enabled)
             }

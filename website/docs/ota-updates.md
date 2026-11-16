@@ -166,7 +166,7 @@ jobs:
       # The nsh the apps in the field were built with, such as v0.5.0 (a repository variable); empty: the latest.
       NSH_VERSION: ${{ vars.NSH_VERSION }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install nsh
         run: |
@@ -274,13 +274,18 @@ export function UpdateBanner() {
 `restartToPackage()` restarts the app as `Application.restart()` does: this run quits as when the user quits it, and
 the app starts again into the package. A user who does not restart gets the package the next time they open the app.
 
-`runningPackage()` says what this run's code is, for an About screen or error reports:
+`runningPackage()` says what this run's code is, and `shellInfo()` what runs it: the installed app's own version and
+build and its NSH runtime. Both are for an About screen or error reports:
 
 ```tsx
-import { runningPackage } from "nsh/updater";
+import { runningPackage, shellInfo } from "nsh/updater";
 
 const running = runningPackage(); // { version, build }, or null for the code the app was built with
+const shell = shellInfo(); // { version, build, nshVersion, packages }: the installed app
 ```
+
+An app installed before it took packages (or built with a runtime without them) never gets one: `packages` is false
+there, or `shellInfo` itself is missing on runtimes older than it, and only installing the whole app again helps.
 
 [nsh/updater](../modules/nsh-updater.md#ota-updates) has every function and its errors.
 
@@ -368,8 +373,10 @@ Nothing is left behind, and the app keeps running what it ran.
 
 ### A package does not run at the next start
 
-The launcher logs why, in the terminal or the platform's log (Console or the unified log on Apple platforms,
-`adb logcat` on Android):
+The launcher logs why, in the terminal or the platform's log: the unified log on macOS and iOS, under the app's id
+(Console, `log stream --predicate 'subsystem == "com.example.notes"'`;
+[A packaged app's logs](./dev-server-and-debugging.md#a-packaged-apps-logs)), `adb logcat` on Android. The first
+three lines below are warnings, logged on every platform; the last one is an info line, logged on Android:
 
 ```text
 updates: downloaded package refused: …

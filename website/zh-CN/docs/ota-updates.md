@@ -138,7 +138,7 @@ jobs:
       # 构建线上应用所用的 nsh，例如 v0.5.0（仓库变量）；为空时用最新版
       NSH_VERSION: ${{ vars.NSH_VERSION }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install nsh
         run: |
@@ -243,13 +243,16 @@ export function UpdateBanner() {
 
 `restartToPackage()` 像 `Application.restart()` 一样重启应用：本次运行像用户退出时那样结束，应用再次启动并进入新包。用户不重启的话，下次打开应用时就会运行新包。
 
-`runningPackage()` 说明本次运行的是哪份代码，可用于“关于”页面或错误报告：
+`runningPackage()` 说明本次运行的是哪份代码，`shellInfo()` 说明由什么来运行它：已安装应用自己的版本、构建号和 NSH 运行时。两者都可用于“关于”页面或错误报告：
 
 ```tsx
-import { runningPackage } from "nsh/updater";
+import { runningPackage, shellInfo } from "nsh/updater";
 
 const running = runningPackage(); // { version, build }；运行应用构建时自带的代码时为 null
+const shell = shellInfo(); // { version, build, nshVersion, packages }：已安装的应用
 ```
+
+在支持包之前安装的应用（或用不支持包的运行时构建的应用）永远收不到包：这时 `packages` 为 false；比 `shellInfo` 更早的运行时连这个函数都没有。只有重新安装完整应用才能解决。
 
 所有函数及其错误见 [nsh/updater](../modules/nsh-updater.md#ota-更新)。
 
@@ -324,7 +327,9 @@ const running = runningPackage(); // { version, build }；运行应用构建时�
 
 ### 下次启动时包没有运行
 
-启动器会在终端或平台日志中记录原因（Apple 平台上是“控制台”或统一日志，Android 上是 `adb logcat`）：
+启动器会在终端或平台日志中记录原因：macOS 和 iOS 上是统一日志，以应用的 id 为子系统（“控制台”应用，或
+`log stream --predicate 'subsystem == "com.example.notes"'`；参见[打包应用的日志](./dev-server-and-debugging.md#a-packaged-apps-logs)），
+Android 上是 `adb logcat`。下面前三行是警告，每个平台都会记录；最后一行是 info 日志，在 Android 上记录：
 
 ```text
 updates: downloaded package refused: …

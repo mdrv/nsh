@@ -222,10 +222,12 @@ pub fn motion_spec<I: HostInput>(input: &I) -> Option<MotionSpec> {
     }
     let mut spec = MotionSpec::new(keyframe_timing(input));
     let frames = input.field("keyframes")?;
-    if frames.as_list().is_some() {
+    if let Some(list) = frames.as_list() {
         // Frames of channels: each channel's keyframes are the frames that
-        // name it, with the frame's offset and easing.
-        let items = frames.items();
+        // name it, with the frame's offset and easing. The list is taken
+        // once: reading it again could see another length, or count its
+        // items against a budget twice.
+        let items: Vec<_> = (0..list.len()).filter_map(|i| list.item(i)).collect();
         let count = items.len();
         for channel in MotionChannel::ALL {
             let mut track = Vec::new();
@@ -287,11 +289,16 @@ type MakeLayoutCurve = fn(f32) -> LayoutCurve;
 /// the default.
 const LAYOUT_TYPES: &[(&str, MakeLayoutCurve)] = &[
     ("easeInEaseOut", |_| LayoutCurve::EaseInEaseOut),
-    ("spring", |damping| LayoutCurve::Spring { damping }),
+    ("spring", |damping_ratio| LayoutCurve::FittedSpring {
+        damping_ratio,
+    }),
     ("linear", |_| LayoutCurve::Linear),
     ("easeIn", |_| LayoutCurve::EaseIn),
     ("easeOut", |_| LayoutCurve::EaseOut),
     ("keyboard", |_| LayoutCurve::Keyboard),
+    // Its control points are the phase's `bezier`; without them it eases
+    // in and out.
+    ("bezier", |_| LayoutCurve::EaseInEaseOut),
 ];
 
 /// What appearing and disappearing views animate (`property`), by name
@@ -322,7 +329,17 @@ fn transition<I: HostInput>(part: &I, duration: f32, cx: &mut HostCx) -> LayoutT
     let damping = field::<f32, _>(part, "springDamping", cx)
         .unwrap_or(SPRING_DAMPING)
         .clamp(0.01, 1.0);
-    let curve = LAYOUT_TYPES[named("type", &mut LAYOUT_TYPES.iter().map(|t| t.0))].1(damping);
+    let kind = LAYOUT_TYPES[named("type", &mut LAYOUT_TYPES.iter().map(|t| t.0))].0;
+    let curve = match part.field("bezier").and_then(|b| b.as_list()) {
+        Some(list) if kind == "bezier" && list.len() == 4 => {
+            let p = |i| list.item(i).and_then(|v| v.as_number()).unwrap_or(0.0) as f32;
+            LayoutCurve::bezier(p(0), p(1), p(2), p(3))
+        }
+        _ => LAYOUT_TYPES
+            .iter()
+            .find(|t| t.0 == kind)
+            .map_or(LayoutCurve::EaseInEaseOut, |t| t.1(damping)),
+    };
     let property =
         LAYOUT_PROPERTIES[named("property", &mut LAYOUT_PROPERTIES.iter().map(|p| p.0))].1;
     LayoutTransition {
@@ -378,7 +395,10 @@ impl HostValue for LayoutAnimation {
                  type?: {curve};\n  /** What appearing and disappearing views animate. */\n  \
                  property?: {property};\n  /** Milliseconds (the config's by default). */\n  \
                  duration?: number;\n  delay?: number;\n  /** The `spring`'s damping ratio, 0..1 \
-                 ({SPRING_DAMPING} by default; 1 does not overshoot). */\n  springDamping?: number;\n}}"
+                 ({SPRING_DAMPING} by default; 1 does not overshoot). */\n  springDamping?: number;\n  \
+                 /** The `bezier`'s control points `[x1, y1, x2, y2]`, as CSS `cubic-bezier()` \
+                 (each `x` clamped to 0..1); without them it eases in and out. */\n  \
+                 bezier?: [number, number, number, number];\n}}"
             )
         });
         types.declare("LayoutAnimationConfig", |_| {
@@ -576,13 +596,20 @@ fn easing_json(e: Easing) -> crate::JsonValue {
 pub fn tables() -> crate::JsonValue {
     use serde_json::{Map, Value, json};
     let transition = |t: &LayoutTransition| {
+        let mut bezier = None;
         let (kind, damping) = match t.curve {
             LayoutCurve::Linear => ("linear", None),
             LayoutCurve::EaseIn => ("easeIn", None),
             LayoutCurve::EaseOut => ("easeOut", None),
             LayoutCurve::EaseInEaseOut => ("easeInEaseOut", None),
-            LayoutCurve::Spring { damping } => ("spring", Some(damping)),
+            LayoutCurve::FittedSpring { damping_ratio } => ("spring", Some(damping_ratio)),
             LayoutCurve::Keyboard => ("keyboard", None),
+            // JS names no spring by its physics, and no preset is one.
+            LayoutCurve::Spring(_) => ("spring", None),
+            LayoutCurve::Bezier(points) => {
+                bezier = Some(points);
+                ("bezier", None)
+            }
         };
         let property = match t.property {
             LayoutProperty::Opacity => "opacity",
@@ -596,6 +623,9 @@ pub fn tables() -> crate::JsonValue {
         });
         if let Some(d) = damping {
             o["springDamping"] = json!(d);
+        }
+        if let Some(points) = bezier {
+            o["bezier"] = json!(points);
         }
         o
     };

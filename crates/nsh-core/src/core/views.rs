@@ -9,8 +9,10 @@
 //! field), so a change sends only what changed.
 //! A region ([`crate::element::dynamic`], `If`, `Each`) is an effect queueing its
 //! new elements; the core reconciles that region's nodes alone, in place
-//! among its parent's other children. Patches and the events components emit
-//! are taken at the start of each commit round, until none is left.
+//! among its parent's other children. Reused nodes are diffed against the
+//! latest values their bindings applied, including when replaced by static
+//! elements. Patches and the events components emit are taken at the start
+//! of each commit round, until none is left.
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -75,13 +77,22 @@ pub(super) enum Patch {
 /// The queue the bindings of views push to.
 pub(super) type Patches = Rc<RefCell<Vec<Patch>>>;
 
+/// Deterministic work counts for the dependency's reconciliation probes.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct CleanupWork {
+    pub(super) regions: usize,
+    pub(super) scans: usize,
+    pub(super) entries: usize,
+}
+
 /// What was last applied to a node with bindings.
 pub(super) struct BoundNode {
     pub(super) attrs: Attrs,
     pub(super) style: StyleRefinement,
     pub(super) classes: Classes,
     /// Its text's content and raw text node.
-    text: Option<(SharedString, NodeId)>,
+    pub(super) text: Option<(SharedString, NodeId)>,
 }
 
 /// A region of a parent's children.
@@ -248,12 +259,12 @@ impl<M: TextEngine> Core<M> {
     ) {
         inst.bound.insert(
             id,
-            BoundNode {
+            Box::new(BoundNode {
                 attrs: attrs.clone(),
                 style: style.clone(),
                 classes,
                 text,
-            },
+            }),
         );
     }
 
@@ -456,6 +467,9 @@ impl<M: TextEngine> Core<M> {
     /// Applies what the views' bindings queued and routes the events their
     /// components emitted, until nothing is left. Whether anything was.
     pub(super) fn drain_views(&mut self) -> bool {
+        // `render_dirty` can release static children of recycled cells
+        // between drain rounds, without reconciling a region at all.
+        self.forget_released_hosts();
         let mut any = false;
         loop {
             // The insets components read, as their screens have them now.
@@ -475,10 +489,25 @@ impl<M: TextEngine> Core<M> {
             for patch in patches {
                 self.apply_patch(patch);
             }
+            // No event or next round of bindings can observe the released
+            // records. Clean each affected host once, after all regions in
+            // this batch have reconciled and put their instances back.
+            self.forget_released_hosts();
         }
     }
 
     fn apply_patch(&mut self, patch: Patch) {
+        // A preceding region in this batch may have released the node.
+        // Keep its already queued bindings from changing a former slot's
+        // JS node while host cleanup waits for this batch's boundary.
+        if let Patch::Text { host, id, .. }
+        | Patch::Attrs { host, id, .. }
+        | Patch::Style { host, id, .. } = &patch
+            && self.components.released_hosts.contains(host)
+            && !self.keeps_view_node(*host, *id)
+        {
+            return;
+        }
         match patch {
             Patch::Region { region, elements } => self.reconcile_region(region, elements),
             Patch::Rows { list, count, keys } => self.set_list_rows(list, count, keys),
@@ -641,8 +670,18 @@ impl<M: TextEngine> Core<M> {
             .filter(RegionElement::applies)
             .map(|e| (e.owner, e.element.0))
             .collect();
+        let before = self.components.release_generation;
         let (out, placeholder) = self.match_children(parent, state.children, new, host, &mut inst);
-        self.forget_released(host, &mut inst);
+        #[cfg(test)]
+        {
+            self.components.cleanup_work.regions += 1;
+        }
+        // Initial population, keyed retention and reordering release
+        // nothing. In particular, do not scan the growing host-wide maps
+        // once for every region a large view initially populates.
+        if self.components.release_generation != before {
+            self.components.released_hosts.insert(host);
+        }
         // The JS children's place went with what the region released.
         let gone = match inst.children_at {
             Placement::At(at, _) => at != host && !self.components.owners.contains_key(&at),
@@ -706,6 +745,29 @@ impl<M: TextEngine> Core<M> {
         // (Resolved with the host's instance back: a region after this one
         // may hold its JS children.)
         let mut before = self.anchor_node(state.anchor);
+        // Already contiguous before the anchor: every precedes check below
+        // would succeed, so no child needs to move.
+        if !nested
+            && self.key(parent).is_ok_and(|key| {
+                let children = &self.nodes[key as usize].children;
+                let end = match before {
+                    Some(id) => children
+                        .iter()
+                        .position(|&child| self.nodes[child as usize].id == id),
+                    None => Some(children.len()),
+                };
+                end.is_some_and(|end| {
+                    end.checked_sub(nodes.len()).is_some_and(|start| {
+                        children[start..end]
+                            .iter()
+                            .zip(&nodes)
+                            .all(|(&child, &id)| self.nodes[child as usize].id == id)
+                    })
+                })
+            })
+        {
+            return;
+        }
         for &child in nodes.iter().rev() {
             if nested {
                 if !self.nested_precedes(parent, child, before) {
@@ -732,16 +794,36 @@ impl<M: TextEngine> Core<M> {
 
     /// Forgets what `host`'s view knew of the nodes released since: their
     /// handlers, responders and bindings.
-    fn forget_released(&self, host: NodeId, inst: &mut Instance) {
+    fn forget_released_hosts(&mut self) {
+        let hosts: Vec<_> = self.components.released_hosts.drain().collect();
+        for host in hosts {
+            if let Some(mut inst) = self.components.instances.remove(&host) {
+                self.forget_released(host, &mut inst);
+                self.components.instances.insert(host, inst);
+            }
+        }
+    }
+
+    fn keeps_view_node(&self, host: NodeId, id: NodeId) -> bool {
+        id == host
+            || self.components.owners.contains_key(&id)
+            || self.components.slot_hosts.get(&id) == Some(&host)
+            || self.adopted_host(id) == Some(host)
+    }
+
+    fn forget_released(&mut self, host: NodeId, inst: &mut Instance) {
+        #[cfg(test)]
+        {
+            self.components.cleanup_work.scans += 1;
+            self.components.cleanup_work.entries += inst.handlers.len()
+                + inst.event_handlers.len()
+                + inst.responders.len()
+                + inst.bound.len();
+        }
         // The app's slot nodes are JS's, not the view's: they keep what the
         // view gave them while they are its slots (and so do the app's
         // elements in them that take the slots' props).
-        let live = |id: &NodeId| {
-            *id == host
-                || self.components.owners.contains_key(id)
-                || self.components.slot_hosts.get(id) == Some(&host)
-                || self.adopted_host(*id) == Some(host)
-        };
+        let live = |id: &NodeId| self.keeps_view_node(host, *id);
         inst.handlers.retain(|(id, _, _)| live(id));
         inst.event_handlers.retain(|(id, _)| live(id));
         inst.responders.retain(|(id, _)| live(id));

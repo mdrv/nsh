@@ -198,6 +198,9 @@ export interface Finish {
  * shadow. `hover` and `pressed` are a raised control's states, `fill` a
  * slider's or a meter's run of the accent; `knob` a switch's knob on its
  * sunk track, `knobOn` the white one with an olive edge on the citrus.
+ * `thumb` is a segmented control's or a tab strip's selected segment on
+ * its sunk track: the raised fill dark; white with a soft drop light, where
+ * the raised fill is all but the track's color.
  * `on` is what stays on (a toggle, a chosen tool, a selected button): a
  * fill that stands off every surface it sits on, and off a raised control
  * at rest, further than a hover does, so on and off read apart at a
@@ -207,7 +210,7 @@ export interface Finish {
  * menu's separator cut into the surface.
  */
 export const finish = themed<
-  Record<"card" | "inset" | "field" | "raised" | "hover" | "pressed" | "light" | "accent" | "track" | "fill" | "knob" | "knobOn" | "pill" | "on" | "chip" | "glass" | "menu" | "groove", Finish>
+  Record<"card" | "inset" | "field" | "raised" | "hover" | "pressed" | "light" | "accent" | "track" | "fill" | "knob" | "knobOn" | "pill" | "thumb" | "on" | "chip" | "glass" | "menu" | "groove", Finish>
 >(finishes.dark, finishes.light);
 
 export type Tone = "neutral" | "accent" | "info" | "warn" | "danger" | "up" | "down";
@@ -216,6 +219,12 @@ export type Tone = "neutral" | "accent" | "info" | "warn" | "danger" | "up" | "d
 export const toneColor = (tone: Tone) => (tone === "neutral" ? colors.muted : colors[tone]);
 /** The tint of a tone. */
 export const toneTint = (tone: Tone) => (tone === "neutral" ? colors.raised : tints[tone]);
+
+/** A tone's tint as `toneTint` shows it on `base` (default the card), but
+ * opaque: for what overlaps, such as stacked avatars, where a translucent
+ * tint would let what is under it show through. */
+export const solidTint = (tone: Tone, base: string = colors.surface) =>
+  tone === "neutral" ? colors.raised : `color-mix(in srgb, ${toneColor(tone)} ${isDark() ? 16 : 10}%, ${base})`;
 
 /** The monospaced family, for code (API names, identifiers). Figures use
  * the system font with tabular numbers instead. */
@@ -293,9 +302,9 @@ export const hovered = (): ViewStyle => ({ backgroundColor: alpha(colors.text, 0
 export const ghostFill = () => (terminal ? token("secondary") : "transparent");
 
 /**
- * The keyboard focus (`focusStyle`): the edge turns the theme's muted olive
- * `ring` and a 3-point halo of it lies around the view (`offset` moves the
- * halo out from the edge).
+ * The keyboard focus (`focusVisibleStyle`: not after a click or a tap): the
+ * edge turns the theme's muted olive `ring` and a 3-point halo of it lies
+ * around the view (`offset` moves the halo out from the edge).
  */
 export const focusRing = (offset = 0): ViewStyle => ({
   borderColor: token("ring"),

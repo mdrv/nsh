@@ -64,13 +64,13 @@ mount(App);
 
 ### 属性
 
-在 Rust 中，每个属性是一个蛇形命名的构建方法（`injected_java_script`、`java_script_enabled`、`scrollable`、`user_agent`、`incognito`；`injectedJavaScriptBeforeContentLoaded` 对应 `injected_java_script_before_content`，iOS 的 `allowsBackForwardNavigationGestures` 对应 `back_forward_gestures`），每个事件是一个 `on_…` 方法（`on_navigation_state_change`），其监听函数收到 `WebNavigation`（`url`、`title`、`loading`、`can_go_back`、`can_go_forward`），`on_error` 和 `on_message` 收到 `&str`。
+在 Rust 中，每个属性是一个蛇形命名的构建方法（`injected_java_script`、`java_script_enabled`、`scrollable`、`user_agent`、`incognito`；`injectedJavaScriptBeforeContentLoaded` 对应 `injected_java_script_before_content`，iOS 的 `allowsBackForwardNavigationGestures` 对应 `back_forward_gestures`），每个事件是一个 `on_…` 方法（`on_navigation_state_change`），其监听函数收到 `WebNavigation`（`url`、`title`、`loading`、`can_go_back`、`can_go_forward`），`on_error` 和 `on_message` 收到 `&str`。Rust 还可以用 `url_scheme` 向页面提供应用自己的资源（[见下文](#应用提供的资源)）。
 
 | 属性 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `src` | `string` | | 要显示的页面的 URL。 |
 | `html` | `string` | | 内联 HTML，代替 `src` 显示。 |
-| `baseUrl` | `string` | | `html` 中相对 URL 的解析基准。 |
+| `baseUrl` | `string` | | `html` 中相对 URL 的解析基准。它需要与该地址的页面相同的授权（`webview.hosts`）；未授权时 HTML 不带基准 URL 加载，`onError` 报告 `ERR_ACCESS_DENIED`。 |
 | `injectedJavaScript` | `string` | | 每个页面加载完成后运行。 |
 | `injectedJavaScriptBeforeContentLoaded` | `string` | | 在每个页面自己的脚本之前运行。 |
 | `javaScriptEnabled` | `boolean` | `true` | 页面可以运行脚本。 |
@@ -86,7 +86,7 @@ mount(App);
 |---|---|---|
 | `onLoadStart` | `WebViewNavigation` | 页面开始加载。 |
 | `onLoad` | `WebViewNavigation` | 页面加载完成。 |
-| `onError` | `{ message }` | 加载失败。 |
+| `onError` | `{ message, code? }` | 加载失败、平台无法显示网页视图（`code` 为 `"ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"`），或页面的进程结束（`code` 为 `"ERR_NSH_WEBVIEW_TERMINATED"`）；均见下文。 |
 | `onNavigationStateChange` | `WebViewNavigation` | URL、标题、加载状态或历史改变。 |
 | `onMessage` | `{ data: string }` | 页面发来消息（见下文）。 |
 
@@ -180,7 +180,7 @@ mount(Browser);
 
 ### 页面与应用之间的消息
 
-页面通过 `window.nsh.postMessage(string)` 向应用发消息，应用收到 `on_message`（`onMessage`）。应用通过 ref 的 `post_message`（`postMessage(string)`）向页面发消息，页面在 `window` 上收到 `message` 事件。消息是字符串；结构化数据请发送 JSON。
+页面通过 `window.nsh.postMessage(string)` 向应用发消息，应用收到 `on_message`（`onMessage`）。应用通过 ref 的 `post_message`（`postMessage(string)`）向页面发消息，页面在 `window` 上收到 `message` 事件。消息是字符串；结构化数据请发送 JSON。收到的消息要当作不可信的数据，检查后再处理：页面运行的任何脚本都能发消息，而在 Android 上，页面的每个 frame（包括 `iframe`）都有 `window.nsh`。
 
 ```rust tabs
 use nsh_core::prelude::*;
@@ -282,6 +282,40 @@ web_view("https://example.com")
   onMessage={(e) => console.log("title", e.data)}
 />
 ```
+
+### 应用提供的资源
+
+页面可以从应用自己的 URL scheme 加载应用持有的字节（内存或磁盘中的图片、邮件的附件）。`url_scheme` 指定 scheme
+和应答其请求的 Rust 函数；页面像引用其他 URL 一样引用它的 URL（`<img src="app-image:42">`、
+`fetch("app-image:42")`），网页引擎像加载任何子资源一样加载它们：字节原样传给页面，不经过页面的脚本。几十 MB
+的图片也能以读文件的速度加载。
+
+```rust
+use nsh_core::{
+    prelude::*,
+    web_resource::{WebResource, WebResourceRequest},
+};
+
+fn serve(request: WebResourceRequest) {
+    // 在主线程上调用：把耗时的工作交给线程，并在那里应答。
+    std::thread::spawn(move || match std::fs::read(path_for(request.url())) {
+        Ok(bytes) if !request.is_cancelled() => request.respond(WebResource::new("image/png", bytes)),
+        _ => request.fail(),
+    });
+}
+
+web_view_html(html, None).url_scheme("app-image", serve).flex_1()
+```
+
+处理函数在平台的主线程上运行，因此应立即返回；请求只应答一次，可以当场或稍后、在任何线程上应答：`respond`
+（字节和 MIME 类型）或 `fail`（图片的 `error` 事件、被拒绝的 `fetch`）。未应答就被丢弃的请求视为失败。页面不再需要
+它时（页面已跳转、网页视图已移除），`is_cancelled()` 变为 true，之后的应答会被丢弃。应答带有
+`Access-Control-Allow-Origin: *`，所以无论页面的来源是什么，页面的脚本都能 `fetch` 它们；Content-Security-Policy
+像其他来源一样写出 scheme 即可（`img-src app-image:`）。
+
+scheme 以字母开头，后接字母、数字、`+`、`-` 或 `.`，且不能是 Web 或系统的 scheme（`http`、`https`、`file`、
+`data`、`blob`、`about` 等）。多个 scheme 就调用多次。与 `incognito` 一样，scheme 在创建网页视图时读取。iOS、
+macOS 和 Linux 提供它们（WebKit 的 `WKURLSchemeHandler` 和 `webkit_web_context_register_uri_scheme`）。
 
 ### 已登录的页面：请求头
 
@@ -399,6 +433,67 @@ web_view("https://example.com/preview").incognito(true).flex_1()
 
 检查覆盖网页视图的 `src` 以及页面发起的每一次顶层导航（链接、重定向、修改 `location`）；它在平台询问能否继续导航时由原生决定。页面自己的子资源（脚本、图片、iframe）属于网页内容自身的事情，不做检查。`*.example.com` 只匹配子域名；要包括裸域名，还需列出 `example.com`。没有 `"capabilities"` 键的应用可以显示任何页面。见[沙箱与能力声明](./sandbox-and-capabilities.md)。
 
+### 没有网页引擎时
+
+网页视图依赖平台的网页引擎，而有些环境里没有：未带 WebKitGTK 构建的 Linux 运行时、没有安装 WebView2 Runtime 的 Windows、没有启用系统 WebView 的 Android 设备。这时网页视图显示占位内容，应用可以立刻改为显示别的东西（代码块、链接、文件卡片）。
+
+可以先用 `web_view_available()`（`WebView.available()`）询问：平台在启动时就知道自己无法显示网页视图时，或应用的能力未授予 `webview` 时，它得到 `false`。
+
+```rust tabs
+use nsh_core::prelude::*;
+
+let web = signal(true);
+spawn(async move { web.set(web_view_available().await) });
+```
+
+```tsx tabs
+import { signal, WebView } from "nsh";
+
+const web = signal(true);
+WebView.available().then((available) => web.set(available));
+```
+
+有些引擎要到网页视图启动时才会失败（Windows 上的 WebView2），所以网页视图自己也会报告：平台一旦知道，就触发 `onError`，其 `code` 为 `"ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"`。
+
+```tsx
+import { signal, Text, WebView } from "nsh";
+
+function Preview(props: { url: string }) {
+  const failed = signal(false);
+  return (
+    <If when={!failed()} else={<Text>{props.url}</Text>}>
+      <WebView
+        src={props.url}
+        onError={(e) => e.code === "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM" && failed.set(true)}
+        style={{ flex: 1 }}
+      />
+    </If>
+  );
+}
+```
+
+### 页面的进程结束时
+
+网页视图的页面运行在单独的进程里，这个进程可能在应用运行时结束：它崩溃了，或系统回收了它的内存。应用继续运行，网页视图不再显示页面；它的
+`onError` 触发，`code` 为 `"ERR_NSH_WEBVIEW_TERMINATED"`（Rust 中为 `.on_process_terminated`，参数为消息）。ref 的 `reload()`、
+`load()` 或新的 `src` / `html` 会重新显示页面（Android 会为此新建一个 WebView）。iOS、macOS、Linux 和 Android 会报告它。
+
+```tsx
+import { WebView, type WebViewRef } from "nsh";
+
+function Diagram(props: { html: string }) {
+  let web!: WebViewRef;
+  return (
+    <WebView
+      ref={web}
+      html={props.html}
+      onError={(e) => e.code === "ERR_NSH_WEBVIEW_TERMINATED" && web.reload()}
+      style={{ flex: 1 }}
+    />
+  );
+}
+```
+
 ## Video
 
 ```rust tabs
@@ -480,7 +575,7 @@ function Player() {
 mount(Player);
 ```
 
-播放由属性控制：用 signal 设置 `paused`、`muted`、`volume` 和 `rate`，播放器随之变化。ref 提供 `seek(seconds)`。
+播放由属性控制：用 signal 设置 `paused`、`muted`、`volume` 和 `rate`，播放器随之变化。已播放到结尾的视频，取消暂停后从头再播。ref 提供 `seek(seconds)`。
 
 在 Rust 中，`video(url)` 创建播放器（URL 可以是值、signal 或闭包），每个属性是一个蛇形命名的构建方法（`paused`、`repeat(true)`、`object_fit(ResizeMode::Contain)`，`progressUpdateInterval` 对应 `progress_interval`）；`on_load` 收到 `VideoInfo`（`duration`、`size`），`on_progress` 收到 `VideoProgress`（`current_time`、`duration`），`on_buffer` 收到 `bool`。
 

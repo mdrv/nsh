@@ -101,6 +101,10 @@ mount(App);
 | 事件 | Rust | 说明 |
 |---|---|---|
 | `onChange`（`Toggle`） | `.on_change(\|pressed: &bool\| ..)` | 开关按钮被按压：轻点、点击、拥有键盘焦点时按 Space 或 Return，或屏幕阅读器的激活。`{ pressed }` 是它想要的值，与 `pressed` 相反。它在任何变化之前运行：开关按钮显示应用传回的 `pressed`。 |
+| `onPressDown`（`Toggle`） | `.on_press_down(\|\| ..)` | 一次按压在它上面按下。 |
+| `onPressUp`（`Toggle`） | `.on_press_up(\|\| ..)` | 按压结束：松开、移开或被取消。 |
+
+`onPressDown` 和 `onPressUp` 用于你自己的按压反馈，比如状态样式表达不了的弹簧效果或形状变化。
 
 `ToggleGroup` 的方向键只移动键盘焦点：不按下任何东西。禁用的开关按钮什么也不报告。
 
@@ -184,7 +188,7 @@ mount(App);
 | Home、End | 把焦点移到第一个或最后一个开关按钮。 |
 | Space、Return | 按下获得焦点的开关按钮。 |
 
-方向键跳过禁用的开关按钮，且不按下任何东西：开关按钮只在被按压时改变。两组方向键都能移动，不论这一组的布局如何，布局是应用的类。在从右到左的布局里，Left 和 Right 互换：Left 移到下一个开关按钮，Right 移到上一个；Up、Down、Home 和 End 不变。`focus:` 样式显示焦点在哪里。`ToggleGroup` 之外的 `Toggle` 自己占一站。
+方向键跳过禁用的开关按钮，且不按下任何东西：开关按钮只在被按压时改变。两组方向键都能移动，不论这一组的布局如何，布局是应用的类。在从右到左的布局里，Left 和 Right 互换：Left 移到下一个开关按钮，Right 移到上一个；Up、Down、Home 和 End 不变。`focus-visible:` 样式显示焦点在哪里。`ToggleGroup` 之外的 `Toggle` 自己占一站。
 
 ## 平台说明
 

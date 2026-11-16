@@ -167,6 +167,11 @@ pub(crate) fn command(surface: &Rc<Surface>, command: &NotificationCommand) {
                 log::warn!("notifications: cannot close: {err}");
             }
         }
+        NotificationCommand::CloseAll => {
+            if let Err(err) = close_all() {
+                log::warn!("notifications: cannot close them: {err}");
+            }
+        }
         NotificationCommand::Listen => {
             LISTENER.with(|l| *l.borrow_mut() = Some(Rc::downgrade(surface)));
             for id in PRESSES.with(|p| std::mem::take(&mut *p.borrow_mut())) {
@@ -316,6 +321,16 @@ fn close(id: &str) -> Result<()> {
         &HSTRING::from(GROUP),
         &HSTRING::from(app),
     )
+}
+
+/// Removes NSH's toasts of the app from the notification center, those an
+/// earlier run left included: the history is the app id's.
+fn close_all() -> Result<()> {
+    let Some((app, _)) = app() else {
+        return Ok(());
+    };
+    ToastNotificationManager::History()?
+        .RemoveGroupWithId(&HSTRING::from(GROUP), &HSTRING::from(app))
 }
 
 /// The toast showing `notification`. The press hands back its `launch`
@@ -681,6 +696,17 @@ mod tests {
 
     #[test]
     fn the_toast_loads_in_the_system_parser() {
+        use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+        struct Apartment;
+        impl Drop for Apartment {
+            fn drop(&mut self) {
+                // SAFETY: balances initialization after the WinRT objects drop.
+                unsafe { RoUninitialize() };
+            }
+        }
+        // SAFETY: this test owns its thread's WinRT apartment.
+        unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.unwrap();
+        let _apartment = Apartment;
         for silent in [false, true] {
             let notification =
                 Notification::new("chat:\"42\"\n", "<T> & \u{1}", "B\n").silent(silent);

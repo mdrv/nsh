@@ -23,6 +23,7 @@ demo: guide-device
 | `locale()` | `locale()`（`nsh`） | 用户的区域设置，BCP 47 标签（`"en-US"`、`"zh-Hans-CN"`）：`Intl` 默认按它格式化。 |
 | `locale_settings()` | `localeSettings()`（`nsh`） | 用户的语言与地区设置：偏好语言、时区、12 小时制或 24 小时制、每周的第一天、度量单位和温度单位（[语言与地区设置](#语言与地区设置)）。 |
 | `lifecycle()` | `lifecycle()`（`nsh`） | 应用是否正在使用：`active`、`inactive`（可见但没有焦点）或 `background`（[在后台](#在后台)）。 |
+| `wake_count()` | `wakeCount()`（`nsh`） | 应用运行期间系统从睡眠中唤醒的次数（[睡眠之后](#睡眠之后)）。 |
 | `reduce_motion()`、`screen_reader()` | `reduceMotion()`、`screenReaderEnabled()`（`nsh`） | 见[无障碍](./accessibility.md)。 |
 
 ```rust tabs
@@ -223,29 +224,21 @@ text("Today")
 
 ## 语言和地区
 
-`locale()` 是用户的区域设置，形式为 BCP 47 标签（Rust 中为 `locale().as_str()`）。在 TSX 中，`Intl` 默认按它格式化数字和日期，所以 `new Intl.NumberFormat().format(1234.5)` 在 `en-US` 下得到 `1,234.5`，在 `de-DE` 下得到 `1.234,5`。读取 `locale()` 来选择你自己的翻译文案：读取它的文字会在它变化时更新。
+`locale()` 是用户的区域设置，形式为 BCP 47 标签（Rust 中为 `locale().as_str()`）。在 TSX 中，`Intl` 默认按它格式化数字和日期，所以 `new Intl.NumberFormat().format(1234.5)` 在 `en-US` 下得到 `1,234.5`，在 `de-DE` 下得到 `1.234,5`。读取它的地方会在它变化时更新。
+
+应用自己在各语言下的文字来自它的翻译：`t("hello")`（`nsh/i18n`；Rust 中为 `t!("hello")`）以用户的语言显示一个 key，`setLocale` 让应用显示另一种语言。见 [I18n](./i18n.md)。
 
 ```rust tabs
 use nsh_core::prelude::*;
 
-fn greeting() -> &'static str {
-    match locale().as_str().split('-').next() {
-        Some("de") => "Willkommen",
-        Some("zh") => "欢迎",
-        _ => "Welcome",
-    }
-}
-
-text(greeting)
+text(move || t!("welcome"))
 ```
 
 ```tsx tabs
 import { Text } from "nsh";
-import { locale } from "nsh";
+import { t } from "nsh/i18n";
 
-const greetings: Record<string, string> = { en: "Welcome", de: "Willkommen", zh: "欢迎" };
-
-<Text>{greetings[locale().split("-")[0]] ?? greetings.en}</Text>
+<Text>{t("welcome")}</Text>
 ```
 
 ## 语言与地区设置
@@ -276,30 +269,7 @@ const twelveHour = computed(() => ["h11", "h12"].includes(localeSettings().hourC
 
 ### 偏好语言
 
-`languages` 是用户的偏好语言列表，按偏好从高到低排列，BCP 47 标签：系统的列表（手机设置中的语言列表、桌面的界面语言、Web 上浏览器的语言）。用其中第一个有翻译的语言显示应用的文字，并沿列表回退：偏好瑞士德语、然后德语、然后英语的用户，在一个有德语和英语的应用中看到德语文字。`locale()` 是另一回事，它是数字和日期遵循的区域格式，可以是另一种（英文文字、德国日期）。列表从不为空，用户修改它时，读取它的地方会随之更新。
-
-```rust tabs
-use nsh_core::prelude::*;
-
-const TRANSLATED: [&str; 3] = ["en", "de", "zh"];
-
-fn text_language() -> &'static str {
-    locale_settings()
-        .languages
-        .iter()
-        .find_map(|l| TRANSLATED.into_iter().find(|t| l.as_str().split('-').next() == Some(*t)))
-        .unwrap_or("en")
-}
-```
-
-```tsx tabs
-import { localeSettings } from "nsh";
-
-const TRANSLATED = ["en", "de", "zh"];
-
-const textLanguage = () =>
-  localeSettings().languages.map((tag) => tag.split("-")[0]).find((l) => TRANSLATED.includes(l)) ?? "en";
-```
+`languages` 是用户的偏好语言列表，按偏好从高到低排列，BCP 47 标签：系统的列表（手机设置中的语言列表、桌面的界面语言、Web 上浏览器的语言）。应用的文字以其中第一个有翻译的语言显示，并沿列表回退：偏好瑞士德语、然后德语、然后英语的用户，在一个有德语和英语的应用中看到德语文字。`t`（`nsh/i18n`）就是这样选择的（[I18n](./i18n.md)）。`locale()` 是另一回事，它是数字和日期遵循的区域格式，可以是另一种（英文文字、德国日期）。列表从不为空，用户修改它时，读取它的地方会随之更新。
 
 显示在原生应用中、且该应用设置了自己语言的应用，会把那个语言排在最前。
 
@@ -396,11 +366,31 @@ effect(() => {
 });
 ```
 
-用 `background` 暂停工作，并在用户做出更改时就保存它：系统可能在应用进入后台几秒后就将其挂起，早于读取这一变化的副作用运行。显示在原生应用中的应用跟随该应用的状态；应用有多个窗口时（iPad、桌面），视图跟随它所在的窗口。在测试中，`nsh/test` 的 `app.setLifecycle("background")` 会把应用移到后台（[测试](./testing-and-trace.md#操作步骤)）。
+用 `background` 暂停工作，并在用户做出更改时就保存它：系统可能在应用进入后台几秒后就将其挂起，早于读取这一变化的副作用运行。显示在原生应用中的应用跟随该应用的状态；应用有多个窗口时（iPad、桌面），视图跟随它所在的窗口。在 macOS 和 Windows 上，屏幕锁定或关闭时、窗口在另一个桌面（Space、虚拟桌面）上时，独立应用以及嵌入 AppKit 和 Win32 应用中的视图也处于 `background`。在 Windows 上，用户注销、Windows 关机或重启、安装程序关闭应用时，应用会进入 `background`，它的处理函数在会话结束前运行；随后应用退出（[`Application.on("quit")`](../modules/nsh-desktop.md#退出)）。在测试中，`nsh/test` 的 `app.setLifecycle("background")` 会把应用移到后台（[测试](./testing-and-trace.md#操作步骤)）。
+
+## 睡眠之后
+
+`wake_count()`（TSX 中为 `wakeCount()`）统计应用运行期间系统从睡眠中唤醒的次数：启动时为 0，每次唤醒后加一。笔记本合上再打开、应用一直在前台时，应用始终是 `active`，但它持有的网络连接和设置的定时器并没有挺过这次睡眠。读取这个计数的 effect 会在每次唤醒后重新运行，应用就在这里检查连接或重新建立连接：
+
+```rust tabs
+effect(move || {
+    if wake_count() > 0 {
+        feed.reconnect();
+    }
+});
+```
+
+```tsx tabs
+effect(() => {
+  if (wakeCount() > 0) feed.reconnect();
+});
+```
+
+独立应用以及嵌入 AppKit、Win32 和 GTK 应用中的视图在 macOS、Windows 和 Linux 上统计唤醒（Linux 通过 systemd 的 `logind`）。在 iOS 和 Android 上，设备睡眠会把应用移到后台，由 `lifecycle()` 报告。在测试中，`nsh/test` 的 `app.wake()` 会唤醒系统（[测试](./testing-and-trace.md#操作步骤)）。
 
 ## 安全区域
 
-刘海、Home 指示条、状态栏、Android 导航栏以及 Mac Catalyst 的标题栏会遮挡 surface 的一部分。NSH 应用在所有平台上都是全屏绘制，被遮挡的部分以 inset 的形式提供。
+刘海、Home 指示条、状态栏、Android 导航栏、Mac Catalyst 的标题栏以及窗口化 iPad 应用的窗口控件会遮挡 surface 的一部分。NSH 应用在所有平台上都是全屏绘制，被遮挡的部分以 inset 的形式提供。在 iPadOS 26 及更高版本上，窗口化应用的前缘 inset 与其顶部前缘角落的窗口控件一样宽，覆盖整条前缘；全屏和 iPhone 上就是普通的安全区。
 
 - `safe_area()`（TSX：`safeArea()`）给出整个 surface 的 inset。
 - 组件的 `cx.insets()`（TSX：`safeAreaInsets()`）给出**组件渲染位置**的 inset：在导航[页面](./navigation.md#标题栏下的安全区域)中从标题栏下方算起，在[对话框](../elements/dialog.md)中是对话框自己的。可能出现在多个地方的组件应该优先用它。
@@ -507,6 +497,22 @@ const hapticsSupported = platform.os === "ios" || (platform.os === "android" && 
 
 在终端中（[终端后端](./tui.md)），`platform.idiom` 为 `"terminal"`，`platform.desktop` 为 `true`，`platform.os` 是本机自己的系统。
 `colorScheme()` 跟随终端的背景色，`reduceMotion()` 为 `true`，安全区域和键盘高度为 0。
+
+## 应用数据目录
+
+Rust 中的 `data_dir()`，即 TSX 中的 `process.dataDir`，是应用存放自己文件（例如 SQLite 数据库）的目录：`<数据目录>/<应用 id>`，与 `storage.json` 同一目录，在所有原生平台上可用，包括 Android 和 iOS。宿主不为应用保存文件时（例如 Web）为 `None`（`undefined`）。目录可能尚未创建，写入前先创建。
+
+打包的桌面应用把日志写到其中的 `logs/app.log`：Rust 中是 `log_file()`，TSX 中是 `process.logFile`
+（[桌面上的日志文件和级别](./dev-server-and-debugging.md#log-files-and-levels-on-the-desktop)）。
+
+```rust
+use nsh_core::prelude::*;
+
+if let Some(dir) = data_dir() {
+    std::fs::create_dir_all(&dir)?;
+    let db = dir.join("app.sqlite");
+}
+```
 
 ## 像素密度
 

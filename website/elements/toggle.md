@@ -113,6 +113,11 @@ typed style methods and `.child(..)` for their content.
 | Event | Rust | Description |
 |---|---|---|
 | `onChange` (`Toggle`) | `.on_change(\|pressed: &bool\| ..)` | The toggle was pressed: a tap, a click, Space or Return while it has the keyboard focus, or a screen reader's activation. `{ pressed }` is the value it asks for, the opposite of `pressed`. It runs before anything changes: the toggle shows the `pressed` the app passes back. |
+| `onPressDown` (`Toggle`) | `.on_press_down(\|\| ..)` | A press went down on it. |
+| `onPressUp` (`Toggle`) | `.on_press_up(\|\| ..)` | The press ended: released, moved away or cancelled. |
+
+`onPressDown` and `onPressUp` are for press feedback of your own, such as a spring or a shape that the state styles do
+not express.
 
 An arrow key of a `ToggleGroup` only moves the keyboard focus: it presses nothing. A disabled toggle reports nothing.
 
@@ -210,7 +215,7 @@ On macOS and the web, where Tab reaches the views that take presses, a `ToggleGr
 
 The arrow keys skip disabled toggles and press nothing: a toggle changes only when it is pressed. Both pairs of arrows
 move, whatever the group's layout, which is the app's class. In a right-to-left layout Left and Right trade places:
-Left moves to the next toggle and Right to the previous; Up, Down, Home and End keep theirs. `focus:` styles show where
+Left moves to the next toggle and Right to the previous; Up, Down, Home and End keep theirs. `focus-visible:` styles show where
 the focus is. A `Toggle`
 outside a `ToggleGroup` is a stop of its own.
 

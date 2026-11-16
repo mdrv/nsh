@@ -23,6 +23,7 @@ In Rust the accessors are functions of `nsh_core::prelude`; in TSX they come fro
 | `locale()` | `locale()` (`nsh`) | The user's locale as a BCP 47 tag (`"en-US"`, `"zh-Hans-CN"`): what `Intl` formats for by default. |
 | `locale_settings()` | `localeSettings()` (`nsh`) | The user's locale settings: the preferred languages, the time zone, 12- or 24-hour time, the day weeks start on, the units of measurements and of temperatures ([Locale settings](#locale-settings)). |
 | `lifecycle()` | `lifecycle()` (`nsh`) | Whether the app is in use: `active`, `inactive` (visible without the focus) or `background` ([In the background](#in-the-background)). |
+| `wake_count()` | `wakeCount()` (`nsh`) | How many times the system woke from sleep while the app ran ([After a sleep](#after-a-sleep)). |
 | `reduce_motion()`, `screen_reader()` | `reduceMotion()`, `screenReaderEnabled()` (`nsh`) | See [Accessibility](./accessibility.md). |
 
 ```rust tabs
@@ -223,29 +224,21 @@ The text size scales text: every text and input that allows font scaling, and th
 
 ## Language and region
 
-`locale()` is the user's locale, as a BCP 47 tag (`locale().as_str()` in Rust). In TSX, `Intl` formats numbers and dates for it by default, so `new Intl.NumberFormat().format(1234.5)` gives `1,234.5` in `en-US` and `1.234,5` in `de-DE`. Read `locale()` to pick the strings of your own translations: the texts that read it update when it changes.
+`locale()` is the user's locale, as a BCP 47 tag (`locale().as_str()` in Rust). In TSX, `Intl` formats numbers and dates for it by default, so `new Intl.NumberFormat().format(1234.5)` gives `1,234.5` in `en-US` and `1.234,5` in `de-DE`. What reads it updates when it changes.
+
+The app's own text in each language comes from its translations: `t("hello")` (`nsh/i18n`; Rust `t!("hello")`) shows a key in the user's language, and `setLocale` shows the app in another one. See [I18n](./i18n.md).
 
 ```rust tabs
 use nsh_core::prelude::*;
 
-fn greeting() -> &'static str {
-    match locale().as_str().split('-').next() {
-        Some("de") => "Willkommen",
-        Some("zh") => "欢迎",
-        _ => "Welcome",
-    }
-}
-
-text(greeting)
+text(move || t!("welcome"))
 ```
 
 ```tsx tabs
 import { Text } from "nsh";
-import { locale } from "nsh";
+import { t } from "nsh/i18n";
 
-const greetings: Record<string, string> = { en: "Welcome", de: "Willkommen", zh: "欢迎" };
-
-<Text>{greetings[locale().split("-")[0]] ?? greetings.en}</Text>
+<Text>{t("welcome")}</Text>
 ```
 
 ## Locale settings
@@ -283,30 +276,7 @@ others ([Testing](./testing-and-trace.md#steps)).
 
 ### Preferred languages
 
-`languages` is the user's list of preferred languages, most preferred first, as BCP 47 tags: the system's (Settings' language list on a phone, the UI languages of a desktop, the browser's on the web). Show the app's text in the first one it has a translation for, and fall back along the list: a user who prefers Swiss German, then German, then English gets German text from an app that has German and English. `locale()` is something else, the region format numbers and dates follow, which can be another (English text, German dates). The list is never empty, and what read it updates when the user changes it.
-
-```rust tabs
-use nsh_core::prelude::*;
-
-const TRANSLATED: [&str; 3] = ["en", "de", "zh"];
-
-fn text_language() -> &'static str {
-    locale_settings()
-        .languages
-        .iter()
-        .find_map(|l| TRANSLATED.into_iter().find(|t| l.as_str().split('-').next() == Some(*t)))
-        .unwrap_or("en")
-}
-```
-
-```tsx tabs
-import { localeSettings } from "nsh";
-
-const TRANSLATED = ["en", "de", "zh"];
-
-const textLanguage = () =>
-  localeSettings().languages.map((tag) => tag.split("-")[0]).find((l) => TRANSLATED.includes(l)) ?? "en";
-```
+`languages` is the user's list of preferred languages, most preferred first, as BCP 47 tags: the system's (Settings' language list on a phone, the UI languages of a desktop, the browser's on the web). An app's text shows in the first one it has a translation for, falling back along the list: a user who prefers Swiss German, then German, then English gets German text from an app that has German and English. `t` (`nsh/i18n`) picks it so ([I18n](./i18n.md)). `locale()` is something else, the region format numbers and dates follow, which can be another (English text, German dates). The list is never empty, and what read it updates when the user changes it.
 
 An app shown inside a native app that sets its own language has that language first.
 
@@ -408,11 +378,31 @@ effect(() => {
 });
 ```
 
-Use `background` to pause work, and save what the user changes as they change it: the system may suspend an app seconds after it moves to the background, before an effect that reads the change has run. An app shown inside a native app follows that app's state, and where an app has several windows (an iPad, a desktop) a view follows the window it is in. In tests, `app.setLifecycle("background")` of `nsh/test` moves the app there ([Testing](./testing-and-trace.md#steps)).
+Use `background` to pause work, and save what the user changes as they change it: the system may suspend an app seconds after it moves to the background, before an effect that reads the change has run. An app shown inside a native app follows that app's state, and where an app has several windows (an iPad, a desktop) a view follows the window it is in. Standalone apps and views embedded in AppKit and Win32 apps are in the `background` too on macOS and Windows while the screen is locked or turned off and while their window is on another desktop (a Space, a virtual desktop). On Windows, an app moves to `background` when the user signs out, Windows shuts down or restarts, or an installer closes it, and its handlers run before the session ends; then the app quits ([`Application.on("quit")`](../modules/nsh-desktop.md#quitting)). In tests, `app.setLifecycle("background")` of `nsh/test` moves the app there ([Testing](./testing-and-trace.md#steps)).
+
+## After a sleep
+
+`wake_count()` (TSX: `wakeCount()`) counts the times the system woke from sleep while the app ran: 0 at the start, one more after each wake. A laptop whose lid closes and opens again with the app in front keeps the app `active` throughout, yet the network connections it held and the timers it set did not live through the sleep. An effect that reads the count runs again after each wake, so the app checks its connections or opens them again there:
+
+```rust tabs
+effect(move || {
+    if wake_count() > 0 {
+        feed.reconnect();
+    }
+});
+```
+
+```tsx tabs
+effect(() => {
+  if (wakeCount() > 0) feed.reconnect();
+});
+```
+
+Standalone apps and views embedded in AppKit, Win32 and GTK apps count wakes on macOS, Windows and Linux (Linux through systemd's `logind`). On iOS and Android a sleeping device takes the app to the background, which `lifecycle()` reports. In tests, `app.wake()` of `nsh/test` wakes the system ([Testing](./testing-and-trace.md#steps)).
 
 ## Safe areas
 
-Notches, the home indicator, the status bar, Android's navigation bar and the Mac Catalyst title bar cover parts of the surface. NSH apps draw edge to edge on every platform, and get the covered parts as insets.
+Notches, the home indicator, the status bar, Android's navigation bar, the Mac Catalyst title bar and the window controls of an iPad app in a window cover parts of the surface. NSH apps draw edge to edge on every platform, and get the covered parts as insets. On iPadOS 26 and later, a windowed app's leading inset is as wide as the window controls in its top-leading corner, over the whole leading edge; in full screen and on iPhone it is the plain safe area.
 
 - `safe_area()` (TSX: `safeArea()`) gives the surface's insets.
 - A component's `cx.insets()` (TSX: `safeAreaInsets()`) gives the insets **where the component renders**: inside a navigation [page](./navigation.md#safe-areas-under-the-header) they are measured below its header, inside a [dialog](../elements/dialog.md) they are the dialog's. Prefer it in components that may be shown in several places.
@@ -523,6 +513,22 @@ come from the browser and follow it live.
 In a terminal ([the terminal backend](./tui.md)), `platform.idiom` is `"terminal"`, `platform.desktop` is `true` and
 `platform.os` is the machine's own system. `colorScheme()` follows the terminal's background, `reduceMotion()` is
 `true`, and the safe area and the keyboard height are 0.
+
+## The app's data directory
+
+`data_dir()` in Rust, `process.dataDir` in TSX, is the directory the app keeps its own files in, such as a SQLite database: `<data dir>/<app id>`, beside its `storage.json`, on every native platform, Android and iOS included. It is `None` (`null`) where the host keeps no files for the app, such as the web. The directory may not exist yet, so create it before writing.
+
+A packaged desktop app writes its log lines to `logs/app.log` there: `log_file()` in Rust, `process.logFile` in TSX
+([Log files and levels on the desktop](./dev-server-and-debugging.md#log-files-and-levels-on-the-desktop)).
+
+```rust
+use nsh_core::prelude::*;
+
+if let Some(dir) = data_dir() {
+    std::fs::create_dir_all(&dir)?;
+    let db = dir.join("app.sqlite");
+}
+```
 
 ## Pixel density
 

@@ -69,13 +69,13 @@ In Rust, `web_view(url)` shows a page and `web_view_html(html, base_url)` shows 
 
 ### Props
 
-In Rust each prop is a builder method in snake case (`injected_java_script`, `java_script_enabled`, `scrollable`, `user_agent`, `incognito`; `injected_java_script_before_content` for `injectedJavaScriptBeforeContentLoaded`, `back_forward_gestures` for iOS's `allowsBackForwardNavigationGestures`) and each event an `on_…` method (`on_navigation_state_change`) whose listener gets a `WebNavigation` (`url`, `title`, `loading`, `can_go_back`, `can_go_forward`) or, for `on_error` and `on_message`, a `&str`.
+In Rust each prop is a builder method in snake case (`injected_java_script`, `java_script_enabled`, `scrollable`, `user_agent`, `incognito`; `injected_java_script_before_content` for `injectedJavaScriptBeforeContentLoaded`, `back_forward_gestures` for iOS's `allowsBackForwardNavigationGestures`) and each event an `on_…` method (`on_navigation_state_change`) whose listener gets a `WebNavigation` (`url`, `title`, `loading`, `can_go_back`, `can_go_forward`) or, for `on_error` and `on_message`, a `&str`. Rust also serves the page resources of the app's own with `url_scheme` ([below](#resources-the-app-serves)).
 
 | Prop | Type | Default | Description |
 |---|---|---|---|
 | `src` | `string` | | The URL of the page to show. |
 | `html` | `string` | | Inline HTML, shown instead of `src`. |
-| `baseUrl` | `string` | | What `html`'s relative URLs resolve against. |
+| `baseUrl` | `string` | | What `html`'s relative URLs resolve against. It needs the same grant as a page there (`webview.hosts`); without it the HTML loads with no base URL and `onError` reports `ERR_ACCESS_DENIED`. |
 | `injectedJavaScript` | `string` | | Runs after each page loads. |
 | `injectedJavaScriptBeforeContentLoaded` | `string` | | Runs before each page's own scripts. |
 | `javaScriptEnabled` | `boolean` | `true` | Pages run scripts. |
@@ -91,7 +91,7 @@ Events:
 |---|---|---|
 | `onLoadStart` | `WebViewNavigation` | A page started loading. |
 | `onLoad` | `WebViewNavigation` | A page finished loading. |
-| `onError` | `{ message }` | Loading failed. |
+| `onError` | `{ message, code? }` | Loading failed, the platform shows no web view (`code` `"ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"`), or the page's process ended (`code` `"ERR_NSH_WEBVIEW_TERMINATED"`); both below. |
 | `onNavigationStateChange` | `WebViewNavigation` | The URL, title, loading state or history changed. |
 | `onMessage` | `{ data: string }` | The page posted a message (below). |
 
@@ -185,7 +185,7 @@ mount(Browser);
 
 ### Messaging between the page and the app
 
-Pages talk to the app with `window.nsh.postMessage(string)`, which arrives as `on_message` (`onMessage`). The app talks to the page with the ref's `post_message` (`postMessage(string)`), which arrives in the page as a `message` event on `window`. Messages are strings; send JSON for structured data.
+Pages talk to the app with `window.nsh.postMessage(string)`, which arrives as `on_message` (`onMessage`). The app talks to the page with the ref's `post_message` (`postMessage(string)`), which arrives in the page as a `message` event on `window`. Messages are strings; send JSON for structured data. Treat what arrives as untrusted data and check it before acting on it: any script the page runs can post, and on Android `window.nsh` is in every frame of the page, `iframe`s included.
 
 ```rust tabs
 use nsh_core::prelude::*;
@@ -287,6 +287,43 @@ web_view("https://example.com")
   onMessage={(e) => console.log("title", e.data)}
 />
 ```
+
+### Resources the app serves
+
+A page can load bytes the app holds (images it has in memory or on disk, a message's attachments) from a URL scheme
+of the app's own. `url_scheme` names the scheme and the Rust function that answers its requests; the page refers to
+its URLs as to any other (`<img src="app-image:42">`, `fetch("app-image:42")`), and the web engine loads them as it
+loads any subresource, bytes as they are, beside the page's scripts. Images of tens of megabytes load at the speed
+of a file.
+
+```rust
+use nsh_core::{
+    prelude::*,
+    web_resource::{WebResource, WebResourceRequest},
+};
+
+fn serve(request: WebResourceRequest) {
+    // On the main thread: hand slow work to a thread and answer from there.
+    std::thread::spawn(move || match std::fs::read(path_for(request.url())) {
+        Ok(bytes) if !request.is_cancelled() => request.respond(WebResource::new("image/png", bytes)),
+        _ => request.fail(),
+    });
+}
+
+web_view_html(html, None).url_scheme("app-image", serve).flex_1()
+```
+
+The handler runs on the platform's main thread, so it returns at once; the request is answered once, then or later
+and from any thread, with `respond` (bytes and a MIME type) or `fail` (the image's `error` event, a rejected `fetch`).
+A request dropped unanswered fails. When the page no longer needs it (it navigated, the web view went),
+`is_cancelled()` turns true and an answer is dropped. Answers carry `Access-Control-Allow-Origin: *`, so a page's
+scripts can `fetch` them whatever the page's origin, and a Content-Security-Policy names the scheme as any source
+(`img-src app-image:`).
+
+A scheme is a letter followed by letters, digits, `+`, `-` or `.`, and none of the web's or the system's (`http`,
+`https`, `file`, `data`, `blob`, `about`, ...). Several schemes are several calls. Like `incognito`, the schemes are
+read when the web view is made. iOS, macOS and Linux serve them (WebKit's `WKURLSchemeHandler` and
+`webkit_web_context_register_uri_scheme`).
 
 ### Signed-in pages: request headers
 
@@ -405,6 +442,72 @@ If your `nsh.json` declares `"capabilities"`, a web view may only show and navig
 
 The check covers the web view's `src` and every top-level navigation the page makes (links, redirects, `location` changes); it is decided natively when the platform asks whether a navigation may proceed. A page's own subresources (scripts, images, frames) are the web content's business and are not checked. `*.example.com` matches subdomains only; list `example.com` as well for the bare domain. An app without a `"capabilities"` key may show any page. See [Sandbox and capabilities](./sandbox-and-capabilities.md).
 
+### When there is no web engine
+
+A web view needs the platform's web engine, and some installs have none: a Linux runtime built without WebKitGTK, a
+Windows machine without the WebView2 Runtime, an Android device without an enabled system WebView. The web view then
+shows a placeholder, and the app can show something else instead (a code block, a link, a file card) at once.
+
+Ask ahead with `web_view_available()` (`WebView.available()`): it resolves `false` where the platform knows from the
+start that it shows no web view, and where the app's capabilities do not grant `webview`.
+
+```rust tabs
+use nsh_core::prelude::*;
+
+let web = signal(true);
+spawn(async move { web.set(web_view_available().await) });
+```
+
+```tsx tabs
+import { signal, WebView } from "nsh";
+
+const web = signal(true);
+WebView.available().then((available) => web.set(available));
+```
+
+Some engines only fail once a web view starts (WebView2 on Windows), so a web view also tells: its `onError` comes with
+`code` `"ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"` as soon as the platform knows.
+
+```tsx
+import { signal, Text, WebView } from "nsh";
+
+function Preview(props: { url: string }) {
+  const failed = signal(false);
+  return (
+    <If when={!failed()} else={<Text>{props.url}</Text>}>
+      <WebView
+        src={props.url}
+        onError={(e) => e.code === "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM" && failed.set(true)}
+        style={{ flex: 1 }}
+      />
+    </If>
+  );
+}
+```
+
+### When the page's process ends
+
+A web view's page runs in a process of its own, which can end while the app runs: it crashed, or the system took
+its memory back. The app keeps running and the web view shows no page; its `onError` comes with `code`
+`"ERR_NSH_WEBVIEW_TERMINATED"` (Rust: `.on_process_terminated`, the message). The ref's `reload()`, `load()` or a new
+`src` / `html` shows a page again (Android makes a new WebView for it). iOS, macOS, Linux and Android report it.
+
+```tsx
+import { WebView, type WebViewRef } from "nsh";
+
+function Diagram(props: { html: string }) {
+  let web!: WebViewRef;
+  return (
+    <WebView
+      ref={web}
+      html={props.html}
+      onError={(e) => e.code === "ERR_NSH_WEBVIEW_TERMINATED" && web.reload()}
+      style={{ flex: 1 }}
+    />
+  );
+}
+```
+
 ## Video
 
 ```rust tabs
@@ -486,7 +589,7 @@ function Player() {
 mount(Player);
 ```
 
-Playback is controlled by props: set `paused`, `muted`, `volume` and `rate` from signals and the player follows. The ref has `seek(seconds)`.
+Playback is controlled by props: set `paused`, `muted`, `volume` and `rate` from signals and the player follows. Unpausing a video that played to its end plays it again from the start. The ref has `seek(seconds)`.
 
 In Rust, `video(url)` makes the player (the URL a value, a signal or a closure) and each prop is a builder method in snake case (`paused`, `repeat(true)`, `object_fit(ResizeMode::Contain)` (the `objectFit` style), `progress_interval` for `progressUpdateInterval`); `on_load` gets a `VideoInfo` (`duration`, `size`), `on_progress` a `VideoProgress` (`current_time`, `duration`) and `on_buffer` a `bool`.
 

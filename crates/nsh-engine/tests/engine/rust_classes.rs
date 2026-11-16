@@ -520,6 +520,7 @@ pub(crate) fn start_with(
         minify: false,
         split: false,
         ui_sets: ui_sets.iter().map(Into::into).collect(),
+        ..Default::default()
     })
     .unwrap();
     let described: Vec<_> = ui_sets.iter().map(Into::into).collect();
@@ -534,6 +535,7 @@ pub(crate) fn start_with(
         ),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -556,6 +558,7 @@ pub(crate) fn start_with(
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),

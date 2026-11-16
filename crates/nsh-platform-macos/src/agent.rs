@@ -31,7 +31,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags, NSEventType,
     NSView, NSWindow,
 };
-use objc2_foundation::{NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 use crate::{surface::Surface, synth};
 
@@ -301,13 +301,52 @@ fn in_window(ns: &NSView, rect: NSRect) -> Option<Bounds<Points>> {
     ))
 }
 
+/// `rect` of `view` (its coordinates) in the window's content, where it is
+/// drawn: AppKit's conversion ([`in_window`]) places it as the frames and
+/// scroll offsets do but leaves the views' layer transforms out, which
+/// hit testing heeds, so each corner moves by what the transforms on the
+/// way shift it ([`crate::input::to_top`]) and the box around them is
+/// where it shows. A thumb centered with a `translate(-50%)` is pressed on
+/// its middle.
+fn mapped(view: &crate::view::NshView, rect: NSRect) -> Option<Bounds<Points>> {
+    crate::scroll::commit_ancestors(view);
+    let plain = in_window(view.ns(), rect)?;
+    let (x0, y0) = (rect.origin.x as f32, rect.origin.y as f32);
+    let (w, h) = (rect.size.width as f32, rect.size.height as f32);
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    // Each corner from the plain box's top left, as the frames, scroll
+    // offsets and zooms place it, then moved by the transforms.
+    let base = crate::input::to_top(view, (x0, y0), false)?;
+    for (dx, dy) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
+        let moved = crate::input::to_top(view, (x0 + dx, y0 + dy), true)?;
+        let x = plain.origin.x.0 + moved.0 - base.0;
+        let y = plain.origin.y.0 + moved.1 - base.1;
+        (min_x, min_y) = (min_x.min(x), min_y.min(y));
+        (max_x, max_y) = (max_x.max(x), max_y.max(y));
+    }
+    Some(Bounds::new(
+        point(Points(min_x), Points(min_y)),
+        Size::new(Points(max_x - min_x), Points(max_y - min_y)),
+    ))
+}
+
+/// Where `frame` goes to lie within `area` (both in screen coordinates,
+/// from the bottom), moved as little as it takes; one wider or taller than
+/// the area keeps its left edge and its top (the title bar) in it.
+fn within(frame: NSRect, area: NSRect) -> NSPoint {
+    let right = area.origin.x + area.size.width - frame.size.width;
+    let x = frame.origin.x.min(right).max(area.origin.x);
+    let top = area.origin.y + area.size.height - frame.size.height;
+    let y = frame.origin.y.max(area.origin.y).min(top);
+    NSPoint::new(x, y)
+}
+
 impl Native for MacNative {
     fn bounds(&self, id: NodeId) -> Option<Bounds<Points>> {
         self.on_main(|surface, _| {
             let mounter = surface.mounter.borrow();
             let view = mounter.views.get(&id)?;
-            crate::scroll::commit_ancestors(view);
-            in_window(view.ns(), view.ns().bounds())
+            mapped(view, view.ns().bounds())
         })
         .flatten()
     }
@@ -316,9 +355,8 @@ impl Native for MacNative {
         self.on_main(|surface, _| {
             let mounter = surface.mounter.borrow();
             let view = mounter.views.get(&text)?;
-            crate::scroll::commit_ancestors(view);
             let rect = *crate::text::range_rects(&view.state(), start, end).first()?;
-            in_window(view.ns(), rect)
+            mapped(view, rect)
         })
         .flatten()
     }
@@ -416,6 +454,17 @@ impl Native for MacNative {
         self.on_key(move |surface, window| synth::type_text(surface, window, &text));
     }
 
+    fn focused(&self) -> Option<NodeId> {
+        self.on_key(|_, window| crate::text_input::test_focused(window))
+            .flatten()
+    }
+
+    fn compose(&self, text: &str) -> Result<(), String> {
+        let text = text.to_owned();
+        self.on_key(move |_, window| crate::text_input::test_compose(window, &text))
+            .unwrap_or_else(|| Err("the window is gone".into()))
+    }
+
     fn paste(&self, content: &nsh_core::PasteEvent) -> Result<(), String> {
         let content = content.clone();
         self.on_key(move |_, window| crate::text_input::test_paste(window, &content))
@@ -482,6 +531,25 @@ impl Native for MacNative {
             }
         })
         .ok_or_else(|| "the window is gone".to_owned())
+    }
+
+    fn drop_files(&self, at: Point<Points>, uris: Vec<String>) -> Result<(), String> {
+        let (x, y) = (at.x.0, at.y.0);
+        let target = self.target();
+        let dropped = self.on_target(move |surface, _| {
+            let root = (target != ROOT_ID)
+                .then(|| crate::window::root_view(surface, target))
+                .flatten();
+            crate::input::enter(surface, root);
+            let dropped = crate::file_drop::drop_uris(surface, x, y, uris);
+            crate::input::enter(surface, None);
+            dropped
+        });
+        match dropped {
+            Some(true) => Ok(()),
+            Some(false) => Err("no view there listens to `onFileDrop`".into()),
+            None => Err("the window is gone".into()),
+        }
     }
 
     fn press_keys(&self, keys: &str) -> Result<(), String> {
@@ -567,7 +635,25 @@ impl Native for MacNative {
 
     fn resize(&self, width: Points, height: Points) -> Result<(), String> {
         self.on_main(|_, window| {
-            window.setContentSize(NSSize::new(f64::from(width.0), f64::from(height.0)));
+            let content = NSSize::new(f64::from(width.0), f64::from(height.0));
+            let old = window.frame();
+            let size = window
+                .frameRectForContentRect(NSRect::new(NSPoint::new(0.0, 0.0), content))
+                .size;
+            // Grown from its top left corner, it may reach past the
+            // display's edge, where a screenshot of it shows nothing: moved
+            // back just enough, so a window the app placed keeps its place
+            // when it still fits. Its display is the one it was on (grown,
+            // most of it may be on another).
+            let top_left = NSPoint::new(old.origin.x, old.origin.y + old.size.height - size.height);
+            let mut frame = NSRect::new(top_left, size);
+            if let Some(screen) = window.screen() {
+                frame.origin = within(frame, screen.visibleFrame());
+            }
+            // One change: a resize, then a move, left the screenshots that
+            // followed misplaced on the window (its title bar in, its right
+            // edge out).
+            window.setFrame_display(frame, true);
         })
         .ok_or_else(|| "the window is gone".to_owned())
     }

@@ -18,8 +18,9 @@ use super::{
     events, when,
 };
 use crate::{
-    CellSlot, EventKind, EventPayload, ListContentStyle, ListViewport, PayloadValue, Prop, Tag,
-    Viewability, geometry::Points,
+    CellSlot, Command, EventKind, EventPayload, ListContentStyle, ListViewport, PayloadValue, Prop,
+    Tag, Viewability,
+    geometry::{Percentage, Points},
 };
 
 /// How a list lays out its rows: [`super::ListElement`] (the app's rows)
@@ -181,8 +182,8 @@ pub(crate) struct VirtualListEl {
     pub(crate) keys: Option<KeysFn>,
     /// Between rows (after each row but the last; before it, inverted).
     pub(crate) separator: Option<SeparatorFn>,
-    /// The row scrolled to before the first frame.
-    pub(crate) initial_index: Option<u32>,
+    /// Where the list scrolls before the first frame.
+    pub(crate) initial_scroll: Option<Command>,
     /// How long rows stay viewable before they are reported.
     pub(crate) min_view_time: Option<Duration>,
     /// The owner of the run that made the list (a component's view, a
@@ -218,7 +219,7 @@ pub fn virtual_list<R: IntoElement>(
         row: Rc::new(move |at| row(at).into_element()),
         keys: None,
         separator: None,
-        initial_index: None,
+        initial_scroll: None,
         min_view_time: None,
         scope: Some(super::Owner::current_or_detached()).filter(|o| *o != super::Owner::detached()),
     }));
@@ -343,9 +344,25 @@ impl VirtualList {
     }
 
     /// Scrolls to row `index` before the first frame (TS:
-    /// `initialScrollIndex`).
+    /// `initialScrollIndex`). Replaces any earlier initial scroll setting.
     pub fn initial_scroll_index(mut self, index: usize) -> Self {
-        self.list().initial_index = Some(index as u32);
+        self.list().initial_scroll = Some(Command::ScrollToIndex {
+            index: index as u32,
+            animated: false,
+            view_position: Percentage(0.0),
+            view_offset: Points::ZERO,
+        });
+        self
+    }
+
+    /// Scrolls to the end before the first frame, and stays there while
+    /// the rows in view are measured: a chat opening at its newest message,
+    /// even one longer than the viewport (LegendList's
+    /// `initialScrollAtEnd`). Content shorter than the viewport stays at
+    /// the top, unlike [`crate::ListAlignment::Bottom`]. Replaces any earlier
+    /// initial scroll setting; a later `initial_scroll_index` replaces this.
+    pub fn initial_scroll_at_end(mut self) -> Self {
+        self.list().initial_scroll = Some(Command::ScrollToEnd { animated: false });
         self
     }
 
@@ -523,24 +540,6 @@ impl Accessible for VirtualList {}
 impl Interactive for VirtualList {}
 impl super::Scrollable for VirtualList {}
 
-/// How the rows changed from `old` to `new` keys: `(at, removed,
-/// inserted)` by the common start and end (as `List` does), `None` when
-/// they are the same.
-pub(crate) fn splice(old: &[u64], new: &[u64]) -> Option<(u32, u32, u32)> {
-    let max = old.len().min(new.len());
-    let start = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-    let end = old[start..]
-        .iter()
-        .rev()
-        .zip(new[start..].iter().rev())
-        .take(max - start)
-        .take_while(|(a, b)| a == b)
-        .count();
-    let removed = old.len() - start - end;
-    let inserted = new.len() - start - end;
-    (removed > 0 || inserted > 0).then_some((start as u32, removed as u32, inserted as u32))
-}
-
 #[cfg(test)]
 mod tests {
     use super::ViewableItems;
@@ -560,15 +559,5 @@ mod tests {
         };
         assert_eq!(none.indices().count(), 0);
         assert_eq!(none.changed().collect::<Vec<_>>(), [(0, false), (1, false)]);
-    }
-
-    #[test]
-    fn splices_keep_the_common_ends() {
-        use super::splice;
-        assert_eq!(splice(&[1, 2, 3], &[1, 2, 3]), None);
-        assert_eq!(splice(&[1, 2, 3], &[0, 1, 2, 3]), Some((0, 0, 1)));
-        assert_eq!(splice(&[1, 2, 3], &[1, 3]), Some((1, 1, 0)));
-        assert_eq!(splice(&[1, 2, 3], &[1, 2, 3, 4]), Some((3, 0, 1)));
-        assert_eq!(splice(&[1, 1], &[1]), Some((1, 1, 0)));
     }
 }

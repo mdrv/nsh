@@ -19,7 +19,7 @@
 //!   dialog, a sheet, a menu) covers it. The window takes the input and
 //!   forwards to the page what nsh's hit testing gives it.
 //! - **Registered components**: [`crate::AppView::register_component`]
-//!   names a factory; the core creates a [`ViewKind::Native`] container,
+//!   names a factory; the core creates a [`nsh_core::ViewKind::Native`] container,
 //!   names the component ([`MountItem::Component`]) and sends its props as
 //!   JSON as they change. A component draws with Direct2D in the view
 //!   ([`NativeComponent::draw`]) or brings a child window of its own
@@ -38,7 +38,9 @@
 //!
 //! [`MountItem::Component`]: nsh_core::MountItem::Component
 
+#[cfg(feature = "media")]
 mod video;
+#[cfg(feature = "webview")]
 mod web;
 
 use std::{
@@ -49,7 +51,7 @@ use std::{
 
 use nsh_core::{
     Bounds, Command, EventKind, EventPayload, NativeProps, NodeId, PayloadValue, Points, Size,
-    ViewKind, geometry::Point,
+    geometry::Point,
 };
 use nsh_engine::{Access, EngineControl};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -334,6 +336,12 @@ impl NativeState {
         *self.access.borrow_mut() = Some(access);
     }
 
+    /// What the running app may reach (all before an app starts): what
+    /// its image loads check their redirects against.
+    pub(crate) fn access(&self) -> Arc<Access> {
+        self.access.borrow().clone().unwrap_or_default()
+    }
+
     /// The application id ([`crate::AppOptions::app_id`]): web views keep
     /// their profile in `%LOCALAPPDATA%\<app id>\WebView2`.
     pub(crate) fn set_app_id(&self, app_id: &str) {
@@ -344,9 +352,10 @@ impl NativeState {
     /// close.
     pub(crate) fn clear(&self) {
         let hosts = std::mem::take(&mut *self.hosts.borrow_mut());
+        #[cfg(feature = "webview")]
         for host in hosts.values() {
             if let Host::Web(w) = host {
-                w.close();
+                w.shutdown();
             }
         }
         drop(hosts);
@@ -355,7 +364,9 @@ impl NativeState {
 
 /// What a native view holds.
 enum Host {
+    #[cfg(feature = "media")]
     Video(Rc<video::VideoItem>),
+    #[cfg(feature = "webview")]
     Web(Rc<web::WebItem>),
     Component(Rc<ComponentItem>),
 }
@@ -363,7 +374,9 @@ enum Host {
 impl Host {
     fn item(&self) -> Rc<dyn Hosted> {
         match self {
+            #[cfg(feature = "media")]
             Host::Video(v) => v.clone(),
+            #[cfg(feature = "webview")]
             Host::Web(w) => w.clone(),
             Host::Component(c) => c.clone(),
         }
@@ -377,7 +390,9 @@ impl Drop for Host {
         // last frame of a video, and a web view's page until the view is
         // not drawn anymore.
         match self {
+            #[cfg(feature = "media")]
             Host::Video(v) => v.close(),
+            #[cfg(feature = "webview")]
             Host::Web(w) => w.retire(),
             Host::Component(c) => c.close(),
         }
@@ -388,8 +403,10 @@ impl Drop for Host {
 pub(crate) fn create(surface: &Rc<Surface>, view: &NshView) {
     let id = view.id();
     let host = match view.kind() {
-        ViewKind::Video => Host::Video(video::VideoItem::new(surface, id)),
-        ViewKind::WebView => Host::Web(web::WebItem::new(surface, view)),
+        #[cfg(feature = "media")]
+        nsh_core::ViewKind::Video => Host::Video(video::VideoItem::new(surface, id)),
+        #[cfg(feature = "webview")]
+        nsh_core::ViewKind::WebView => Host::Web(web::WebItem::new(surface, view)),
         _ => Host::Component(Rc::new(ComponentItem {
             surface: Rc::downgrade(surface),
             id,
@@ -428,10 +445,12 @@ pub(crate) fn props(surface: &Rc<Surface>, view: &NshView, props: &NativeProps) 
         .get(&view.id())
         .map(Host::item_ref);
     match (host, props) {
+        #[cfg(feature = "media")]
         (Some(HostRef::Video(video)), NativeProps::Video(p)) => {
             let base = surface.native.asset_base.borrow().clone();
             video.set(surface, p, base.as_ref());
         }
+        #[cfg(feature = "webview")]
         (Some(HostRef::Web(web)), NativeProps::WebView(p)) => web.set(surface, view, p),
         _ => log::debug!("native: props for a view of another kind"),
     }
@@ -496,7 +515,9 @@ pub(crate) fn command(surface: &Rc<Surface>, view: &NshView, command: &Command) 
         .get(&view.id())
         .map(Host::item_ref);
     match (host, command) {
+        #[cfg(feature = "media")]
         (Some(HostRef::Video(video)), Command::Seek(seconds)) => video.seek(*seconds),
+        #[cfg(feature = "webview")]
         (Some(HostRef::Web(web)), _) => web.command(command),
         (Some(HostRef::Component(item)), Command::Native { name, args }) => {
             let taken = item.component.borrow_mut().take();
@@ -512,7 +533,9 @@ pub(crate) fn command(surface: &Rc<Surface>, view: &NshView, command: &Command) 
 /// A host's item, cloned out of the map so that no borrow of it is held
 /// while the control runs.
 enum HostRef {
+    #[cfg(feature = "media")]
     Video(Rc<video::VideoItem>),
+    #[cfg(feature = "webview")]
     Web(Rc<web::WebItem>),
     Component(Rc<ComponentItem>),
 }
@@ -520,7 +543,9 @@ enum HostRef {
 impl Host {
     fn item_ref(&self) -> HostRef {
         match self {
+            #[cfg(feature = "media")]
             Host::Video(v) => HostRef::Video(v.clone()),
+            #[cfg(feature = "webview")]
             Host::Web(w) => HostRef::Web(w.clone()),
             Host::Component(c) => HostRef::Component(c.clone()),
         }
@@ -549,6 +574,7 @@ pub(crate) fn take_keyboard(surface: &Surface) {
 }
 
 /// The web view of node `id`.
+#[cfg(feature = "webview")]
 fn web_item(surface: &Surface, id: NodeId) -> Option<Rc<web::WebItem>> {
     match surface.native.hosts.borrow().get(&id) {
         Some(Host::Web(item)) => Some(item.clone()),
@@ -730,27 +756,32 @@ impl Wheel {
 /// the components' windows it holds go back to the main window, hidden, so
 /// that they are not destroyed with it.
 pub(crate) fn window_closing(surface: &Surface, hwnd: HWND) {
-    let (webs, components): (Vec<_>, Vec<_>) = {
-        let hosts = surface.native.hosts.borrow();
-        let webs = hosts
+    #[cfg(feature = "webview")]
+    {
+        let webs: Vec<_> = surface
+            .native
+            .hosts
+            .borrow()
             .values()
             .filter_map(|h| match h {
                 Host::Web(w) if w.hwnd() == Some(hwnd) => Some(w.clone()),
                 _ => None,
             })
             .collect();
-        let components = hosts
+        for web in webs {
+            web.close();
+        }
+    }
+    let components: Vec<_> = {
+        let hosts = surface.native.hosts.borrow();
+        hosts
             .values()
             .filter_map(|h| match h {
                 Host::Component(c) if c.parent.get() == Some(hwnd) => Some(c.clone()),
                 _ => None,
             })
-            .collect();
-        (webs, components)
+            .collect()
     };
-    for web in webs {
-        web.close();
-    }
     let main = surface.hwnd();
     for item in components {
         if let Some(child) = item.window.get() {
@@ -909,6 +940,7 @@ fn intersect(a: RECT, b: RECT) -> Option<RECT> {
 
 /// Where a video's source is.
 #[derive(Debug, PartialEq)]
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 pub(crate) enum Location {
     /// A URL Media Foundation opens (`https://`, `file://`, ...).
     Url(String),
@@ -918,6 +950,7 @@ pub(crate) enum Location {
 
 impl Location {
     /// The URL the media engine opens.
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
     pub(crate) fn url(&self) -> String {
         match self {
             Location::Url(url) => url.clone(),
@@ -927,6 +960,7 @@ impl Location {
 }
 
 /// Resolves `source` (`asset:/` URIs against `base`).
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 pub(crate) fn locate(source: &str, base: Option<&AssetBase>) -> Option<Location> {
     if let Some(path) = source.strip_prefix("asset:/") {
         let path = path.trim_start_matches('/');
@@ -953,6 +987,7 @@ pub(crate) fn locate(source: &str, base: Option<&AssetBase>) -> Option<Location>
 /// A `file:` URL for a Windows path (`C:\a b\c.mp4` →
 /// `file:///C:/a%20b/c.mp4`; `\\server\share\c.mp4` →
 /// `file://server/share/c.mp4`).
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 fn file_url(path: &str) -> String {
     let unc = path.strip_prefix(r"\\");
     let mut url = String::with_capacity(path.len() + 8);
@@ -972,11 +1007,13 @@ fn file_url(path: &str) -> String {
 
 /// Sends a control's events to JS, when JS listens to them.
 #[derive(Clone)]
+#[cfg_attr(not(any(feature = "webview", feature = "media")), allow(dead_code))]
 struct Emitter {
     surface: Weak<Surface>,
     id: NodeId,
 }
 
+#[cfg_attr(not(any(feature = "webview", feature = "media")), allow(dead_code))]
 impl Emitter {
     fn new(surface: &Rc<Surface>, id: NodeId) -> Self {
         Emitter {
@@ -985,21 +1022,29 @@ impl Emitter {
         }
     }
 
+    /// Whether the view has a listener for `kind`.
+    fn listens(&self, kind: EventKind) -> bool {
+        let Some(surface) = self.surface.upgrade() else {
+            return false;
+        };
+        surface
+            .view(self.id)
+            .is_some_and(|v| v.try_state().is_none_or(|s| s.events.contains(kind)))
+    }
+
     fn emit(&self, kind: EventKind, payload: impl FnOnce() -> EventPayload) {
         let Some(surface) = self.surface.upgrade() else {
             return;
         };
         // A view whose state is being changed right now cannot be read:
         // send the event, JS ignores events it has no handler for.
-        let listens = surface
-            .view(self.id)
-            .is_some_and(|v| v.try_state().is_none_or(|s| s.events.contains(kind)));
-        if listens {
+        if self.listens(kind) {
             surface.event(self.id, kind, payload());
         }
     }
 }
 
+#[cfg_attr(not(any(feature = "webview", feature = "media")), allow(dead_code))]
 fn error(message: String) -> EventPayload {
     EventPayload::Map(vec![("message", PayloadValue::Str(message))])
 }

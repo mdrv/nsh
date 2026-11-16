@@ -10,8 +10,9 @@
 //!   commit is one hop to the main queue ([`surface`]).
 //! - Text is typeset by CoreText on the engine thread; the main thread
 //!   only draws the lines it produced ([`text`]).
-//! - Native animations run on the root view's display link
-//!   ([`animation`]).
+//! - Native animations run on the surface's display link, made from the
+//!   root view of one of its windows that shows ([`surface`],
+//!   [`animation`]).
 //! - Desktop input as the Linux backend has it: the root view takes the
 //!   mouse, wheel, trackpad and keyboard and picks views itself
 //!   ([`input`]); scroll views keep offsets of their own ([`scroll`]).
@@ -26,7 +27,6 @@ mod access;
 mod agent;
 mod animation;
 mod app;
-mod audio;
 mod blur;
 mod canvas;
 mod chrome;
@@ -40,7 +40,9 @@ mod global_shortcut;
 mod gpu;
 mod image;
 mod input;
+mod keyboard;
 mod keymap;
+mod login_item;
 mod mount;
 mod native;
 mod navigation;
@@ -52,7 +54,7 @@ mod selectable_view;
 mod shader;
 mod sight;
 // Shared with iOS.
-use nsh_platform_apple::{notifications, speech};
+use nsh_platform_apple::{audio, notifications, speech};
 mod surface;
 #[cfg(feature = "dev")]
 mod synth;
@@ -78,8 +80,8 @@ pub use objc2_foundation;
 pub use crate::app::set_root;
 pub use crate::{
     app::{
-        AppOptions, AppSource, AppView, WindowDisplay, quit_app, run_app, set_components,
-        set_ui_sets,
+        ActivationPolicy, AppOptions, AppSource, AppView, WindowDisplay, quit_app, run_app,
+        set_components, set_ui_sets,
     },
     image::AssetBase,
     native::{ComponentContext, ComponentFactory, Components, NativeComponent},

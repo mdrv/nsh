@@ -52,6 +52,8 @@ use crate::{image::AssetBase, surface::Surface, view::NshView};
 
 #[cfg(feature = "webview")]
 mod web;
+#[cfg(feature = "webview")]
+mod web_scheme;
 
 /// A native component made by a registered factory.
 ///
@@ -341,7 +343,7 @@ pub(crate) fn props(surface: &Rc<Surface>, view: &NshView, props: &NativeProps) 
             Some(Host::Web(None))
         );
         if unmade {
-            let web = web::WebHost::new(surface, view, p.incognito);
+            let web = web::WebHost::new(surface, view, p);
             if let Some(Host::Web(slot)) = surface.native.hosts.borrow_mut().get_mut(&view.id()) {
                 *slot = Some(web);
             }
@@ -409,6 +411,25 @@ pub(crate) fn command(surface: &Rc<Surface>, view: &NshView, command: &Command) 
             if let Some(mut component) = take_component(surface, view.id()) {
                 component.command(name, args);
                 put_component(surface, view.id(), component);
+            }
+        }
+        #[cfg(feature = "webview")]
+        Command::WebViewRequest(request) => {
+            // Outside the hosts' borrow: WebKit may call back at once.
+            let target = match surface.native.hosts.borrow().get(&view.id()) {
+                Some(Host::Web(Some(web))) => Some(web.request_target()),
+                _ => None,
+            };
+            match target {
+                Some((web, shared)) => web::web_request(&web, &shared, request),
+                None => surface.event(
+                    view.id(),
+                    EventKind::WebViewReply,
+                    nsh_core::webview::reply(
+                        request.id,
+                        Err("the web view is not available".into()),
+                    ),
+                ),
             }
         }
         #[cfg(feature = "webview")]
@@ -596,12 +617,15 @@ struct Emitter {
 }
 
 impl Emitter {
-    fn emit(&self, kind: EventKind, payload: impl FnOnce() -> EventPayload) {
-        let listens = self
-            .view
+    /// Whether the view has a listener for `kind`.
+    fn listens(&self, kind: EventKind) -> bool {
+        self.view
             .upgrade()
-            .is_some_and(|v| v.state().events.contains(kind));
-        if !listens {
+            .is_some_and(|v| v.state().events.contains(kind))
+    }
+
+    fn emit(&self, kind: EventKind, payload: impl FnOnce() -> EventPayload) {
+        if !self.listens(kind) {
             return;
         }
         if let Some(surface) = self.surface.upgrade() {

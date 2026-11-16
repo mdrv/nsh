@@ -21,6 +21,19 @@ pub(super) fn rewrite(source: &str) -> Cow<'_, str> {
     if !source.contains("\\(") && !source.contains("\\[") {
         return Cow::Borrowed(source);
     }
+    Cow::Owned(rewrite_lines(source, &mut |_, _| {}))
+}
+
+/// [`rewrite`] of `source`, which also tells where its lines after a blank
+/// line outside fenced code start: `blank(at, written)`, `at` the offset in
+/// `source` and `written` the one in what is returned. The scan is there in
+/// the state it starts in, so what follows such a line is rewritten the
+/// same with or without the text before it.
+pub(super) fn rewrite_blanks(source: &str, blank: &mut dyn FnMut(usize, usize)) -> String {
+    rewrite_lines(source, blank)
+}
+
+fn rewrite_lines(source: &str, blank: &mut dyn FnMut(usize, usize)) -> String {
     let lines = lines(source);
     let mut out = String::with_capacity(source.len() + 16);
     // The lines of text (not code, not blank) not written out yet: a
@@ -58,12 +71,17 @@ pub(super) fn rewrite(source: &str) -> Cow<'_, str> {
             continue;
         }
         out.push_str(&source[start..next]);
+        // A blank line that ended: no fence is open (a fence's opening line
+        // is no blank line) and no text waits to be written.
+        if fence.is_none() && end < source.len() {
+            blank(next, out.len());
+        }
         i += 1;
     }
     if let Some(from) = text {
         inline(&source[from..], &mut out);
     }
-    Cow::Owned(out)
+    out
 }
 
 /// The lines of `source`: start, end without the line ending, start of the
@@ -173,9 +191,14 @@ fn inline(text: &str, out: &mut String) {
     let bytes = text.as_bytes();
     let mut copied = 0;
     let mut i = 0;
+    let mut span_index = 0;
     while i < bytes.len() {
-        if let Some(&(_, e)) = code.iter().find(|&&(s, _)| s == i) {
-            i = e;
+        while code.get(span_index).is_some_and(|&(start, _)| start < i) {
+            span_index += 1;
+        }
+        if let Some(&(_, end)) = code.get(span_index).filter(|&&(start, _)| start == i) {
+            i = end;
+            span_index += 1;
             continue;
         }
         if open_code.is_some_and(|(s, _)| i >= s) {
@@ -251,6 +274,18 @@ mod tests {
         check("escaped \\\\(x\\\\)", "escaped \\\\(x\\\\)");
         check("costs \\($5\\)", "costs \\($5\\)");
         check("plain (x) and [y]", "plain (x) and [y]");
+    }
+
+    #[test]
+    fn code_after_formulas_is_preserved() {
+        check(
+            r"\(a `one` + `two`\) `\(code\)` and \(x\)",
+            r"$$a `one` + `two`$$ `\(code\)` and $$x$$",
+        );
+        check(
+            r"\[a `one` = `two`\] ``\[code ` literal\]`` and \(x\)",
+            r"$$a `one` = `two`$$ ``\[code ` literal\]`` and $$x$$",
+        );
     }
 
     #[test]

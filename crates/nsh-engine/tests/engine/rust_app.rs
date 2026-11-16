@@ -45,6 +45,7 @@ fn start() -> (Engine, Receiver<MountBatch>) {
         })),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -68,6 +69,7 @@ fn start() -> (Engine, Receiver<MountBatch>) {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -124,6 +126,7 @@ fn a_rust_app_starts_in_its_appearance() {
         app: App::Rust(Root::of::<WithCard>().appearance(nsh_core::platform::Appearance::Dark)),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -146,6 +149,7 @@ fn a_rust_app_starts_in_its_appearance() {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     let _engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -185,6 +189,7 @@ fn rust_components_navigate_with_native_stacks() {
         app: App::Rust(Root::of::<Navigation>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -207,6 +212,7 @@ fn rust_components_navigate_with_native_stacks() {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -280,6 +286,7 @@ fn rust_components_pass_content_to_rust_components() {
         app: App::Rust(Root::of::<WithCard>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -302,6 +309,7 @@ fn rust_components_pass_content_to_rust_components() {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -385,6 +393,7 @@ fn rust_components_take_the_back_button() {
         app: App::Rust(Root::of::<BackCounter>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -407,6 +416,7 @@ fn rust_components_take_the_back_button() {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -543,6 +553,7 @@ fn rust_components_hear_layouts_and_scrolls() {
         app: App::Rust(Root::of::<Measured>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -565,6 +576,7 @@ fn rust_components_hear_layouts_and_scrolls() {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     // Until `until` shows; the scroll view's id on the way.
@@ -624,6 +636,7 @@ fn nested_components_in_list_rows_reach_the_list_owner() {
         app: App::Rust(Root::of::<ButtonRows>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -646,6 +659,7 @@ fn nested_components_in_list_rows_reach_the_list_owner() {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let mut parents = std::collections::HashMap::new();
@@ -692,6 +706,7 @@ fn content_a_component_does_not_place_is_not_shown() {
         app: App::Rust(Root::of::<WithSheet>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -714,6 +729,7 @@ fn content_a_component_does_not_place_is_not_shown() {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let mut parents: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();

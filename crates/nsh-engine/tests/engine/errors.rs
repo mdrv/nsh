@@ -36,6 +36,7 @@ fn config(bundle: Bundle, limits: nsh_engine::Limits) -> EngineConfig {
         app: nsh_engine::App::Js(bundle),
         viewport: Size::new(px(100.0), px(100.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -58,6 +59,7 @@ fn config(bundle: Bundle, limits: nsh_engine::Limits) -> EngineConfig {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     }
 }
 
@@ -107,6 +109,7 @@ fn bundle_app(name: &str, minify: bool, source: &str) -> nsh_bundler::Bundle {
         minify,
         split: false,
         ui_sets: vec![nsh_base::registry().into()],
+        ..Default::default()
     })
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -123,6 +126,7 @@ fn first_error(bundle: Bundle) -> String {
         app: nsh_engine::App::Js(bundle),
         viewport: Size::new(px(100.0), px(100.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -145,6 +149,7 @@ fn first_error(bundle: Bundle) -> String {
         speech: None,
         audio: None,
         windows: None,
+        login_item: None,
     };
     let _engine = Engine::start(config, || ApproxTextEngine, sink).unwrap();
     rx.recv_timeout(Duration::from_secs(5))

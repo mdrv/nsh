@@ -12,7 +12,7 @@
 //!   window loses the focus: answered on the spot, JS hears about it
 //!   afterwards.
 //! - **Limits** the window procedure enforces: the minimum and maximum
-//!   size (`WM_GETMINMAXINFO`), the aspect ratio (`WM_SIZING`), what the
+//!   size (`WM_GETMINMAXINFO`), what the
 //!   user may do (`WM_SYSCOMMAND`).
 //! - **Hit testing** ([`hit`]): the views marked `windowDrag`,
 //!   `windowControl` and `windowResize` answer as the system's caption,
@@ -49,7 +49,6 @@ pub(crate) struct Attrs {
     pub(crate) frame: WindowFrameStyle,
     pub(crate) min_size: Option<Size<Points>>,
     pub(crate) max_size: Option<Size<Points>>,
-    pub(crate) aspect_ratio: Option<f32>,
     pub(crate) resizable: bool,
     pub(crate) movable: bool,
     pub(crate) minimizable: bool,
@@ -67,8 +66,6 @@ pub(crate) struct Attrs {
     pub(crate) transparent: bool,
     pub(crate) backdrop: Backdrop,
     pub(crate) shadow: bool,
-    pub(crate) color_scheme: Appearance,
-    pub(crate) content_protected: bool,
     pub(crate) progress: Option<WindowProgress>,
 }
 
@@ -80,7 +77,6 @@ impl Default for Attrs {
             frame: WindowFrameStyle::Default,
             min_size: None,
             max_size: None,
-            aspect_ratio: None,
             resizable: true,
             movable: true,
             minimizable: true,
@@ -97,8 +93,6 @@ impl Default for Attrs {
             transparent: false,
             backdrop: Backdrop::None,
             shadow: true,
-            color_scheme: Appearance::System,
-            content_protected: false,
             progress: None,
         };
         attrs.merge(&WindowAttributes::for_kind(WindowKind::Normal));
@@ -128,7 +122,6 @@ impl Attrs {
             frame,
             min_size,
             max_size,
-            aspect_ratio,
             resizable,
             movable,
             minimizable,
@@ -144,8 +137,6 @@ impl Attrs {
             transparent,
             backdrop,
             shadow,
-            color_scheme,
-            content_protected,
             progress
         );
         if let Some(pointer) = diff.pointer_events {
@@ -385,35 +376,6 @@ pub(crate) fn command_allowed(command: u32, attrs: &Attrs) -> bool {
     }
 }
 
-/// The dragged rectangle `rect` (pixels, the outer frame) kept at
-/// `ratio` (width / height) of its content, whose frame takes `extra`
-/// pixels (width, height): the edge dragged (`WMSZ_*`) decides which side
-/// follows.
-pub(crate) fn keep_aspect(rect: &mut RECT, edge: u32, ratio: f32, extra: (i32, i32)) {
-    if !(ratio.is_finite() && ratio > 0.0) {
-        return;
-    }
-    let width = (rect.right - rect.left - extra.0).max(1);
-    let height = (rect.bottom - rect.top - extra.1).max(1);
-    match edge {
-        // The width follows the height.
-        WMSZ_TOP | WMSZ_BOTTOM => {
-            let width = (height as f32 * ratio).round() as i32 + extra.0;
-            rect.right = rect.left + width;
-        }
-        // The height follows the width.
-        WMSZ_LEFT | WMSZ_RIGHT | WMSZ_BOTTOMRIGHT | WMSZ_BOTTOMLEFT => {
-            let height = (width as f32 / ratio).round() as i32 + extra.1;
-            rect.bottom = rect.top + height;
-        }
-        WMSZ_TOPLEFT | WMSZ_TOPRIGHT => {
-            let height = (width as f32 / ratio).round() as i32 + extra.1;
-            rect.top = rect.bottom - height;
-        }
-        _ => {}
-    }
-}
-
 /// A window's minimum and maximum outer sizes in pixels (`None`: unset).
 pub(crate) type TrackSizes = (Option<(i32, i32)>, Option<(i32, i32)>);
 
@@ -499,6 +461,9 @@ pub(crate) struct Shell {
     pub(crate) closing: Cell<bool>,
     /// The title bar's area last reported (windows of the app's own).
     pub(crate) title_bar: Cell<Option<Edges<Points>>>,
+    /// The material is the zoomed one's ([`set_material`]): square
+    /// corners, no border over the screen's edges.
+    pub(crate) zoomed_material: Cell<bool>,
 }
 
 impl Shell {
@@ -520,6 +485,7 @@ impl Shell {
             tab_deleted: Cell::new(false),
             closing: Cell::new(false),
             title_bar: Cell::new(None),
+            zoomed_material: Cell::new(false),
         }
     }
 
@@ -635,11 +601,8 @@ pub(crate) fn sync(surface: &Surface, hwnd: HWND, before: Option<Attrs>, after: 
     if frame {
         crate::chrome::frame_changed(surface, hwnd);
     }
-    if changed(&|b| {
-        b.min_size != after.min_size
-            || b.max_size != after.max_size
-            || b.aspect_ratio != after.aspect_ratio
-    }) && (before.is_some() || after.min_size.is_some() || after.max_size.is_some())
+    if changed(&|b| b.min_size != after.min_size || b.max_size != after.max_size)
+        && (before.is_some() || after.min_size.is_some() || after.max_size.is_some())
     {
         clamp_size(hwnd, &after);
     }
@@ -662,14 +625,14 @@ pub(crate) fn sync(surface: &Surface, hwnd: HWND, before: Option<Attrs>, after: 
     }) && (before.is_some() || after.backdrop != Backdrop::None || after.frameless())
     {
         set_material(hwnd, &after);
+        // The background a composed window clears to follows its backdrop
+        // ([`crate::surface::Surface::transparent`]).
+        if before.is_some_and(|b| b.backdrop != after.backdrop) {
+            surface.invalidate();
+        }
     }
-    if changed(&|b| b.color_scheme != after.color_scheme) {
-        set_color_scheme(surface, hwnd, after.color_scheme);
-    }
-    if changed(&|b| b.content_protected != after.content_protected)
-        && (before.is_some() || after.content_protected)
-    {
-        set_protected(hwnd, after.content_protected);
+    if before.is_none() {
+        set_color_scheme(surface, hwnd, Appearance::System);
     }
     if changed(&|b| b.progress != after.progress) && (before.is_some() || after.progress.is_some())
     {
@@ -744,9 +707,6 @@ fn clamp_size(hwnd: HWND, attrs: &Attrs) {
 pub(crate) fn clamped(size: (i32, i32), attrs: &Attrs, scale: f32) -> (i32, i32) {
     let px = |v: Points| (v.0 * scale).round() as i32;
     let (mut w, mut h) = size;
-    if let Some(ratio) = attrs.aspect_ratio.filter(|r| r.is_finite() && *r > 0.0) {
-        h = (w as f32 / ratio).round() as i32;
-    }
     if let Some(min) = attrs.min_size {
         w = w.max(px(min.width));
         h = h.max(px(min.height));
@@ -805,11 +765,19 @@ fn set_tab(hwnd: HWND, show: bool) {
 fn set_material(hwnd: HWND, attrs: &Attrs) {
     let frameless = attrs.frameless();
     let backdrop = attrs.backdrop != Backdrop::None;
+    // A zoomed frameless window's client area is the monitor's: the
+    // extended frame's border would run along the screen's edges and the
+    // rounded corners would cut them (a system-framed window hides both
+    // beyond the monitor, which a frameless one has no room for). A
+    // zoomed window has no use for its shadow either, so its material is
+    // the bare one's while zoomed.
+    // SAFETY: a plain query on a live window.
+    let zoomed = frameless && unsafe { IsZoomed(hwnd) }.as_bool();
     // A frameless window's shadow is the frame's, extended by a pixel;
     // a backdrop shows through the whole client area.
     let margin = if backdrop {
         -1
-    } else if frameless && attrs.shadow && !attrs.transparent {
+    } else if frameless && attrs.shadow && !attrs.transparent && !zoomed {
         1
     } else {
         0
@@ -824,8 +792,8 @@ fn set_material(hwnd: HWND, attrs: &Attrs) {
     // No shadow and square corners: a frameless window without a shadow
     // (or see-through) is only what the app draws.
     let bare = frameless && (!attrs.shadow || attrs.transparent);
-    let policy: i32 = if bare { 1 } else { 0 };
-    let corners: i32 = if bare { 1 } else { 0 };
+    let policy: i32 = if bare || zoomed { 1 } else { 0 };
+    let corners: i32 = if bare || zoomed { 1 } else { 0 };
     let set = |attribute, value: &i32| {
         // SAFETY: an i32-sized attribute value.
         unsafe {
@@ -843,6 +811,23 @@ fn set_material(hwnd: HWND, attrs: &Attrs) {
     let _ = set(DWMWA_WINDOW_CORNER_PREFERENCE, &corners);
     // SAFETY: a plain call with a local structure.
     let _ = unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) };
+    if let Some(shell) = crate::window::shell(hwnd) {
+        shell.zoomed_material.set(zoomed);
+    }
+}
+
+/// A window was maximized or restored (`WM_SIZE`): its material follows
+/// the zoom state, which [`set_material`] only saw when its attributes
+/// changed.
+pub(crate) fn zoom_changed(hwnd: HWND) {
+    let Some(shell) = crate::window::shell(hwnd) else {
+        return;
+    };
+    // SAFETY: a plain query on a live window.
+    let zoomed = shell.attrs().frameless() && unsafe { IsZoomed(hwnd) }.as_bool();
+    if shell.zoomed_material.get() != zoomed {
+        set_material(hwnd, &shell.attrs());
+    }
 }
 
 /// The window's frame dark or light: its own scheme, else the app's.
@@ -856,27 +841,9 @@ pub(crate) fn set_color_scheme(surface: &Surface, hwnd: HWND, scheme: Appearance
     crate::window::invalidate(hwnd);
 }
 
-/// Draws window `hwnd` (its caption buttons) dark: its own scheme, else
-/// the app's.
-pub(crate) fn dark(surface: &Surface, hwnd: HWND) -> bool {
-    match crate::window::shell(hwnd).map(|s| s.attrs().color_scheme) {
-        Some(Appearance::Dark) => true,
-        Some(Appearance::Light) => false,
-        _ => crate::system::dark(surface),
-    }
-}
-
-/// Keeps the window out of screenshots and recordings (Windows 10 2004's
-/// exclusion; before, a black rectangle shows instead).
-fn set_protected(hwnd: HWND, protected: bool) {
-    // SAFETY: plain calls on a live top-level window.
-    unsafe {
-        if !protected {
-            let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE);
-        } else if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
-            let _ = SetWindowDisplayAffinity(hwnd, WDA_MONITOR);
-        }
-    }
+/// Draws window `hwnd` (its caption buttons) dark: the app's scheme.
+pub(crate) fn dark(surface: &Surface, _hwnd: HWND) -> bool {
+    crate::system::dark(surface)
 }
 
 /// The progress on the window's taskbar button.
@@ -945,7 +912,7 @@ pub(crate) fn request(hwnd: HWND, request: &WindowRequest) -> bool {
                     crate::window::show(hwnd);
                 }
                 if crate::window::shell(hwnd).is_none_or(|s| s.attrs().focusable) {
-                    let _ = SetForegroundWindow(hwnd);
+                    crate::window::set_foreground(hwnd);
                 }
             }
             WindowRequest::Close => return false,
@@ -1193,35 +1160,6 @@ mod tests {
             assert!(command_allowed(command, &Attrs::default()), "{command:x}");
         }
         assert!(command_allowed(SC_RESTORE, &overlay));
-    }
-
-    #[test]
-    fn the_aspect_ratio_follows_the_dragged_edge() {
-        let extra = (16, 39);
-        let mut r = RECT {
-            left: 0,
-            top: 0,
-            right: 816,
-            bottom: 339,
-        };
-        keep_aspect(&mut r, WMSZ_RIGHT, 2.0, extra);
-        assert_eq!(r.bottom, 400 + 39);
-        let mut r = RECT {
-            left: 0,
-            top: 0,
-            right: 500,
-            bottom: 339,
-        };
-        keep_aspect(&mut r, WMSZ_BOTTOM, 2.0, extra);
-        assert_eq!(r.right, 600 + 16);
-        let mut r = RECT {
-            left: 0,
-            top: 100,
-            right: 816,
-            bottom: 500,
-        };
-        keep_aspect(&mut r, WMSZ_TOPLEFT, 2.0, extra);
-        assert_eq!((r.top, r.bottom), (500 - 439, 500));
     }
 
     #[test]

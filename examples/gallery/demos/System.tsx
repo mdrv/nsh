@@ -1,6 +1,6 @@
 import { cleanup, resource, signal, Text, View } from "nsh";
 import { createAnimatedValue, Easing } from "nsh";
-import { colorScheme, fontScale, windowSize } from "nsh";
+import { colorScheme, fontScale, horizontalSizeClass, verticalSizeClass, windowSize } from "nsh";
 import { AlertDialog, type AlertDialogAction, Dialog, type StatusBarForeground } from "nsh/base";
 import { keyboardFrame, safeArea } from "nsh";
 import { Menu } from "nsh/desktop";
@@ -28,7 +28,6 @@ function SafeAreaDiagram() {
         borderColor: colors.border,
         backgroundColor: colors.surface,
         backgroundImage: finish.card.backgroundImage,
-        boxShadow: isDark() ? "inset 0 1px 0 rgba(255,255,255,0.06)" : "inset 0 1px 0 #ffffff",
         overflow: "hidden",
       }}
     >
@@ -48,7 +47,7 @@ function Environment() {
     { label: "Left", value: safeArea().left },
   ];
   return (
-    <Card icon="system" title="Environment" subtitle="Updates when the window, insets or keyboard change" right={<Badge label="Live" tone="up" />}>
+    <Card icon="system" title="Environment" subtitle="Follows the window, insets and keyboard" right={<Badge label="Live" tone="up" />}>
       <View style={{ flexDirection: "row", gap: 16, alignItems: "center" }}>
         <View style={{ flex: 1, gap: 12 }}>
           <View style={{ gap: 2 }}>
@@ -68,6 +67,11 @@ function Environment() {
       <View style={{ height: 1, backgroundColor: colors.line }} />
       <View style={{ gap: 4 }}>
         {/* The terminal's figures carry their unit, as the keyboard's does. */}
+        <Caption label="Size classes" note="Resize or rotate the window" />
+        <View class="flex-row">
+          <Stat label="Horizontal" value={horizontalSizeClass() === "compact" ? "Compact" : "Regular"} width="50%" />
+          <Stat label="Vertical" value={verticalSizeClass() === "compact" ? "Compact" : "Regular"} width="50%" />
+        </View>
         <Caption label="Safe area insets" note={terminal ? undefined : "pt"} />
         <View style={{ flexDirection: "row" }}>
           <Each of={insets()}>

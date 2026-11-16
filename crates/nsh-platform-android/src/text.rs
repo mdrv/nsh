@@ -39,6 +39,7 @@ const UNDERLINE: i32 = 2;
 const STRIKE: i32 = 4;
 const DECORATION_COLOR: i32 = 8;
 const BACKGROUND: i32 = 16;
+const HIDDEN: i32 = 32;
 
 /// `0xRRGGBBAA` -> Android's `0xAARRGGBB`.
 #[inline]
@@ -124,6 +125,9 @@ impl TextEngine for AndroidTextEngine {
             if s.background.is_some() {
                 flags |= BACKGROUND;
             }
+            if s.hidden {
+                flags |= HIDDEN;
+            }
             ints.extend_from_slice(&[
                 span.start as i32,
                 span.end as i32,
@@ -174,9 +178,11 @@ impl TextEngine for AndroidTextEngine {
         };
         let density = self.density.get();
         let shadow = text.shadow;
-        // Offset, width, height and `verticalAlign` (0 baseline, 1 text
-        // top, 2 text bottom, 3 middle): `TextLayouts.Attachment` places it
-        // as `TextAttachment::ascent` does, with the run's font metrics.
+        // Offset, width, height, `verticalAlign` (0 baseline, 1 text top,
+        // 2 text bottom, 3 middle) and how far below its top its own
+        // baseline is (the first baseline of the text in it; negative: it has none):
+        // `TextLayouts.Attachment` places it as
+        // `AttachmentAlignments::ascent` does, with the run's font metrics.
         let attachments: Vec<f32> = text
             .attachments
             .iter()
@@ -187,7 +193,8 @@ impl TextEngine for AndroidTextEngine {
                     nsh_core::VerticalAlign::TextBottom => 2.0,
                     nsh_core::VerticalAlign::Middle => 3.0,
                 };
-                [a.index as f32, a.width.0, a.height.0, align]
+                let baseline = alignments.baseline(a.index).map_or(-1.0, |b| b.0.max(0.0));
+                [a.index as f32, a.width.0, a.height.0, align, baseline]
             })
             .collect();
         Prepared(with_env(|env| {
@@ -261,6 +268,15 @@ impl TextEngine for AndroidTextEngine {
         let width = f32::from_bits((packed as u64 >> 32) as u32);
         let height = f32::from_bits(packed as u64 as u32);
         Size::new(Points(width), Points(height))
+    }
+
+    fn first_baseline(&self, prepared: &Prepared, width: Points) -> Option<Points> {
+        // Typeset at the size it measures `width` wide, as the text is laid
+        // out: a `Layout`'s line ascent is what is between the line's top
+        // and its baseline (`getLineBaseline`).
+        let layout = self.layout(prepared, self.measure(prepared, Some(width)));
+        let first = self.lines(&layout).into_iter().next()?;
+        Some(first.y + first.ascender)
     }
 
     fn layout(&self, prepared: &Prepared, size: Size<Points>) -> TextLayout {

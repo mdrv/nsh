@@ -28,6 +28,7 @@ use super::{
 };
 use crate::{
     input,
+    link_hint::{HintAt, link_hint},
     rich_editor::{
         model::{DomOutputSpec, Mark, Node, utf16_len},
         state::{Decoration, DecorationKind},
@@ -55,6 +56,29 @@ pub(crate) fn part<E: Element>(el: E, rv: &Rv, part: Part) -> E {
         })
 }
 
+/// `el` with the classes and styles of each part of `list`, in order.
+pub(crate) fn parts<E: Element>(el: E, rv: &Rv, list: &'static [Part]) -> E {
+    let props = rv.props;
+    el.app_class(move || {
+        props.classes.with(|c| {
+            let joined: Vec<&str> = list
+                .iter()
+                .filter_map(|p| c.part(*p).map(|s| s.as_str()))
+                .collect();
+            (!joined.is_empty()).then(|| SharedString::from(joined.join(" ")))
+        })
+    })
+    .inline_style(move || {
+        props.styles.with(|s| {
+            Style::from_decls(
+                list.iter()
+                    .filter_map(|p| s.part(*p))
+                    .flat_map(|s| s.decls().iter().cloned()),
+            )
+        })
+    })
+}
+
 /// A box of the content, absolutely placed.
 fn rect(b: Bounds<Points>) -> View {
     view()
@@ -77,26 +101,46 @@ pub(crate) fn render(rv: Rv) -> impl IntoElement {
         &rv,
         Part::Root,
     );
+    // An unpadded box around the scroll view and the sink, so padding on
+    // the root insets both together and the sink stays in the viewport's
+    // coordinates. Both use `flex_auto` so an editor without a height is as
+    // tall as its document, and past its `max-height` it scrolls.
     root.child(
-        scroll()
-            .element_ref(&rv.scroll)
-            .flex_1()
-            .on_scroll(move |e: &ScrollEvent| {
-                scroll_rv.scroll_y.set(e.offset.y);
-                scroll_rv.scrolled.set(e.offset.y);
-                scroll_rv.viewport.set(e.size);
-            })
-            .on_layout(move |b: &Bounds<Points>| layout_rv.viewport.set(b.size))
-            .child(content(rv.clone())),
+        view()
+            .relative()
+            .flex_auto()
+            .overflow_hidden()
+            .child(
+                scroll()
+                    .element_ref(&rv.scroll)
+                    .flex_auto()
+                    // The editor's own taps keep its keyboard (Android's scroll
+                    // views dismiss it on a tap otherwise).
+                    .keyboard_taps(KeyboardTaps::Always)
+                    .on_scroll(move |e: &ScrollEvent| {
+                        scroll_rv.scroll_y.set(e.offset.y);
+                        scroll_rv.scrolled.set(e.offset.y);
+                        scroll_rv.viewport.set(e.size);
+                    })
+                    .on_layout(move |b: &Bounds<Points>| {
+                        layout_rv.viewport.set(b.size);
+                        // The viewport moving moves the content on the page
+                        // with no layout of the content's own.
+                        layout_rv.place();
+                    })
+                    .child(content(rv.clone())),
+            )
+            .child(sink(rv)),
     )
-    .child(sink(rv))
 }
 
 /// The content box: what presses and drags select in.
 fn content(rv: Rv) -> impl IntoElement {
     let desktop = is_desktop();
     let (down, tap, mov, up, end) = (rv.clone(), rv.clone(), rv.clone(), rv.clone(), rv.clone());
+    let (long, lift, armed, sweep) = (rv.clone(), rv.clone(), rv.clone(), rv.clone());
     let over = rv.clone();
+    let claim = rv.clone();
     let placed = rv.clone();
     let height = rv.content_height;
     part(
@@ -107,13 +151,19 @@ fn content(rv: Rv) -> impl IntoElement {
                 placed.place();
             })
             .relative()
+            .min_h(relative(1.0))
             .cursor(Cursor::Text),
         &rv,
         Part::Content,
     )
     .on(EventKind::PressDown, move |p: &EventPayload| {
-        if let (true, EventPayload::Press(e)) = (desktop, p) {
-            down.press(e.position, e.page_position, e.modifiers, e.clicks.max(1));
+        match (desktop, p) {
+            // A checkbox's press is its own: the caret stays where it is.
+            (true, EventPayload::Press(e)) if !down.on_checkbox(e.position) => {
+                down.press(e.position, e.page_position, e.modifiers, e.clicks.max(1))
+            }
+            (false, _) => down.touch_down(),
+            _ => {}
         }
     })
     // Where the pointer is, for drags the app starts from a page point.
@@ -127,26 +177,101 @@ fn content(rv: Rv) -> impl IntoElement {
             return;
         }
         if let EventPayload::Press(e) = p {
-            tap.press(e.position, e.page_position, e.modifiers, e.clicks.max(1));
+            tap.tap(e.position, e.page_position, e.modifiers, e.clicks.max(1));
         }
     })
-    // The mouse selects as it drags (a finger scrolls).
+    // A long press selects the word under the finger (touch screens; the
+    // mouse drags instead).
+    .when(!desktop, |v| {
+        v.on(EventKind::LongPress, move |p: &EventPayload| {
+            if let EventPayload::Press(e) = p {
+                long.long_press(e.position, e.page_position);
+            }
+        })
+        .on(EventKind::PressUp, move |_: &EventPayload| lift.touch_up())
+    })
+    // The mouse selects as it drags; a finger scrolls, unless a long press
+    // armed its sweep, which selects by words.
+    // Not from a task's checkbox: a responder granted after the pointer
+    // moved takes the press from the view under it, and a hand moves as it
+    // clicks, so the checkbox would miss presses.
     .claim_touches(TouchClaim::on_start().ask(move |request: &ClaimRequest| {
-        if desktop {
+        let page = request.event.page;
+        let on_checkbox = claim
+            .page_shift()
+            .is_some_and(|shift| claim.on_checkbox(Point::new(page.x + shift.x, page.y + shift.y)));
+        if desktop && !on_checkbox {
             request.claim();
         }
     }))
-    .keep_touches(desktop)
-    .on_responder_move(move |e: &ResponderEvent| mov.drag_to(e.page))
-    .on_responder_release(move |_: &ResponderEvent| up.release())
-    .on_responder_terminate(move |_: &ResponderEvent| end.release())
-    .child(selection_rects(rv.clone()))
-    .child(blocks(rv.clone(), DOC))
+    .claim_touches(TouchClaim::on_move().ask(move |request: &ClaimRequest| {
+        if !desktop && armed.sweep_armed() {
+            request.claim();
+        }
+    }))
+    .keep_touches(true)
+    .on_responder_grant(move |_: &ResponderEvent| {
+        if !desktop {
+            sweep.begin_sweep();
+        }
+    })
+    .on_responder_move(move |e: &ResponderEvent| match desktop {
+        true => mov.drag_to(e.page),
+        false => mov.sweep_to(e.page),
+    })
+    .on_responder_release(move |_: &ResponderEvent| match desktop {
+        true => up.release(),
+        false => up.end_sweep(),
+    })
+    .on_responder_terminate(move |_: &ResponderEvent| match desktop {
+        true => end.release(),
+        false => end.end_sweep(),
+    })
+    // Keep the intrinsic extent separate from the content box, whose
+    // min-height fills the viewport. In particular, a parent must be able
+    // to shrink an overestimated height and discover offscreen blocks
+    // without progressively enlarging the editor.
+    .child(
+        view()
+            .flex_shrink_0()
+            .on_layout({
+                let extent = rv.clone();
+                move |bounds: &Bounds<Points>| {
+                    // Root blocks are now relative to this wrapper, including
+                    // padding on Part::Content, rather than directly to content.
+                    extent.set_inset(DOC, bounds.origin);
+                    if extent.document_size.get_untracked() != bounds.size {
+                        extent.document_size.set(bounds.size);
+                    }
+                }
+            })
+            .child(blocks(rv.clone(), DOC)),
+    )
     .child(table::controls(rv.clone()))
     .child(gap_cursor(rv.clone()))
     .child(drop_cursor(rv.clone()))
     .child(caret(rv.clone()))
+    // The touch selection's handles take touches of their own.
+    .child(super::touch::handles(rv.clone()))
+    .child(content_layer(rv.clone()))
     .children(bubble_menu(rv))
+}
+
+/// The app's layer over the document (`contentLayer`): a box over the
+/// whole content box, after everything the editor draws, so it scrolls
+/// with the text. The box takes no press; what the app puts in it does.
+fn content_layer(rv: Rv) -> impl IntoElement {
+    let props = rv.props;
+    when(
+        move || props.content_layer.get().is_some(),
+        move || {
+            view()
+                .absolute()
+                .inset(px(0.0))
+                .pointer_events(PointerEvents::BoxNone)
+                .child(props.content_layer.place(|slot| slot))
+        },
+    )
 }
 
 /// The app's bubble menu: an overlay against an empty box over the
@@ -314,17 +439,25 @@ fn block(rv: Rv, item: ReadSignal<BlockItem>) -> AnyElement {
     // A task item is a row: its checkbox, then its content (Tiptap's
     // `<label><input></label><div>`), so the checkbox is inside the item
     // and takes presses.
+    // The content's holder is not the item's origin: the blocks in it are
+    // framed in the holder, so its offset is noted (`Geometry::insets`).
+    let inset_rv = rv.clone();
+    let holder = move |content: Option<AnyElement>| {
+        view()
+            .flex_1()
+            .min_w(px(0.0))
+            .on_layout(move |b: &Bounds<Points>| inset_rv.set_inset(id, b.origin))
+            .children(content)
+    };
     if task {
         return wrapper
             .flex_row()
             .child(task_checkbox(rv, item))
-            .child(view().flex_1().min_w(px(0.0)).children(content))
+            .child(holder(content))
             .into_element();
     }
     if marked && terminal {
-        return wrapper
-            .child(view().flex_1().min_w(px(0.0)).children(content))
-            .into_element();
+        return wrapper.child(holder(content)).into_element();
     }
     wrapper.children(content).into_element()
 }
@@ -345,28 +478,60 @@ fn render_kind(node: &Node) -> Option<&str> {
     node.ty().spec().extra.get("render")?.as_str()
 }
 
-/// An image node's `Image`: its `src`, `alt` (what screen readers say)
-/// and, when set, its `width` and `height` in points.
+/// An image node's `Image`: its `src` (a URL, a file path or `file:` URL,
+/// a `data:` URI, as `Image` takes them), `alt` (what screen readers say)
+/// and its `width` and `height` in points. A side it leaves out follows
+/// the image's natural size once known ([`image_box`]).
 fn image_of(node: &Node) -> AnyElement {
     let attrs = node.attrs();
-    let src = attrs.get("src").and_then(Value::as_str).unwrap_or_default();
-    let mut el = image(src.to_owned());
-    if let Some(alt) = attrs.get("alt").and_then(Value::as_str) {
-        el = el.label(alt.to_owned());
-    }
+    let src = attrs
+        .get("src")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let number = |key: &str| {
         attrs.get(key).and_then(|v| {
             v.as_f64()
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .map(|n| n as f32)
         })
     };
-    if let Some(w) = number("width") {
-        el = el.w(px(w as f32));
+    let (width, height) = (number("width"), number("height"));
+    // Its natural size, for the sides it leaves out (an image has no size
+    // of its own in layout: one without both sides showed nothing).
+    let natural = signal(None::<(f32, f32)>);
+    if (width.is_none() || height.is_none()) && !src.is_empty() {
+        let src = src.clone();
+        spawn(async move {
+            if let Ok(size) = image_size(src).await {
+                natural.set(Some((size.width.0 as f32, size.height.0 as f32)));
+            }
+        });
     }
-    if let Some(h) = number("height") {
-        el = el.h(px(h as f32));
+    let mut el = image(src);
+    if let Some(alt) = attrs.get("alt").and_then(Value::as_str) {
+        el = el.label(alt.to_owned());
     }
-    el.into_element()
+    let size = move || image_box(width, height, natural.get());
+    el.w(move || px(size().0))
+        .h(move || px(size().1))
+        .into_element()
+}
+
+/// The size an image node shows at, in points: the `width` and `height`
+/// it asks for; a side it leaves out from the other and the aspect ratio
+/// of its `natural` size; its natural size (a pixel a point, as a browser
+/// takes it) when it asks for neither. A side that cannot be known yet is
+/// 0.
+fn image_box(width: Option<f32>, height: Option<f32>, natural: Option<(f32, f32)>) -> (f32, f32) {
+    let natural = natural.filter(|(w, h)| *w > 0.0 && *h > 0.0);
+    let aspect = natural.map(|(w, h)| w / h);
+    match (width, height) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, aspect.map_or(0.0, |a| w / a)),
+        (None, Some(h)) => (aspect.map_or(0.0, |a| h * a), h),
+        (None, None) => natural.unwrap_or_default(),
+    }
 }
 
 /// A task item's checkbox, before the item's content: unstyled
@@ -882,6 +1047,12 @@ fn text_block(rv: Rv, item: ReadSignal<BlockItem>, owner: u64) -> impl IntoEleme
             |n| inline_rv.leaf_text(n),
         );
         if let Some(geo) = inline_rv.geo.borrow_mut().texts.get_mut(&id) {
+            // Its views moved within it: they report their widths anew.
+            // A move of the whole block (an edit in another) keeps them;
+            // its spans are not drawn again.
+            if geo.map != inline.map {
+                geo.widths.clear();
+            }
             geo.map = inline.map.clone();
         }
         inline
@@ -891,9 +1062,9 @@ fn text_block(rv: Rv, item: ReadSignal<BlockItem>, owner: u64) -> impl IntoEleme
         let it = item.get();
         placeholder_text(&ph_rv, &it)
     });
-    let (frame_rv, lines_rv, spans_rv) = (rv.clone(), rv.clone(), rv);
-    text("")
-        .on_layout(move |b: &Bounds<Points>| frame_rv.set_text_frame(id, owner, *b))
+    let (frame_rv, lines_rv, spans_rv, sel_rv) = (rv.clone(), rv.clone(), rv.clone(), rv);
+    // The text's box: its selection boxes, then the text over them.
+    let text = text("")
         .on(EventKind::TextLayout, move |p: &EventPayload| {
             if let EventPayload::TextLayout(lines) = p {
                 lines_rv.set_lines(id, lines.clone());
@@ -901,8 +1072,7 @@ fn text_block(rv: Rv, item: ReadSignal<BlockItem>, owner: u64) -> impl IntoEleme
         })
         .child(dynamic(move || {
             let inline = content.get();
-            let start = item.get_untracked().pos + 1;
-            let mut list = spans(&spans_rv, inline.pieces.clone(), start);
+            let mut list = spans(&spans_rv, inline.pieces.clone(), id, item);
             if inline.pieces == [Piece::Filler]
                 && let Some(label) = placeholder.get()
             {
@@ -916,7 +1086,12 @@ fn text_block(rv: Rv, item: ReadSignal<BlockItem>, owner: u64) -> impl IntoEleme
                 );
             }
             list
-        }))
+        }));
+    view()
+        .relative()
+        .on_layout(move |b: &Bounds<Points>| frame_rv.set_text_frame(id, owner, *b))
+        .child(selection_rects(sel_rv, id))
+        .child(text)
 }
 
 /// The placeholder of an empty textblock that shows one (Tiptap's
@@ -974,9 +1149,12 @@ fn placeholder_text(rv: &Rv, it: &BlockItem) -> Option<String> {
     Some(label)
 }
 
-/// The spans of a textblock's pieces.
-fn spans(rv: &Rv, pieces: Vec<Piece>, start: usize) -> Vec<AnyElement> {
+/// The spans of a textblock's pieces (textblock `id`, `item`).
+fn spans(rv: &Rv, pieces: Vec<Piece>, id: u64, item: ReadSignal<BlockItem>) -> Vec<AnyElement> {
     let props = rv.props;
+    // Inline leaves by their order in the block: a node view's key that
+    // typing before it does not change.
+    let mut leaves = 0usize;
     pieces
         .into_iter()
         .map(|piece| match piece {
@@ -992,6 +1170,23 @@ fn spans(rv: &Rv, pieces: Vec<Piece>, start: usize) -> Vec<AnyElement> {
                     return view.create(mark, &t);
                 }
                 let style_marks = marks.clone();
+                // The built-in link mark's destination, shown while the
+                // pointer rests on it, as `TextView`'s links show theirs (a
+                // terminal links the text itself). Hover only: the span
+                // takes no presses, so the editor's touches still place the
+                // caret, select and open the link (`handleClickLink`). An
+                // app's `MarkView` of a mark here renders the piece itself,
+                // above, and owns its hint.
+                let hint = (!crate::terminal::is_terminal())
+                    .then(|| link_destination(&marks))
+                    .flatten()
+                    .map(|(href, title)| {
+                        link_hint(
+                            move || Some(href.clone()),
+                            move || title.clone(),
+                            HintAt::Pointer,
+                        )
+                    });
                 text(t)
                     .app_class(move || {
                         props.classes.with(|c| {
@@ -1012,9 +1207,14 @@ fn spans(rv: &Rv, pieces: Vec<Piece>, start: usize) -> Vec<AnyElement> {
                             parts::merge(&list)
                         })
                     })
+                    .when_some(hint, |t, hint| t.child(hint))
                     .into_element()
             }
-            Piece::Leaf { node, offset, text } => leaf(rv, node, start + offset, text),
+            Piece::Leaf { node, offset, text } => {
+                leaves += 1;
+                let key = SharedString::from(format!("i{id}.{leaves}"));
+                leaf(rv, node, (id, offset), item, text, key)
+            }
             Piece::Widget { class } => view()
                 .app_class(class.map(SharedString::from))
                 .into_element(),
@@ -1026,10 +1226,41 @@ fn spans(rv: &Rv, pieces: Vec<Piece>, start: usize) -> Vec<AnyElement> {
         .collect()
 }
 
+/// The destination and title of the built-in link mark (`link`, Tiptap's
+/// `Link`) among `marks`, when it has a destination.
+fn link_destination(marks: &[Mark]) -> Option<(SharedString, Option<SharedString>)> {
+    let link = marks.iter().find(|m| m.ty().name() == "link")?;
+    let attr = |name: &str| {
+        link.attrs()
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| SharedString::from(s.to_owned()))
+    };
+    Some((attr("href")?, attr("title")))
+}
+
+/// The box of an inline view or image at `offset` in textblock `id`'s
+/// content: it reports its width, which its attachment character stands
+/// for when the geometry places the caret and finds the position at a
+/// point.
+fn inline_box(rv: &Rv, el: View, (id, offset): (u64, usize)) -> View {
+    let width_rv = rv.clone();
+    el.on_layout(move |b: &Bounds<Points>| width_rv.set_inline_width(id, offset, *b))
+}
+
 /// An inline leaf: its one-character text (a line break), its node view,
 /// the text it is drawn as (`drawn`, [`Rv::leaf_text`]), else a box of its
-/// part.
-fn leaf(rv: &Rv, node: Node, pos: usize, drawn: Option<String>) -> AnyElement {
+/// part. Its position is its textblock's current one plus its offset: an
+/// edit in a block before it moves it without drawing it again.
+fn leaf(
+    rv: &Rv,
+    node: Node,
+    at: (u64, usize),
+    item: ReadSignal<BlockItem>,
+    drawn: Option<String>,
+    key: SharedString,
+) -> AnyElement {
     let props = rv.props;
     let classes_node = node.clone();
     let styled = move |el: View| {
@@ -1047,21 +1278,43 @@ fn leaf(rv: &Rv, node: Node, pos: usize, drawn: Option<String>) -> AnyElement {
         })
     };
     if let Some(view) = rv.node_view(node.ty().name()) {
-        let get_pos: Rc<dyn Fn() -> Option<usize>> = Rc::new(move || Some(pos));
+        let offset = at.1;
+        let live = Rc::new(Cell::new(true));
+        let get_pos: Rc<dyn Fn() -> Option<usize>> = {
+            let live = live.clone();
+            Rc::new(move || live.get().then(|| item.get_untracked().pos + 1 + offset))
+        };
+        let selected = signal(false);
+        {
+            let rv = rv.clone();
+            effect(move || {
+                rv.sel_rev.get();
+                let pos = item.get().pos + 1 + offset;
+                let state = rv.st.borrow();
+                let sel = state.selection();
+                selected.set(sel.as_node().is_some() && sel.from() == pos);
+            });
+        }
+        cleanup(move || live.set(false));
         let cx = NodeViewCx::new(
             rv.session.clone(),
             get_pos,
             signal(node.clone()).read_only(),
-            signal(false).read_only(),
+            selected.read_only(),
             signal(Vec::new()).read_only(),
             None,
-        );
+        )
+        .rendered_at(rv.cx.__host(), key, item);
         let el = view.create(&cx, &node);
         cleanup(move || view.destroy());
-        return styled(view_box()).child(el).into_element();
+        return inline_box(rv, styled(view_box()), at)
+            .child(el)
+            .into_element();
     }
     if render_kind(&node) == Some("image") {
-        return styled(view_box()).child(image_of(&node)).into_element();
+        return inline_box(rv, styled(view_box()), at)
+            .child(image_of(&node))
+            .into_element();
     }
     if let Some(drawn) = drawn {
         let (class_node, style_node) = (node.clone(), node);
@@ -1153,7 +1406,8 @@ fn node_view_block(rv: Rv, item: ReadSignal<BlockItem>, view: Arc<dyn NodeView>)
                 selected.read_only(),
                 decorations.read_only(),
                 content,
-            );
+            )
+            .rendered_at(rv.cx.__host(), SharedString::from(format!("b{id}")), item);
             let el = view.create(&cx, &current);
             let destroyed = view.clone();
             cleanup(move || destroyed.destroy());
@@ -1190,8 +1444,11 @@ fn slot(rv: Rv, item: ReadSignal<BlockItem>, id: u64, node: &Node) -> AnyElement
         .into_element()
 }
 
-/// The selection's boxes.
-fn selection_rects(rv: Rv) -> impl IntoElement {
+/// The selection's boxes in textblock `id`, in its text's box. Drawn in
+/// the block, under its text and over its background: a block with a
+/// background of its own (a code block) would hide boxes drawn under all
+/// the blocks.
+fn selection_rects(rv: Rv, id: u64) -> impl IntoElement {
     dynamic(move || {
         rv.sel_rev.get();
         rv.layout_rev.get();
@@ -1206,7 +1463,7 @@ fn selection_rects(rv: Rv) -> impl IntoElement {
         if from == to || !text {
             return Vec::new();
         }
-        let rects = rv.geo.borrow().range_rects(from, to);
+        let rects = rv.geo.borrow().text_range_rects(id, from, to);
         rects
             .into_iter()
             .map(|b| {
@@ -1373,6 +1630,7 @@ fn sink(rv: Rv) -> impl IntoElement {
         rv.clone(),
         rv.clone(),
     );
+    let menu = rv.clone();
     let value = rv.sink_value;
     input()
         .element_ref(&rv.input)
@@ -1403,6 +1661,10 @@ fn sink(rv: Rv) -> impl IntoElement {
         })
         .on_key_press(move |k: &str| key.sink_key(k))
         .on_paste(move |p: &PasteEvent| paste.paste_event(p))
+        // The touch selection's edit menu, which the sink opens.
+        .on(EventKind::EditAction, move |p: &EventPayload| {
+            menu.edit_action(p)
+        })
         .on_focus(move || focus.focus_changed(true))
         .on_blur(move || blur.focus_changed(false))
 }
@@ -1434,6 +1696,43 @@ impl Rv {
             return;
         }
         geo.frames.insert(id, (parent, frame));
+        drop(geo);
+        self.layout_rev.update(|r| *r += 1);
+    }
+
+    /// The width of the inline view or image at `offset` in textblock
+    /// `id`'s content (see `TextGeo::widths`).
+    fn set_inline_width(&self, id: u64, offset: usize, frame: Bounds<Points>) {
+        let mut geo = self.geo.borrow_mut();
+        let Some(text) = geo.texts.get_mut(&id) else {
+            return;
+        };
+        if text.widths.get(&offset) == Some(&frame) {
+            return;
+        }
+        text.widths.insert(offset, frame);
+        drop(geo);
+        // Every inline view of a block reports its width as an edit before
+        // them moves them (their offsets are new): the geometry follows once
+        // for all of them, not once per view.
+        if self.widths_pending.replace(true) {
+            return;
+        }
+        let (pending, layout_rev) = (self.widths_pending.clone(), self.layout_rev);
+        spawn(async move {
+            pending.set(false);
+            layout_rev.update(|r| *r += 1);
+        });
+    }
+
+    /// Where block `id`'s children start in its box (see
+    /// `Geometry::insets`).
+    fn set_inset(&self, id: u64, origin: Point<Points>) {
+        let mut geo = self.geo.borrow_mut();
+        if geo.insets.get(&id) == Some(&origin) {
+            return;
+        }
+        geo.insets.insert(id, origin);
         drop(geo);
         self.layout_rev.update(|r| *r += 1);
     }
@@ -1504,6 +1803,19 @@ mod tests {
 
     use super::*;
     use crate::rich_editor::extensions::starter;
+
+    #[test]
+    fn an_image_takes_the_sides_it_leaves_out_from_its_natural_size() {
+        let natural = Some((400.0, 200.0));
+        assert_eq!(image_box(Some(30.0), Some(40.0), natural), (30.0, 40.0));
+        assert_eq!(image_box(Some(100.0), None, natural), (100.0, 50.0));
+        assert_eq!(image_box(None, Some(100.0), natural), (200.0, 100.0));
+        assert_eq!(image_box(None, None, natural), (400.0, 200.0));
+        // Unknown yet (or never: it failed): what it asks for, else 0.
+        assert_eq!(image_box(Some(100.0), None, None), (100.0, 0.0));
+        assert_eq!(image_box(None, None, None), (0.0, 0.0));
+        assert_eq!(image_box(None, None, Some((0.0, 10.0))), (0.0, 0.0));
+    }
 
     #[test]
     fn decorations_split_text_and_widgets_take_a_unit() {

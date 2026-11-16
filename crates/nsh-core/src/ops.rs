@@ -220,7 +220,7 @@ events! {
     MomentumEnd = "onMomentumEnd": "A scroll view stopped gliding (payload: [`EventPayload::Scroll`]).",
     Dialog = "onDialog": "An alert or action sheet closed (root only; payload: `id`, `index`, -1 when dismissed).",
     Touch = "onTouch": "Touches on the view or inside it, for the JS touch and responder handlers (payload: [`EventPayload::Touch`]).",
-    SelectionChange = "onSelectionChange": "The selection (or caret) of an input moved (payload: `start`, `end` in UTF-16 units), or the selection of a selectable view changed (payload: `text`, the selected text as a copy gives it, empty once nothing is selected; `start`, where it starts in the view's whole text).",
+    SelectionChange = "onSelectionChange": "The selection (or caret) of an input moved (payload: `start`, `end` in UTF-16 units), or the selection of a selectable view changed (payload: `text`, the selected text as a copy gives it, empty once nothing is selected; `start`, where it starts in the view's whole text; `bounds`, the box around it in the view, to which the core adds `pageBounds`).",
     KeyPress = "onKeyPress": "A key was pressed in an input (payload: `key`: the character, `Backspace` or `Enter`).",
     LoadEnd = "onLoadEnd": "An image finished loading, or failed.",
     ImageInfo = "onImageInfo": "An `Image.getSize` / `Image.prefetch` request finished (root only; payload: `id`, `width` and `height` in pixels, or `error`).",
@@ -233,7 +233,7 @@ events! {
     Menu = "onMenu": "A menu item was chosen: the application menu's or a context menu's (root only; desktops; payload: `id`), or a context menu closed (`closed`: true, after its item).",
     MouseEnter = "onMouseEnter": "The mouse came over the view or a view inside it (never on touches; payload: [`EventPayload::Mouse`]).",
     MouseLeave = "onMouseLeave": "The mouse left the view and the views inside it, or the window (payload: [`EventPayload::Mouse`], where it was last).",
-    FileDragEnter = "onFileDragEnter": "A local file drag entered an eligible desktop drop destination.",
+    FileDragEnter = "onFileDragEnter": "A local file drag entered an eligible desktop drop destination (payload: [`EventPayload::FileDrop`]).",
     FileDragLeave = "onFileDragLeave": "A local file drag left its desktop drop destination.",
     FileDrop = "onFileDrop": "Local files were dropped (payload: [`EventPayload::FileDrop`]).",
     MouseMove = "onMouseMove": "The mouse moved over the view or a view inside it, with or without a button down, or a modifier key changed while it rests there with none down (payload: [`EventPayload::Mouse`]; at most one per frame).",
@@ -251,12 +251,26 @@ events! {
     ScreenColor = "onScreenColor": "A [`Command::PickScreenColor`] request finished (root only; payload: `id`, `color`: the color picked, packed `0xRRGGBBAA`, absent when cancelled).",
     FileRequest = "onFileRequest": "A [`Command::FileRequest`] finished (root only; payload: [`EventPayload::FileRequest`]).",
     Speech = "onSpeech": "A speech recognition session reported (root only; payload: [`EventPayload::Speech`]).",
-    Download = "onDownload": "A web view's download started, finished or failed (payload: `state`, `id`, `url`, `filename`, `path`; `bytes` once finished, `message` when it failed).",
+    Download = "onDownload": "A web view's download started, finished, failed or was cancelled (payload: `state`, `id`, `url`, `filename`, `path`, `source`; `bytes` once finished, `code` and `message` when it failed, `reason` when it was cancelled).",
     Notification = "onNotification": "The platform answered a [`Command::Notification`], or the user pressed a notification (root only; payload: the fields of [`crate::notifications::NotificationEvent`]).",
     UrlScheme = "onUrlScheme": "The system handed the app a URL that opens it (root only; payload: `url`, [`crate::url_scheme::URL`]); the core keeps those of the schemes the app claims ([`crate::url_scheme`]).",
+    SecondInstance = "onSecondInstance": "A later launch of the app handed the running instance its command line (root only; desktops, nsh.json `singleInstance`; payload: [`EventPayload::Json`], [`crate::single_instance::SecondInstance::to_json`]).",
     Audio = "onAudio": "A sound or a player reported (root only; payload: [`EventPayload::Audio`]).",
     Window = "onWindow" as "": "A window of the app's own reported its state, a close press or that it closed (on its root node; desktops; payload: [`EventPayload::Window`]).",
+    EditAction = "onEditAction" as "": "An action was chosen from the edit menu a [`Command::OpenEditMenu`] opened on an input (payload: `action`, an [`EditAction`]'s name); Paste is the input's own paste (`onPaste`), never reported.",
+    Wheel = "onWheel": "A mouse wheel or touchpad scrolled over the view (payload: [`EventPayload::Wheel`]): the nearest listener around the view under the pointer hears it; one nearer than any scroll view under the pointer takes the wheel, so nothing scrolls or zooms natively ([`crate::input::wheel_listener`]).",
+    Pinch = "onPinch": "A touchpad pinch over the view (payload: [`EventPayload::Pinch`]; macOS, Linux, GPUI, Safari): the nearest listener around the view under the pointer hears it; one nearer than any view that pinches natively takes it, so nothing zooms or pinches natively ([`crate::input::wheel_listener`]); a pinch stays on the view its start went to.",
 
+    WebEvaluation = "onWebEvaluation" as "": "A native WebView evaluation reply (internal; payload: id and a JSON envelope string data).",
+    MouseUp = "onMouseUp": "A mouse button was released over the view or a view inside it (payload: [`EventPayload::Mouse`], its `button` naming the released one, with where and the modifiers). The primary button's release also reports `onPressUp`.",
+    CanvasImage = "onCanvasImage": "A [`Command::RenderCanvas`] request finished (root only; payload: [`EventPayload::CanvasImage`]).",
+    KeyDown = "onKeyDown": "A hardware key went down on the focused view or a view inside it (payload: [`EventPayload::Key`]). Notifications bubble to enabled listening ancestors within the same native window; returning from the listener cannot change handling, and `default_prevented` reports the mounted capture policy's decision for this transition.",
+    KeyUp = "onKeyUp": "A hardware key came up on the focused view (payload: [`EventPayload::Key`]), with `default_prevented` as the capture policy decided for this transition. It bubbles to enabled ancestors as `onKeyDown` does.",
+    WebViewReply = "onWebViewReply" as "": "A [`Command::WebViewRequest`] was carried out (the web view it was sent to; payload: [`EventPayload::Json`], `{ id, ok, value }` or `{ id, ok, error }`; the core answers the request's typed result and it reaches no listener).",
+    DownloadPending = "onDownloadPending" as "": "A web view's page asked to download a file and waits for the app's destination (payload: [`EventPayload::Json`]; handed to Rust's `WebView::on_download_pending`, not to a JS listener).",
+    DownloadOffer = "onDownloadOffer" as "": "A platform holds a download for the core (payload: [`EventPayload::Json`], [`crate::webview::DownloadOffer`]; never reaches a listener).",
+    DownloadProgress = "onDownloadProgress" as "": "A held download received bytes (payload: [`EventPayload::Json`], [`crate::webview::DownloadProgress`]; never reaches a listener).",
+    DownloadEnd = "onDownloadEnd" as "": "A platform's download ended (payload: [`EventPayload::Json`], [`crate::webview::DownloadEnd`]; never reaches a listener).",
 }
 
 /// What an input holds, for the system's autofill and suggestions
@@ -391,12 +405,41 @@ pub struct TouchPoint {
     /// This finger is one the event is about (it went down, moved or
     /// lifted).
     pub changed: bool,
+    /// What the pointer is: a finger, a pen, or the mouse, which desktops
+    /// also report as a touch (what a held finger does, such as opening a
+    /// context menu, a held mouse button does not).
+    pub pointer_type: PointerType,
+    /// How hard the pointer presses, from 0 to 1, as the DOM's
+    /// `PointerEvent.pressure`: a device without pressure reports 0.5
+    /// while it is down and 0 once it lifted.
+    pub pressure: f32,
+    /// The pen's tilt toward the right of the surface, in degrees from
+    /// -90 to 90 (the DOM's `tiltX`); 0 for a finger, a mouse, or a pen
+    /// that does not report it.
+    pub tilt_x: f32,
+    /// The pen's tilt toward the bottom of the surface, in degrees from
+    /// -90 to 90 (the DOM's `tiltY`).
+    pub tilt_y: f32,
+}
+
+impl TouchPoint {
+    /// The pressure of a pointer without pressure sensing in a `phase`
+    /// event, `changed` telling whether the point is the one the event is
+    /// about: 0.5 while down, 0 once lifted (the DOM's default).
+    pub fn default_pressure(phase: TouchPhase, changed: bool) -> f32 {
+        if changed && matches!(phase, TouchPhase::End | TouchPhase::Cancel) {
+            0.0
+        } else {
+            0.5
+        }
+    }
 }
 
 /// Where the mouse is over a view ([`EventKind::MouseEnter`],
-/// [`EventKind::MouseMove`], [`EventKind::MouseLeave`]), in points, as
-/// GPUI's `MouseMoveEvent`.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// [`EventKind::MouseMove`], [`EventKind::MouseLeave`]), and where a mouse
+/// button was released ([`EventKind::MouseUp`]), in points, as GPUI's
+/// `MouseMoveEvent`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct MouseEvent {
     /// Position in the view, its transforms undone.
@@ -408,9 +451,54 @@ pub struct MouseEvent {
     pub modifiers: crate::keymap::Modifiers,
     /// The button held down, if any (a drag).
     pub pressed_button: Option<MouseButton>,
+    /// The button that changed at this event: the released one on
+    /// [`EventKind::MouseUp`], none on a move.
+    pub button: Option<MouseButton>,
+    /// What the pointer is: the mouse, or a pen over a tablet.
+    pub pointer_type: PointerType,
+    /// How hard the pointer presses, from 0 to 1, as the DOM's
+    /// `PointerEvent.pressure`: 0.5 with a button down and 0 without on a
+    /// device that has no pressure.
+    pub pressure: f32,
+    /// The pen's tilt in degrees, as [`TouchPoint::tilt_x`].
+    pub tilt_x: f32,
+    /// The pen's tilt in degrees, as [`TouchPoint::tilt_y`].
+    pub tilt_y: f32,
+}
+
+impl Default for MouseEvent {
+    fn default() -> Self {
+        Self {
+            position: Point::default(),
+            page_position: Point::default(),
+            modifiers: Default::default(),
+            pressed_button: None,
+            button: None,
+            pointer_type: PointerType::Mouse,
+            pressure: 0.0,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+        }
+    }
 }
 
 impl MouseEvent {
+    /// The event as reported by a pen (or a pressure-sensing touchpad):
+    /// `pointer_type`, `pressure` from 0 to 1, and tilt in degrees.
+    pub fn with_pointer(
+        mut self,
+        pointer_type: PointerType,
+        pressure: f32,
+        tilt_x: f32,
+        tilt_y: f32,
+    ) -> Self {
+        self.pointer_type = pointer_type;
+        self.pressure = pressure.clamp(0.0, 1.0);
+        self.tilt_x = tilt_x;
+        self.tilt_y = tilt_y;
+        self
+    }
+
     /// The mouse at `position` in the view and `page_position` in its root
     /// view, with `modifiers` held and `pressed_button` down.
     pub fn new(
@@ -424,7 +512,103 @@ impl MouseEvent {
             page_position,
             modifiers,
             pressed_button,
+            button: None,
+            pressure: if pressed_button.is_some() { 0.5 } else { 0.0 },
+            ..Self::default()
         }
+    }
+
+    /// A mouse button released at `position` in the view and
+    /// `page_position` in its root view, with `modifiers` held
+    /// ([`EventKind::MouseUp`]).
+    pub fn released(
+        position: Point<Points>,
+        page_position: Point<Points>,
+        modifiers: crate::keymap::Modifiers,
+        button: MouseButton,
+    ) -> Self {
+        Self {
+            position,
+            page_position,
+            modifiers,
+            pressed_button: None,
+            button: Some(button),
+            ..Self::default()
+        }
+    }
+}
+
+/// A touchpad pinch over a view ([`EventKind::Pinch`]), as GPUI's
+/// `PinchEvent`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
+pub struct PinchEvent {
+    /// Position in the view, its transforms undone.
+    pub position: Point<Points>,
+    /// Position in the root view the view is in (the surface, or its
+    /// modal), as touches' `page`.
+    pub page_position: Point<Points>,
+    /// How much the scale changed since the last event, as a fraction
+    /// (0.1: 10 % bigger; negative: smaller), as GPUI's.
+    pub delta: crate::geometry::Percentage,
+    /// Where it is in the gesture.
+    pub phase: PinchPhase,
+    /// The modifier keys held.
+    pub modifiers: crate::keymap::Modifiers,
+}
+
+impl PinchEvent {
+    /// A pinch step of `delta` in `phase` at `position` in the view and
+    /// `page_position` in its root view, with `modifiers` held.
+    pub fn new(
+        position: Point<Points>,
+        page_position: Point<Points>,
+        delta: crate::geometry::Percentage,
+        phase: PinchPhase,
+        modifiers: crate::keymap::Modifiers,
+    ) -> Self {
+        Self {
+            position,
+            page_position,
+            delta,
+            phase,
+            modifiers,
+        }
+    }
+}
+
+/// Where a pinch is in its gesture ([`PinchEvent::phase`]), as a touch's
+/// [`TouchPhase`] (TS: `"start"`, `"move"`, `"end"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PinchPhase {
+    /// The fingers began pinching.
+    Start,
+    /// The fingers moved.
+    #[default]
+    Move,
+    /// The fingers lifted, or the system cancelled the pinch.
+    End,
+}
+
+impl PinchPhase {
+    /// Its TS name.
+    pub fn name(self) -> &'static str {
+        match self {
+            PinchPhase::Start => "start",
+            PinchPhase::Move => "move",
+            PinchPhase::End => "end",
+        }
+    }
+
+    /// The phase named `name` (its TS name).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "start" => PinchPhase::Start,
+            "move" => PinchPhase::Move,
+            "end" => PinchPhase::End,
+            _ => return None,
+        })
     }
 }
 
@@ -516,6 +700,93 @@ impl ContextMenuEvent {
     }
 }
 
+/// How far a wheel scrolled ([`WheelEvent::delta`]), as GPUI's
+/// `ScrollDelta`: positive `y` scrolls toward the end (down), positive `x`
+/// toward the right, as the DOM's `WheelEvent`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WheelDelta {
+    /// Points, from a precise device (a touchpad, a Magic Mouse; AppKit's
+    /// `hasPreciseScrollingDeltas`, the DOM's `DOM_DELTA_PIXEL`).
+    Points(Point<Points>),
+    /// Lines (notches) of a mouse wheel, the DOM's `DOM_DELTA_LINE`.
+    Lines(Point<f32>),
+}
+
+impl Default for WheelDelta {
+    fn default() -> Self {
+        WheelDelta::Points(Point::default())
+    }
+}
+
+impl WheelDelta {
+    /// The delta in points, a line being `line_height` points (GPUI's
+    /// `ScrollDelta::pixel_delta`).
+    pub fn points(self, line_height: Points) -> Point<Points> {
+        match self {
+            WheelDelta::Points(p) => p,
+            WheelDelta::Lines(l) => Point {
+                x: Points(l.x * line_height.0),
+                y: Points(l.y * line_height.0),
+            },
+        }
+    }
+
+    /// Whether the delta is in precise points rather than lines.
+    pub fn precise(self) -> bool {
+        matches!(self, WheelDelta::Points(_))
+    }
+
+    /// Its TS `deltaMode`: `"points"` or `"lines"`.
+    pub fn mode_name(self) -> &'static str {
+        match self {
+            WheelDelta::Points(_) => "points",
+            WheelDelta::Lines(_) => "lines",
+        }
+    }
+
+    /// Its raw `(x, y)`, in its own unit.
+    pub fn xy(self) -> (f32, f32) {
+        match self {
+            WheelDelta::Points(p) => (p.x.0, p.y.0),
+            WheelDelta::Lines(l) => (l.x, l.y),
+        }
+    }
+}
+
+/// A wheel over a view ([`EventKind::Wheel`]), in points, as GPUI's
+/// `ScrollWheelEvent`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
+pub struct WheelEvent {
+    /// Position in the view, its transforms undone.
+    pub position: Point<Points>,
+    /// Position in the root view the view is in (the surface, or its
+    /// modal), as touches' `page`.
+    pub page_position: Point<Points>,
+    /// How far it scrolled, in lines or points.
+    pub delta: WheelDelta,
+    /// The modifier keys held (Control + wheel zooms by convention).
+    pub modifiers: crate::keymap::Modifiers,
+}
+
+impl WheelEvent {
+    /// A wheel by `delta` at `position` in the view and `page_position` in
+    /// its root view, with `modifiers` held.
+    pub fn new(
+        position: Point<Points>,
+        page_position: Point<Points>,
+        delta: WheelDelta,
+        modifiers: crate::keymap::Modifiers,
+    ) -> Self {
+        Self {
+            position,
+            page_position,
+            delta,
+            modifiers,
+        }
+    }
+}
+
 /// The kind of pointer behind an event, as the DOM's `pointerType` (TS:
 /// `"mouse"`, `"pen"`, `"touch"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -564,6 +835,10 @@ pub struct TouchEvent {
     /// A view around the fingers whose `panActivation` the platform
     /// activated with this event: it becomes the responder.
     pub activated: Option<NodeId>,
+    /// The modifier keys held when the changed pointer went down, as a
+    /// press's [`PressEvent::modifiers`] (none for a finger on a touch
+    /// screen).
+    pub modifiers: crate::keymap::Modifiers,
 }
 
 /// What the user pasted into an input ([`EventKind::Paste`]): what the
@@ -825,15 +1100,22 @@ pub enum EventPayload {
     /// Touches (`onTouch`).
     Touch(Box<TouchEvent>),
     /// The mouse over a view (`onMouseEnter`, `onMouseMove`,
-    /// `onMouseLeave`).
+    /// `onMouseLeave`) or a button released over it (`onMouseUp`, its
+    /// `button` naming the released one).
     Mouse(MouseEvent),
     /// A context menu asked for over a view (`onContextMenu`).
     ContextMenu(ContextMenuEvent),
+    /// A wheel over a view (`onWheel`).
+    Wheel(WheelEvent),
+    /// A touchpad pinch over a view (`onPinch`).
+    Pinch(PinchEvent),
+    /// A hardware key transition on a focused Rust view.
+    Key(crate::KeyEvent),
     /// Where the pointer was at a press (`onPress`, `onLongPress`,
     /// `onPressDown`, `onPressUp`), with the modifier keys and the click
     /// count, on backends that know it.
     Press(PressEvent),
-    /// Local file URLs dropped by the user, in the platform's order.
+    /// Local file URLs offered on drag entry or dropped by the user, in the platform's order.
     FileDrop(Vec<String>),
     /// [`Self::FileDrop`] with where the files were let go, in the
     /// window's coordinates, from backends that know it.
@@ -883,6 +1165,14 @@ pub enum EventPayload {
         /// Why the request failed; `None` when it was carried out (or the
         /// dialog cancelled).
         error: Option<String>,
+    },
+    /// The image a [`Command::RenderCanvas`] made, or why it failed
+    /// ([`crate::canvas::render`]).
+    CanvasImage {
+        /// The request.
+        id: u32,
+        /// The encoded image, or why there is none.
+        result: Result<Vec<u8>, crate::canvas::render::RenderFailure>,
     },
     /// An event of a registered native component: its name and data (any
     /// JSON value), handed to JS as `{ name, data }`.
@@ -1254,6 +1544,71 @@ pub enum HeaderSystemItem {
     Cancel,
 }
 
+/// What a trailing iOS bar button shows (`ios={{ headerRightItems }}`):
+/// exactly one of a system item, an SF Symbol, or a text label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HeaderItemContent {
+    /// A [`HeaderSystemItem`].
+    SystemItem(HeaderSystemItem),
+    /// An SF Symbol's name.
+    Symbol(Arc<str>),
+    /// A text title on the button.
+    Label(Arc<str>),
+}
+
+/// A trailing iOS navigation-bar button (`ios={{ headerRightItems }}`), as
+/// the platform sees it: numeric ids for presses and menu actions report
+/// the root's [`EventKind::Menu`]. Rust apps build one with
+/// [`crate::element::header::HeaderItem`] (handlers included); JS sets
+/// `onPress` / `MenuItem.onSelect` and the runtime assigns the ids.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct HeaderItem {
+    /// Optional key for keeping a `UIBarButtonItem` across updates: a kept
+    /// button takes the new title, symbol, label, menu and state in place.
+    /// Without a key, a button is kept only while its position and its
+    /// content are unchanged; any other change makes a new one.
+    pub key: Option<Arc<str>>,
+    /// What the button shows.
+    pub content: HeaderItemContent,
+    /// VoiceOver's label when the content is a system item or symbol
+    /// (the content's own text when it is a [`HeaderItemContent::Label`]).
+    pub label: Option<Arc<str>>,
+    /// Whether the button is disabled.
+    pub disabled: bool,
+    /// Reported as the root's [`EventKind::Menu`] when pressed with no
+    /// menu (0: no handler).
+    pub press_id: u32,
+    /// A native pull-down menu of [`crate::desktop::MenuItem`]s; a press
+    /// opens it instead of reporting [`Self::press_id`].
+    pub menu: Option<Vec<crate::desktop::MenuItem>>,
+}
+
+impl HeaderItem {
+    /// Builds a platform header button from its fields. `#[non_exhaustive]`
+    /// keeps a struct literal off other crates; prefer
+    /// [`crate::element::header::HeaderItem`] in Rust apps.
+    #[doc(hidden)]
+    pub fn from_parts(
+        key: Option<Arc<str>>,
+        content: HeaderItemContent,
+        label: Option<Arc<str>>,
+        disabled: bool,
+        press_id: u32,
+        menu: Option<Vec<crate::desktop::MenuItem>>,
+    ) -> Self {
+        Self {
+            key,
+            content,
+            label,
+            disabled,
+            press_id,
+            menu,
+        }
+    }
+}
+
 /// What return does in an input (`submitBehavior`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PropEnum)]
 pub enum SubmitBehavior {
@@ -1293,6 +1648,52 @@ pub enum KeyboardDismissMode {
     Interactive,
 }
 
+/// The HTML element the web draws a view or text as (`web={{ element }}`),
+/// for what `role` cannot say: paragraphs, landmarks, lists, emphasis, ...
+/// Headings come from `role="header"` with `accessibilityLevel` and links
+/// from a `Link` with an `href`, everywhere. Only the web reads it; the
+/// layout, styles and events stay the view's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PropEnum)]
+pub enum WebElement {
+    /// A paragraph (`<p>`).
+    P,
+    /// Navigation links (`<nav>`).
+    Nav,
+    /// The header of the page or a section (`<header>`), a landmark; a
+    /// heading is `role="header"`.
+    Header,
+    /// The footer of the page or a section (`<footer>`).
+    Footer,
+    /// The page's main content (`<main>`).
+    Main,
+    /// A self-contained composition (`<article>`).
+    Article,
+    /// A section of a document (`<section>`).
+    Section,
+    /// Content aside from the main content (`<aside>`).
+    Aside,
+    /// An unordered list (`<ul>`).
+    Ul,
+    /// An ordered list (`<ol>`).
+    Ol,
+    /// An item of a list (`<li>`).
+    Li,
+    /// Strong importance (`<strong>`).
+    Strong,
+    /// Emphasis (`<em>`).
+    Em,
+    /// A quotation (`<blockquote>`).
+    Blockquote,
+    /// A figure (`<figure>`).
+    Figure,
+    /// A figure's caption (`<figcaption>`).
+    Figcaption,
+    /// A date or time (`<time>`).
+    Time,
+    /// Contact information (`<address>`).
+    Address,
+}
+
 /// Which point of a page a snapping scroll view aligns to its start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PropEnum)]
 pub enum SnapAlignment {
@@ -1309,7 +1710,8 @@ pub enum SnapAlignment {
 /// (`keyboardShouldPersistTaps`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyboardTaps {
-    /// The tap dismisses the keyboard and reaches nothing else (default).
+    /// A tap only dismisses the keyboard (default): nothing inside acts on
+    /// it; long presses and drags go on as with the keyboard down.
     #[default]
     Never,
     /// Taps never dismiss the keyboard.
@@ -1354,6 +1756,11 @@ pub enum ImageProp {
     /// Native).
     #[prop(js = "fadeDuration", min = 0, on = IMAGE)]
     FadeDuration(Option<f32>),
+    /// Set by `svg()` where the platform draws the SVG itself (the web): its
+    /// `currentColor` is the element's text color
+    /// ([`crate::mount::ImageOptions::current_color`]).
+    #[prop(js = "svgCurrentColor", internal)]
+    SvgCurrentColor(bool),
 }
 
 /// A behavior property of a scroll view or list.
@@ -1380,6 +1787,11 @@ pub enum ScrollProp {
     /// `bounces`: overscroll past the edges (default true).
     #[prop(js = "bounces", default = true, on = SCROLLING)]
     Bounces(bool),
+    /// `scrollsToTop`: a tap at the top of the window (the status bar's)
+    /// scrolls it to its top (default true; iOS and Mac Catalyst, where
+    /// UIKit does it: elsewhere ignored).
+    #[prop(js = "scrollsToTop", default = true, on = SCROLLING)]
+    ScrollsToTop(bool),
     /// `contentInset`: room around the content.
     #[prop(js = "contentInset", on = SCROLLING)]
     ContentInset(EdgeInsets),
@@ -1579,6 +1991,15 @@ pub enum ScreenProp {
     /// slot, pressing the first pressable view of `headerLeft`.
     #[prop(ios = "headerLeftSymbol", on = SCREEN)]
     HeaderLeftSymbol(Option<Arc<str>>),
+    /// `ios={{ headerRightItems }}`: the trailing UIKit bar buttons, first
+    /// at the trailing edge; a non-empty list wins over
+    /// `headerRightSystemItem` / `headerRightSymbol` and leaves
+    /// `headerRight`'s views out of the iOS bar (they stay the fallback on
+    /// other platforms). An empty list is unset. A press without a menu,
+    /// or a menu action, reports the root's `onMenu` with the item's id
+    /// (its `onPress` / `onSelect`).
+    #[prop(ios = "headerRightItems", on = SCREEN)]
+    HeaderRightItems(Vec<HeaderItem>),
     /// `headerBackVisible`: the system header's back button shows (default
     /// true; iOS and Android).
     #[prop(js = "headerBackVisible", default = true, on = SCREEN)]
@@ -1607,6 +2028,16 @@ pub enum ScreenProp {
     /// and dialogs share it.
     #[prop(js = "statusBar", on = SCREEN | MODAL)]
     StatusBar(Option<StatusBarSetting>),
+    /// `ios={{ supportedOrientations }}` / `android={{ supportedOrientations }}`:
+    /// the orientations the screen may take while the page is shown
+    /// (default: the app's). Of the pages in the tree and displayed (not
+    /// under `display: none`, as a tab not shown is), the most recently
+    /// shown one with a setting decides; the core sends the result as
+    /// [`Command::Orientations`].
+    ///
+    /// [`crate::ModalConfig::PORTRAIT`] bits.
+    #[prop(ios = "supportedOrientations", android = "supportedOrientations", with = crate::js::host_values::page_orientations, reset = ScreenProp::Orientations(0), ts = "(\"portrait\" | \"portrait-upside-down\" | \"landscape\" | \"landscape-left\" | \"landscape-right\")[]", on = SCREEN, shared)]
+    Orientations(u8),
 }
 
 /// How a modal appears (`animation`).
@@ -1654,7 +2085,7 @@ pub enum ModalProp {
     /// presenter's).
     ///
     /// [`crate::ModalConfig::PORTRAIT`] bits.
-    #[prop(ios = "supportedOrientations", with = crate::js::host_values::orientations, reset = ModalProp::Orientations(0), ts = "(\"portrait\" | \"portrait-upside-down\" | \"landscape\" | \"landscape-left\" | \"landscape-right\")[]", on = MODAL)]
+    #[prop(ios = "supportedOrientations", with = crate::js::host_values::orientations, reset = ModalProp::Orientations(0), ts = "(\"portrait\" | \"portrait-upside-down\" | \"landscape\" | \"landscape-left\" | \"landscape-right\")[]", on = MODAL, shared)]
     Orientations(u8),
     /// `closeOnEscape`: Escape and the Android back button close it natively
     /// (default true); either way they call `onCancel`.
@@ -1808,6 +2239,79 @@ impl WebKey {
     }
 }
 
+/// Where `reveal` puts a view along the axis of a scroll view around it
+/// (GPUI's `ScrollStrategy`, with the DOM's `ScrollLogicalPosition`
+/// names, as [`SnapAlignment`]). Physical: start and end are top and
+/// bottom along a vertical scroll view, left and right along a horizontal
+/// one, in either writing direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PropEnum)]
+#[non_exhaustive]
+pub enum ScrollAlignment {
+    /// Its start at the start of the viewport.
+    #[default]
+    Start,
+    /// Its middle in the middle of the viewport.
+    Center,
+    /// Its end at the end of the viewport.
+    End,
+    /// Nowhere new while it is in full view or covers the viewport; else
+    /// the edge it is past at that edge of the viewport, or, when it is
+    /// longer than the viewport, its other edge at the viewport's other
+    /// edge (CSSOM View's).
+    Nearest,
+}
+
+/// How `reveal` scrolls ([`crate::element::ElementRef::reveal`], TS
+/// `ref.reveal(options)`). It places the view from the layout and the
+/// zoom scales the platforms last reported, as `measure()` does:
+/// transforms (animations included) and a `zoomTo` not applied yet are not
+/// taken into account.
+///
+/// ```
+/// # use nsh_core::{RevealOptions, ScrollAlignment};
+/// let options = RevealOptions::default().vertical(ScrollAlignment::Center);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct RevealOptions {
+    /// Along vertical scroll views; `Start` by default.
+    pub vertical: ScrollAlignment,
+    /// Along horizontal scroll views; `Nearest` by default.
+    pub horizontal: ScrollAlignment,
+    /// Animate the scrolls; `true` by default, as `scroll_to`'s.
+    pub animated: bool,
+}
+
+impl Default for RevealOptions {
+    fn default() -> Self {
+        Self {
+            vertical: ScrollAlignment::Start,
+            horizontal: ScrollAlignment::Nearest,
+            animated: true,
+        }
+    }
+}
+
+impl RevealOptions {
+    /// Sets where the view goes along vertical scroll views.
+    pub fn vertical(mut self, alignment: ScrollAlignment) -> Self {
+        self.vertical = alignment;
+        self
+    }
+
+    /// Sets where the view goes along horizontal scroll views.
+    pub fn horizontal(mut self, alignment: ScrollAlignment) -> Self {
+        self.horizontal = alignment;
+        self
+    }
+
+    /// Sets whether the scrolls animate.
+    pub fn animated(mut self, animated: bool) -> Self {
+        self.animated = animated;
+        self
+    }
+}
+
 /// An imperative call on a native view (`ref.focus()` and the like).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -1830,6 +2334,17 @@ pub enum Command {
     LayoutAnimation(LayoutAnimation),
     /// Leave the app (Android back handling; on the root).
     ExitApp,
+    /// The app's address (`UrlScheme.setUrl`, `set_app_url`; on the root):
+    /// the web replaces the current history entry's; iOS and macOS give it
+    /// to the system when the app opts in (Handoff); the other
+    /// platforms keep none ([`crate::url_scheme`]).
+    SetAppUrl(String),
+    /// The app's address as an entry of its own after the current one
+    /// (`UrlScheme.setUrl(url, { history: "push" })`, `set_app_url_with`; on
+    /// the root): the web pushes one unless the same turn pushed a page's
+    /// or it is the address shown; iOS and macOS take it as
+    /// [`Command::SetAppUrl`]; the other platforms keep none.
+    PushAppUrl(String),
     /// What the back button does when none of the app's listeners took
     /// it: the innermost stack pops (or asks, with `popOnBack` false); with
     /// none, the app leaves on Android (on the root).
@@ -1844,6 +2359,22 @@ pub enum Command {
     StopLoading,
     /// Run JavaScript in a web view's page.
     InjectJavaScript(String),
+    /// Run a script in a web view's page for its result
+    /// ([`crate::platform::web_evaluation`]); the platform answers on this
+    /// node with [`EventKind::WebEvaluation`] (`id`: the request, `data`:
+    /// the JSON envelope), once.
+    Evaluate {
+        /// The engine's request, echoed in the reply.
+        request: u32,
+        /// The app's script.
+        script: String,
+    },
+    /// Give up request `request` of [`Command::Evaluate`]: release what the
+    /// platform keeps for it, answering nothing.
+    CancelEvaluate {
+        /// The request.
+        request: u32,
+    },
     /// Send a message to a web view's page (`window.onmessage` data).
     PostMessage(String),
     /// Give a web view's page input as the user's own (trusted events).
@@ -1875,6 +2406,9 @@ pub enum Command {
         /// Animate the change.
         animated: bool,
     },
+    /// Scroll the scroll views around the view so it shows (resolved by
+    /// the core into their `ScrollTo`; never mounted).
+    Reveal(RevealOptions),
     /// Scroll a list to the end of its content.
     ScrollToEnd {
         /// Animate the change.
@@ -1903,6 +2437,12 @@ pub enum Command {
     },
     /// The JS responder let go (on the root).
     ClearJsResponder,
+    /// The press going on in this view (or a view inside it) ends without
+    /// its release: no `onPressUp` or `onPress` follow, and its `active:`
+    /// styles reset at once (a context menu opened by a held finger). The
+    /// core handles it; platforms never see it.
+    #[doc(hidden)]
+    CancelPress,
     /// Select a range of an input (UTF-16 units; equal for a caret).
     SetSelection {
         /// Start.
@@ -1910,13 +2450,24 @@ pub enum Command {
         /// End.
         end: u32,
     },
+    /// Insert text into an input in place of its selection, as the user's
+    /// edit: the input's `maxLength` and line rules apply, `onChangeText`
+    /// reports it, no key is reported, and where the platform keeps an
+    /// undo history it is a step of it (unlike a new `value`). With
+    /// `pasteBehavior` `"report"`, the app inserts a paste it allowed or
+    /// rewrote this way.
+    InsertText(String),
     /// Have the screen reader read a message (on the root).
     Announce(String),
     /// Turn the performance monitor on or off (on the root;
     /// `setFpsEnabled`): what the platform has of one, the
-    /// macOS panel or the other platforms' `nsh::perf` lines. Platforms
+    /// macOS panel or the other platforms' `nsh::fps` lines. Platforms
     /// without a monitor ignore it.
     PerfMonitor(bool),
+    /// How the performance monitor shows (on the root; `setFpsMode`): its
+    /// whole panel, collapsed to its frame rate, or nothing while it still
+    /// measures. Platforms without a panel ignore it.
+    PerfMonitorMode(FpsMode),
     /// Load the image at `uri` (keeping its bytes for views that show it
     /// next) and report its pixel size as [`EventKind::ImageInfo`] `id`
     /// (on the root).
@@ -1936,8 +2487,24 @@ pub enum Command {
         /// The call to answer.
         call: u32,
     },
+    /// Where a list's viewport starts among its rows, with this commit's
+    /// layout (`ref.measureScrollPosition()`): answered by the core in its
+    /// events for promise `call` (a [`crate::ListScrollPosition`], or null
+    /// for a view that is no list or a list without items); never
+    /// mounted.
+    MeasureScrollPosition {
+        /// The call to answer.
+        call: u32,
+    },
     /// Put `text` on the system clipboard (on the root; `Clipboard.writeText`).
     SetClipboard(String),
+    /// Put one item on the system clipboard, each of its formats in one
+    /// write: the text as plain text, the HTML (when it has some) as the
+    /// platform's HTML type, which apps that read formatting paste (on the
+    /// root; `Clipboard.write`). A platform without an HTML type puts the
+    /// text only. New formats of [`crate::element::ClipboardItem`] come in
+    /// the same command.
+    SetClipboardItem(crate::element::ClipboardItem),
     /// Read the system clipboard and report it as [`EventKind::Clipboard`]
     /// `id` (on the root): `has` and, unless `has_only`, `text`. Asking
     /// only whether it holds text does not read it (no iOS paste notice).
@@ -2010,6 +2577,29 @@ pub enum Command {
         /// The request.
         id: u32,
     },
+    /// Render `drawing` offscreen into a `width` × `height` pixel image
+    /// (on the root; `OffscreenCanvas`'s `convertToBlob`,
+    /// [`crate::canvas::render`]): replay it as a canvas of `scale` pixels
+    /// per point draws it on screen, into a bitmap of its own that starts
+    /// transparent, its animated values at 0, and report the encoded image
+    /// as [`EventKind::CanvasImage`] `id` ([`EventPayload::CanvasImage`]).
+    /// Sent only on platforms whose
+    /// [`crate::platform::Environment::canvas_render`] is set, with a size
+    /// [`crate::canvas::render::pixel_size`] passed.
+    RenderCanvas {
+        /// The request.
+        id: u32,
+        /// What to draw, in points.
+        drawing: std::sync::Arc<crate::canvas::Drawing>,
+        /// The image's width in pixels.
+        width: u32,
+        /// The image's height in pixels.
+        height: u32,
+        /// Pixels per point.
+        scale: f32,
+        /// The encoding.
+        format: crate::canvas::render::ImageFormat,
+    },
     /// Carry out `request` on local paths (on the root;
     /// [`crate::file_dialog`]): show the open or save dialog, open a file
     /// in its app, show it in the file manager or move it to the trash.
@@ -2036,6 +2626,14 @@ pub enum Command {
     /// Show a notification, ask for the permission, set the app's badge
     /// (on the root; `Notifications` of `nsh`, [`crate::notifications`]).
     Notification(crate::notifications::NotificationCommand),
+    /// Play a haptic (on the root; `Haptics` of `nsh/mobile`,
+    /// [`crate::element::haptic`]). Platforms without haptics ignore it.
+    Haptic(Haptic),
+    /// The orientations the screen may take (on the root; the
+    /// `supportedOrientations` of the page shown, [`ScreenProp::Orientations`]):
+    /// [`crate::ModalConfig::PORTRAIT`] bits, 0 for the app's own. iOS and
+    /// Android; the other platforms ignore it.
+    Orientations(u8),
     /// A desktop command (on the root; `nsh/desktop`): the window, its
     /// title bar, menus. Mobile platforms ignore it.
     Desktop(Box<crate::desktop::DesktopCommand>),
@@ -2052,6 +2650,17 @@ pub enum Command {
         /// Its argument (any JSON value; `null` without one).
         args: crate::JsonValue,
     },
+    /// Hand `args` to function `name` of the app embedding NSH, with no
+    /// answer (on the root; `nsh/host`'s `host.post` without a native SDK
+    /// channel). Sent only on platforms whose
+    /// [`crate::platform::Environment::host`] is set, for functions the
+    /// app's `capabilities.host` grants.
+    HostPost {
+        /// The host's function.
+        name: String,
+        /// Its argument (any JSON value; `null` without one).
+        args: crate::JsonValue,
+    },
     /// A call on a registered native component (`ref.command(name, args)`).
     Native {
         /// The command.
@@ -2059,6 +2668,104 @@ pub enum Command {
         /// Its arguments (any JSON value).
         args: crate::JsonValue,
     },
+    /// Open the system's edit menu over `bounds` (in the root view) on an
+    /// input that has the focus: the menu of a component that draws its
+    /// own text selection (`RichEditor`'s on touch screens). UIKit's
+    /// `UIEditMenuInteraction` on iOS, a floating `ActionMode` on Android;
+    /// platforms without such a menu ignore it. It offers `actions`, in the
+    /// platform's order: Paste pastes into the input as the user's paste
+    /// does (`onPaste`), the others are reported as
+    /// [`EventKind::EditAction`]. The menu closes when an action is chosen.
+    OpenEditMenu {
+        /// What the menu points at, in the root view.
+        bounds: Bounds<Points>,
+        /// The actions it offers; those that cannot apply are left out,
+        /// not disabled.
+        actions: Vec<EditAction>,
+    },
+    /// Close the edit menu [`Command::OpenEditMenu`] opened on an input.
+    CloseEditMenu,
+    /// A request on a web view ([`crate::webview`]) sent once the target is
+    /// known to be a mounted, granted web view; the platform answers on
+    /// this node with [`EventKind::WebViewReply`] (`id`: the request).
+    WebViewRequest(crate::webview::WebViewRequest),
+}
+
+/// An editing action of an edit menu ([`Command::OpenEditMenu`],
+/// [`EventKind::EditAction`]): gpui-base's input actions of the same names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PropEnum)]
+#[non_exhaustive]
+pub enum EditAction {
+    /// Cut the selection.
+    Cut,
+    /// Copy the selection.
+    Copy,
+    /// Paste the clipboard (the input's own paste).
+    Paste,
+    /// Select everything.
+    SelectAll,
+}
+
+/// A haptic the device plays ([`Command::Haptic`], TS: `Haptics` of
+/// `nsh/mobile`): grouped as UIKit's feedback generators and Expo's API —
+/// a selection that changed, an impact by weight, a task's outcome. On
+/// Android it is the view's haptic feedback. What the user feels follows
+/// the device and its settings: none with haptics turned off, or on
+/// hardware without them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Haptic {
+    /// A selection changed: a picker's value, a segment, a slider's step
+    /// (`Haptics.selection()`).
+    Selection,
+    /// An element collided; the style is its weight (`Haptics.impact`).
+    Impact(HapticImpact),
+    /// A task ended (`Haptics.notification`).
+    Notification(HapticNotification),
+}
+
+/// How the performance monitor shows ([`Command::PerfMonitorMode`], TS:
+/// `setFpsMode`'s argument: `"expanded"`, `"collapsed"`, `"hidden"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PropEnum)]
+#[non_exhaustive]
+pub enum FpsMode {
+    /// The whole panel: the readings and the frame-cost trace.
+    #[default]
+    Expanded,
+    /// A small pill with the frame rate only, colored by the frame budget.
+    Collapsed,
+    /// Nothing on screen; it still measures (`perfStats()`, the log).
+    Hidden,
+}
+
+/// The weight of an impact ([`Haptic::Impact`], TS: `Haptics.impact`'s
+/// argument: `"light"` … `"rigid"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PropEnum)]
+#[non_exhaustive]
+pub enum HapticImpact {
+    /// A small, light element.
+    Light,
+    /// A moderate element.
+    Medium,
+    /// A large, heavy element.
+    Heavy,
+    /// A soft, flexible element.
+    Soft,
+    /// A hard, inflexible element.
+    Rigid,
+}
+
+/// How a task ended ([`Haptic::Notification`], TS: `Haptics.notification`'s
+/// argument: `"success"`, `"warning"`, `"error"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PropEnum)]
+#[non_exhaustive]
+pub enum HapticNotification {
+    /// It succeeded.
+    Success,
+    /// It produced a warning.
+    Warning,
+    /// It failed.
+    Error,
 }
 
 /// The status bar's look.
@@ -2338,6 +3045,10 @@ pub enum Prop {
     /// (precedes the new `Count`).
     #[prop(js = "splice", with = crate::js::host_values::splice, internal)]
     Splice(u32, u32, u32),
+    /// The items of a keyed list changed: rows kept, moved, inserted and
+    /// removed, each row that stays keeping its cell (precedes the new
+    /// `Count`). Set by the runtime's lists.
+    ListDiff(std::rc::Rc<crate::list_diff::ListDiff>),
     /// `inverted`: laid out from the end, item 0 last (chat style); starts scrolled
     /// to the end and keeps its distance from the end as content changes.
     #[prop(js = "inverted", on = LIST)]
@@ -2471,8 +3182,9 @@ pub enum Prop {
     /// (`nsh/ios`) shown over the keyboard while the input has focus.
     #[prop(ios = "inputAccessoryViewID", on = INPUT)]
     InputAccessoryViewId(Option<Box<str>>),
-    /// `nativeID`: names the view for others (an input accessory's for
-    /// `inputAccessoryViewID`).
+    /// `nativeID`: names the view for others: an input accessory's for
+    /// `inputAccessoryViewID`, a scroll view's for the embedding app's
+    /// `watchScroll`.
     #[prop(js = "nativeID")]
     NativeId(Option<Box<str>>),
     /// The highlight of an input's or a selectable text's selection (Rust
@@ -2502,6 +3214,10 @@ pub enum Prop {
     /// `hitSlop`: extends the touch area beyond the bounds.
     #[prop(js = "hitSlop", with = crate::js::host_values::hit_slop, reset = Prop::HitSlop(EdgeInsets::default()), ts = "number | Partial<Edges>")]
     HitSlop(EdgeInsets),
+    /// Where a link goes (`nsh/base`'s `Link` sets its `href`), carried
+    /// to the platform as data: a terminal draws the text inside the view
+    /// as a hyperlink to it. Set by the link component, never by JS.
+    Href(Option<Arc<str>>),
     /// `panActivation`: the view's touch responder waits for a pan that the
     /// platform activates past an offset on one axis (and fails past one on
     /// the other), deciding on the main thread so the scroll views around
@@ -2546,6 +3262,10 @@ pub enum Prop {
     /// view or a view inside it (an overlay's content counting as inside
     /// the view it is in), and it is not disabled.
     FocusWithinStyle(Option<std::rc::Rc<StylePatch>>),
+    /// `focusVisibleStyle`: the style while the view has focus and shows
+    /// it (`focus-visible:`: the keyboard moved the focus there, or it is
+    /// an input that edits), and it is not disabled.
+    FocusVisibleStyle(Option<std::rc::Rc<StylePatch>>),
     /// The states a part of a control shows its classes and state styles
     /// as its control has them ([`crate::tailwind::state`] bits: `checked`,
     /// `indeterminate`, `disabled`): a switch's thumb styled `checked:`
@@ -2621,12 +3341,21 @@ pub enum Prop {
     /// The system material of a backdrop blur (iOS, default `ultraThin`).
     #[prop(ios = "backdropMaterial")]
     BackdropMaterial(crate::BackdropMaterial),
+    /// `macos={{ backdrop }}`: the `NSVisualEffectView` material on macOS
+    /// (default `popover` / `withinWindow` / `active`; `None`: none).
+    #[prop(macos = "backdrop")]
+    MacOsBackdrop(Option<crate::MacOsBackdrop>),
     /// An accessibility property.
     #[prop(nested)]
     Accessibility(AccessibilityProp),
     /// `testID`: an identifier for UI tests.
     #[prop(js = "testID")]
     TestId(Option<Arc<str>>),
+    /// `web={{ element }}`: the HTML element the web draws the view or text
+    /// as (`"p"`, `"nav"`, `"article"`, ...), for what `role` cannot say;
+    /// the other platforms keep the view as it is.
+    #[prop(web = "element")]
+    WebElement(Option<WebElement>),
     /// `windowDrag` (desktops): pressing the view drags the window, as its
     /// title bar would (double-clicking maximizes it); `false` keeps a part
     /// of a draggable view clickable. The nearest view that sets it
@@ -2660,12 +3389,28 @@ pub enum Prop {
     /// popover). Unset, the views that take presses are stops.
     #[prop(js = "focusable")]
     Focusable(Option<bool>),
+    /// `captureKeys`: the hardware keys this view or a focused descendant
+    /// consumes before native defaults run: `"none"`, `"all"`, or the
+    /// canonical keystrokes (`"mod+k"`, `"shift+tab"`) it takes. Decided
+    /// from mounted props; eligible app shortcuts and focused native
+    /// inputs keep their keys. Omitting it restores `"none"`.
+    #[prop(js = "captureKeys", reset = Prop::KeyCapture(crate::KeyCapture::None))]
+    KeyCapture(crate::KeyCapture),
     /// `selectable` of a view: the texts in it share one selection, as a
     /// browser page's do ([`crate::selection`]); texts with
     /// `selectable={false}` stay out of it, a selectable view inside
     /// another is part of the outer one.
     #[prop(js = "selectable", on = VIEW, shared)]
     SelectableView(bool),
+    /// `selectionMenu` of a selectable view: the app's items of the
+    /// system's selection menu (iOS's edit menu, Android's floating text
+    /// actions, the desktops' secondary-click menu), after the system's own,
+    /// which stay. Plain items and separators only: submenus, roles,
+    /// shortcuts and check marks are left out. A chosen item is reported
+    /// as the root's [`EventKind::Menu`] with its id, as a menu's; the web
+    /// shows the browser's menu alone. Empty is unset.
+    #[prop(js = "selectionMenu", on = VIEW, with = crate::js::host_values::selection_menu, reset = Prop::SelectionMenu(Vec::new()), ts = "import(\"nsh/desktop\").MenuItem[]")]
+    SelectionMenu(Vec<crate::desktop::MenuItem>),
     /// The text continues the text before it in document order (a long
     /// line's next wrapped part): a selection's copy joins the two with
     /// nothing between them, and a double or triple click selects across
@@ -2777,6 +3522,18 @@ pub enum NativeProp {
     /// (with a warning): render a new element to change it.
     #[prop(js = "incognito", on = WEBVIEW)]
     Incognito(bool),
+    /// The URL schemes a web view serves from the app (Rust's
+    /// `WebView::url_scheme`). Read when the web view is made, as
+    /// `incognito`.
+    UrlSchemes(Vec<crate::web_resource::WebUrlScheme>),
+    /// Internal: the web view has an `on_download` or
+    /// `on_download_pending` listener, so it must hold its downloads for
+    /// the core (which chooses automatic versus manual from the
+    /// listeners). Without either listener the platform keeps its own
+    /// download behavior.
+    #[doc(hidden)]
+    #[prop(internal, reset = NativeProp::DeferDownloads(false))]
+    DeferDownloads(bool),
     /// `paused` (videos): playback is paused.
     #[prop(js = "paused", on = VIDEO, shared)]
     Paused(bool),
@@ -2816,6 +3573,27 @@ pub enum NativeProp {
 /// A mutation produced by the JS renderer.
 #[derive(Debug)]
 pub enum Op {
+    /// `ref.evaluate(script, { timeout })` of a web view, in order with
+    /// the UI's ops: JS promise `call` settles with its result.
+    Evaluate {
+        /// The web view.
+        id: NodeId,
+        /// The JS promise's call number.
+        call: u32,
+        /// The app's script.
+        script: String,
+        /// How long the script may take to answer.
+        timeout: std::time::Duration,
+    },
+    /// `OffscreenCanvas`'s `convertToBlob`: render `drawing` into an image
+    /// ([`crate::canvas::render`]); JS promise `call` settles with its
+    /// bytes (a `Uint8Array`) or the failure.
+    RenderCanvas {
+        /// The JS promise's call number.
+        call: u32,
+        /// What to render.
+        request: Box<crate::canvas::render::RenderRequest>,
+    },
     /// What a canvas draws (replaces the previous drawing).
     Draw {
         /// The canvas.
@@ -2879,6 +3657,14 @@ pub enum Op {
         /// Sibling to insert before; `None` appends.
         before: Option<NodeId>,
     },
+    /// Marks detached view `id` the stand-in of an `<Each>` row not
+    /// rendered yet, sized like its rendered siblings: the core asks JS to
+    /// render the row once the view would be made
+    /// ([`crate::element::JsEvent::Rows`]).
+    Placeholder {
+        /// Node id.
+        id: NodeId,
+    },
     /// Detaches `child` from `parent`. The child stays alive until released.
     Remove {
         /// Parent node id.
@@ -2906,4 +3692,49 @@ pub enum Op {
     /// posted during a synchronous call ([`crate::element::RustCall`]). Never
     /// reaches a platform.
     Rust(crate::element::RustOp),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventKind;
+
+    /// Android reads an event's kind by its index in [`EventKind::ALL`], so
+    /// `Native.java`'s codes must follow this order: a kind inserted here
+    /// and not there makes Android report the kinds after it as others.
+    #[test]
+    fn androids_event_codes_follow_the_kinds() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nsh-platform-android/java/com/longbridge/nsh/Native.java"
+        );
+        let java = std::fs::read_to_string(path).expect("Native.java");
+        let codes: std::collections::HashMap<&str, usize> = java
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("static final int ")?;
+                let (name, value) = rest.strip_suffix(';')?.split_once(" = ")?;
+                Some((name, value.parse().ok()?))
+            })
+            .collect();
+        for (index, kind) in EventKind::ALL.iter().enumerate() {
+            let prop = kind.prop_name().trim_start_matches("on");
+            let mut name = String::new();
+            for (i, c) in prop.chars().enumerate() {
+                if c.is_ascii_uppercase() && i > 0 {
+                    name.push('_');
+                }
+                name.push(c.to_ascii_uppercase());
+            }
+            assert_eq!(
+                codes.get(name.as_str()),
+                Some(&index),
+                "Native.{name} for {kind:?}"
+            );
+        }
+        assert_eq!(
+            codes.len(),
+            EventKind::ALL.len(),
+            "Native.java has codes of no kind"
+        );
+    }
 }

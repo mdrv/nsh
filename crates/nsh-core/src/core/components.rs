@@ -15,7 +15,7 @@ use std::{any::Any, cell::RefCell, rc::Rc, sync::Arc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{Core, Kind, NO_KEY, views::Anchor};
+use super::{Core, Key, Kind, NO_KEY, views::Anchor};
 use crate::{
     ApplyError, Command, EdgeInsets, EventKind, EventMask, EventPayload, NodeId, Op, Prop, ROOT_ID,
     Tag, TextEngine,
@@ -31,6 +31,7 @@ use crate::{
         virtual_list::{self, RowFn, SeparatorFn, VirtualListEl},
     },
     geometry::Points,
+    list_diff::ListDiff,
     tailwind::ClassList,
 };
 
@@ -134,6 +135,12 @@ pub(super) struct Instance {
     pub(super) user: Option<std::rc::Rc<ClassList>>,
     /// Events JS listens to on the host.
     js_events: EventMask,
+    /// The listeners the view this one is in gives its element
+    /// (`.on_mouse_enter(..)` on a nested component's element), run by
+    /// that view's component after the root's own, as JS's on a host are.
+    given_handlers: Vec<(EventKind, Listener<EventPayload>)>,
+    /// The events of `given_handlers`.
+    given_events: EventMask,
     /// The view, expanded (its root is the host); a list cell's row as
     /// built last.
     root: Option<Expanded>,
@@ -154,8 +161,10 @@ pub(super) struct Instance {
     /// style and animated values.
     pub(super) app_style: Option<crate::StylePatch>,
     dirty: bool,
-    /// The nodes of its view with bindings: what was applied last.
-    pub(super) bound: FxHashMap<NodeId, super::views::BoundNode>,
+    /// The nodes of its view with bindings: what was applied last. Boxed:
+    /// a record is large, and a map's free slots are as large as its
+    /// entries.
+    pub(super) bound: FxHashMap<NodeId, Box<super::views::BoundNode>>,
     /// In a view placing its JS children one by one: them, as a signal.
     pub(super) js_kids: Option<crate::element::Signal<Vec<NodeId>>>,
     /// A cell of a view's list: the owner of the row it shows.
@@ -170,9 +179,10 @@ pub(super) struct Instance {
     /// which the components JS made among them are under.
     children_owner: Option<crate::element::Owner>,
     /// It joined a host as its children (content a view passed a nested
-    /// component, `tabs().child(tab())`): its view waits, as one JS made
-    /// does, to be in the tree under where that host's view places it, so
-    /// it reads the context there.
+    /// component, `tabs().child(tab())`, or inside plain views of that
+    /// content): its view waits, as one JS made does, to be in the tree
+    /// under where that host's view places it, so it reads the context
+    /// there.
     joined: bool,
     /// The component its view's root is, made on this host (its alias,
     /// [`Core::alias`]): its view makes the host's node.
@@ -224,6 +234,9 @@ pub(super) struct RootContext {
     pub(super) app: Option<crate::StylePatch>,
     /// JS's events on the top host.
     pub(super) js: Option<EventMask>,
+    /// The events of the listeners the views above give it (and the
+    /// components whose root it is).
+    pub(super) given_events: EventMask,
     /// The insets given it (the outer wins).
     inset_padding: Option<crate::EdgeInsets>,
     inset_margin: Option<crate::EdgeInsets>,
@@ -291,6 +304,8 @@ impl Instance {
             class_list: Vec::new(),
             user: None,
             js_events: EventMask::default(),
+            given_handlers: Vec::new(),
+            given_events: EventMask::default(),
             root: None,
             js_children,
             children_at: Placement::None,
@@ -422,6 +437,9 @@ pub(super) struct ClipboardAnswer {
     pub(super) has: bool,
     /// The text, for a text read.
     pub(super) text: Option<String>,
+    /// Whether the person refused a text read (iOS's paste prompt): the
+    /// clipboard holds text, but none was read.
+    pub(super) denied: bool,
     /// The image, for an image read.
     pub(super) image: Option<crate::element::ClipboardImage>,
     /// The size in encoded bytes of an image over
@@ -443,6 +461,7 @@ impl ClipboardAnswer {
             match (*k, v) {
                 ("has", crate::PayloadValue::Bool(b)) => answer.has = *b,
                 ("text", crate::PayloadValue::Str(t)) => answer.text = Some(t.clone()),
+                ("denied", crate::PayloadValue::Bool(b)) => answer.denied = *b,
                 ("uri", crate::PayloadValue::Str(u)) => uri = Some(u.clone()),
                 ("width", crate::PayloadValue::Number(n)) => width = *n,
                 ("height", crate::PayloadValue::Number(n)) => height = *n,
@@ -508,6 +527,38 @@ struct UrlScheme {
     pending: std::collections::VecDeque<String>,
     /// The listener waiting for a link.
     next: Option<AnswerSlot<String>>,
+    /// Address moves no listener took yet
+    /// ([`crate::url_scheme::AppUrlChange`]), kept once something listened
+    /// ([`Self::hears_changes`]), at most [`crate::url_scheme::MAX_PENDING`].
+    changes: std::collections::VecDeque<crate::url_scheme::AppUrlChange>,
+    /// The listener waiting for an address move.
+    next_change: Option<AnswerSlot<crate::url_scheme::AppUrlChange>>,
+    /// Something listens to address moves: those before it are stale (the
+    /// address has them), those after it wait between its answers.
+    hears_changes: bool,
+    /// The app's address: the last link taken, the page's on the web, or
+    /// what the app set (`UrlScheme.setUrl`, `set_app_url`). The one copy,
+    /// which every VM's `System` shares ([`Core::app_url_cell`]).
+    address: crate::url_scheme::AppUrlCell,
+}
+
+/// Files the system opened the app with ([`crate::file_type`]).
+#[derive(Default)]
+struct OpenFiles {
+    /// Files no listener took yet, at most [`crate::file_type::MAX_PENDING`].
+    pending: std::collections::VecDeque<std::path::PathBuf>,
+    /// The listener waiting for files.
+    next: Option<AnswerSlot<Vec<std::path::PathBuf>>>,
+}
+
+/// Later launches of the app ([`crate::single_instance`]).
+#[derive(Default)]
+struct SecondInstances {
+    /// Launches no listener took yet, at most
+    /// [`crate::single_instance::MAX_PENDING`].
+    pending: std::collections::VecDeque<crate::single_instance::SecondInstance>,
+    /// The listener waiting for a launch.
+    next: Option<AnswerSlot<crate::single_instance::SecondInstance>>,
 }
 
 /// The speech recognition session running ([`crate::speech`]).
@@ -521,6 +572,8 @@ struct SpeechSession {
 
 /// The core's component state.
 pub(super) struct Components {
+    pub(super) web_evaluations: super::web_evaluation::Evaluations,
+    pub(super) canvas_renders: super::canvas_render::Renders,
     registry: Registry,
     /// The specs of the components made by type (not by name from the
     /// registry), one per type.
@@ -538,6 +591,15 @@ pub(super) struct Components {
     pub(super) instances: FxHashMap<NodeId, Box<Instance>>,
     /// Expanded node -> the host of the component whose view made it.
     pub(super) owners: FxHashMap<NodeId, NodeId>,
+    /// Changes when reconciliation releases an expanded element or raw
+    /// node. A region that only populates or retains nodes needs no sweep
+    /// of its host's listeners and bindings.
+    pub(super) release_generation: u64,
+    /// Region hosts to clean before the next binding/event round. Several
+    /// regions of one view can release nodes in the same patch batch.
+    pub(super) released_hosts: FxHashSet<NodeId>,
+    #[cfg(test)]
+    pub(super) cleanup_work: super::views::CleanupWork,
     /// Slot nodes (`componentSlot`) -> their slot's name.
     slot_names: FxHashMap<NodeId, Arc<str>>,
     /// Slot nodes in a host -> the host.
@@ -600,6 +662,8 @@ pub(super) struct Components {
     notifications: Notifications,
     /// The links that open the app ([`crate::url_scheme`]).
     url_schemes: UrlScheme,
+    second_instances: SecondInstances,
+    open_files: OpenFiles,
     /// Calls of the embedding app's functions (`nsh/host`), by request id:
     /// their answers.
     host_calls: FxHashMap<u64, AnswerSlot<Result<crate::JsonValue, crate::element::JsError>>>,
@@ -608,6 +672,16 @@ pub(super) struct Components {
     url_opens: FxHashMap<u32, AnswerSlot<bool>>,
     /// Those not handed to the engine yet ([`Core::take_url_opens`]).
     url_requests: Vec<(u32, String)>,
+    /// The language the app asked to show in (`Some(None)`: the user's
+    /// again), for the engine ([`Core::take_locale_request`]).
+    pub(super) locale_request: Option<Option<crate::platform::Locale>>,
+    /// The app listened to quit requests at the last commit: the platform
+    /// was told its quit requests go to the app
+    /// ([`crate::desktop::DesktopCommand::SetQuitOnRequest`]).
+    asks_quit: bool,
+    /// Functions for the platform's main thread, for the engine
+    /// ([`Core::take_main_thread_tasks`]).
+    main_thread: Vec<crate::main_thread::MainThreadTask>,
     next_url_open: u32,
     /// Colors being picked on the screen, by request id: their answers.
     screen_colors: FxHashMap<u32, AnswerSlot<Option<crate::Hsla>>>,
@@ -628,9 +702,24 @@ pub(super) struct Components {
     /// Elements to measure once this commit is laid out
     /// ([`crate::element::ElementRef::measure`]).
     pub(super) measures: Vec<(NodeId, AnswerSlot<Option<crate::Measurement>>)>,
+    /// Lists to tell where their viewports start once this commit is laid
+    /// out ([`crate::element::ElementRef::measure_scroll_position`]).
+    pub(super) scroll_positions: Vec<(NodeId, AnswerSlot<Option<crate::ListScrollPosition>>)>,
     /// Elements whose transitions' time to tell once this commit is
     /// styled ([`crate::element::ElementRef::transition_time`]).
     pub(super) transition_times: Vec<(NodeId, AnswerSlot<std::time::Duration>)>,
+    /// Elements whose text to tell once this commit is applied
+    /// ([`crate::element::ElementRef::text_content`]).
+    pub(super) text_contents: Vec<(NodeId, AnswerSlot<String>)>,
+    /// Presses to pass on inside elements once this commit is laid out
+    /// ([`crate::element::ElementRef::press_at`]).
+    pub(super) presses: Vec<(NodeId, crate::PressEvent, AnswerSlot<bool>)>,
+    /// The web views' downloads ([`crate::webview::downloads`]): the
+    /// sessions, their files and the platform's replies.
+    pub(super) downloads: crate::webview::downloads::Downloads,
+    /// The next id of a platform command answering a web view request
+    /// (shared by the downloads' commands).
+    next_webview_request: u64,
     /// The components' own lists, by node.
     virtual_lists: FxHashMap<NodeId, VirtualListState>,
     /// Views JS made, waiting to be in the tree to make their view.
@@ -691,6 +780,10 @@ impl Default for Components {
             host_tokens: None,
             instances: FxHashMap::default(),
             owners: FxHashMap::default(),
+            release_generation: 0,
+            released_hosts: FxHashSet::default(),
+            #[cfg(test)]
+            cleanup_work: Default::default(),
             slot_names: FxHashMap::default(),
             slot_hosts: FxHashMap::default(),
             slot_targets: FxHashMap::default(),
@@ -711,6 +804,9 @@ impl Default for Components {
             clipboard_reads: FxHashMap::default(),
             url_opens: FxHashMap::default(),
             url_requests: Vec::new(),
+            locale_request: None,
+            asks_quit: false,
+            main_thread: Vec::new(),
             next_url_open: 0,
             screen_colors: FxHashMap::default(),
             next_screen_color: 1,
@@ -723,14 +819,23 @@ impl Default for Components {
             audio: FxHashMap::default(),
             notifications: Notifications::default(),
             url_schemes: UrlScheme::default(),
+            second_instances: SecondInstances::default(),
+            open_files: OpenFiles::default(),
             host_calls: FxHashMap::default(),
             next_host_call: 1,
+            web_evaluations: Default::default(),
+            canvas_renders: Default::default(),
             fetches: FxHashMap::default(),
             fetch_requests: Vec::new(),
             next_fetch: 1,
             animations: FxHashMap::default(),
             measures: Vec::new(),
+            scroll_positions: Vec::new(),
             transition_times: Vec::new(),
+            text_contents: Vec::new(),
+            presses: Vec::new(),
+            downloads: crate::webview::downloads::Downloads::default(),
+            next_webview_request: 1,
             virtual_lists: FxHashMap::default(),
             list_counts: FxHashMap::default(),
             waiting: Vec::new(),
@@ -769,6 +874,9 @@ impl Components {
         components.environment.window = viewport;
         // What components that run once read of the core.
         components.runtime.set_services(components.executor.clone());
+        components
+            .runtime
+            .set_app_url(components.url_schemes.address.clone());
         components.runtime.set_environment(components.environment);
         components.runtime.set_tokens(components.tokens.clone());
         components
@@ -843,7 +951,7 @@ impl<M: TextEngine> Core<M> {
     /// ([`Registry::tokens_from`]); set before the first op. Runs the
     /// sets' setup functions ([`Registry::setup`]).
     pub fn set_components(&mut self, registry: Registry) {
-        if let Some(Ok(tokens)) = registry.tokens(None) {
+        if let Some(Ok((tokens, _))) = registry.tokens(None) {
             self.set_tokens(tokens);
         }
         {
@@ -866,11 +974,18 @@ impl<M: TextEngine> Core<M> {
         self.components.registry = registry;
     }
 
-    /// `uiTheme` on the root: the app's theme file (`nsh.json`), which the
-    /// UI set that reads themes makes tokens of.
+    /// `uiTheme` on the root: the app's theme file (`nsh.json`, `setTheme`),
+    /// which the UI set that reads themes makes tokens of. What it cannot
+    /// read is left out and the rest applies, so a bundle made by a newer
+    /// NSH keeps its theme here.
     pub(super) fn set_ui_theme(&mut self, json: &str) {
         match self.components.registry.tokens(Some(json)) {
-            Some(Ok(tokens)) => self.set_tokens(tokens),
+            Some(Ok((tokens, left_out))) => {
+                for what in left_out {
+                    log::warn!("theme: {what}, ignored");
+                }
+                self.set_tokens(tokens);
+            }
             Some(Err(e)) => log::warn!("theme: {e}"),
             None => log::warn!("theme: no UI set reads themes"),
         }
@@ -881,6 +996,64 @@ impl<M: TextEngine> Core<M> {
     pub fn set_tokens(&mut self, tokens: Tokens) {
         self.components.app_tokens = Arc::new(tokens);
         self.tokens_changed();
+    }
+
+    /// The app's translations ([`crate::i18n`]): what `t!` and TS's `t`
+    /// read from now on.
+    pub fn set_translations(&mut self, translations: crate::i18n::Translations) {
+        let _entered = self.components.runtime.enter();
+        let stored = crate::element::global::<crate::i18n::Translations>();
+        let env = self.components.environment;
+        let before =
+            crate::i18n::text_locale(&stored.get(), env.locale, env.locale_settings.languages);
+        stored.set(translations);
+        if crate::i18n::text_locale(&stored.get(), env.locale, env.locale_settings.languages)
+            != before
+        {
+            self.localize_menus();
+        }
+    }
+
+    /// The menus NSH owns use the same language selection as the app's text.
+    fn localize_menus(&mut self) {
+        let _entered = self.components.runtime.enter();
+        if !matches!(
+            self.components.environment.os,
+            crate::platform::Os::MacOs | crate::platform::Os::Windows
+        ) || self.components.environment.idiom == crate::platform::Idiom::Terminal
+        {
+            return;
+        }
+        let translations = crate::element::global::<crate::i18n::Translations>().get();
+        let env = self.components.environment;
+        let locale =
+            crate::i18n::text_locale(&translations, env.locale, env.locale_settings.languages);
+        let labels = crate::desktop::MenuLabels::for_locale(
+            locale,
+            self.components.environment.os == crate::platform::Os::MacOs,
+        );
+        let _ = self.apply_op(crate::Op::Command {
+            id: crate::ROOT_ID,
+            command: crate::Command::Desktop(Box::new(
+                crate::desktop::DesktopCommand::SetMenuLabels(Box::new(labels)),
+            )),
+        });
+    }
+
+    /// The language the app asked to show in since the last call
+    /// (`Some(None)`: the user's again), which the engine applies to the
+    /// environment it gives the core and JS.
+    pub fn take_locale_request(&mut self) -> Option<Option<crate::platform::Locale>> {
+        self.components.locale_request.take()
+    }
+
+    /// The functions components, tasks and module functions asked to run
+    /// on the platform's main thread since the last call
+    /// ([`crate::element::run_on_main_thread`]), in order: the engine hands
+    /// them to its sink after the commit.
+    #[doc(hidden)]
+    pub fn take_main_thread_tasks(&mut self) -> Vec<crate::main_thread::MainThreadTask> {
+        std::mem::take(&mut self.components.main_thread)
     }
 
     /// The embedding app's design tokens (`None`: the app's again): an app
@@ -955,6 +1128,19 @@ impl<M: TextEngine> Core<M> {
             child: id,
             before: None,
         });
+        // The windows `open_window` opens render beside the root (desktops).
+        let desktop = crate::element::os().is_desktop();
+        if desktop {
+            use crate::element::Component as _;
+            let host = crate::element::desktop::OpenedWindowsHost::element(()).into_element();
+            if let Some(host) = self.make_component(host, |_, _| {}) {
+                let _ = self.apply_op(Op::Insert {
+                    parent: ROOT_ID,
+                    child: host,
+                    before: None,
+                });
+            }
+        }
         self.own_direction();
     }
 
@@ -1005,6 +1191,12 @@ impl<M: TextEngine> Core<M> {
         self.components.runtime.set_perf_monitor(enabled);
     }
 
+    /// What the performance monitor measured last (`perfStats()`; `None`
+    /// while it does not measure): what read it runs again.
+    pub fn set_perf_stats(&mut self, stats: Option<crate::platform::PerfStats>) {
+        self.components.runtime.set_perf_stats(stats);
+    }
+
     /// The displays components read ([`crate::element::desktop::displays`]),
     /// as the platform reports them: what read them runs again.
     pub fn set_displays(&mut self, displays: Arc<[crate::desktop::Display]>) {
@@ -1015,6 +1207,11 @@ impl<M: TextEngine> Core<M> {
     pub(super) fn apply_environment(&mut self, environment: Environment) {
         let _entered = self.components.runtime.enter();
         let changed = self.components.environment != environment;
+        let language_changed = self.components.environment.idiom != environment.idiom
+            || self.components.environment.os != environment.os
+            || self.components.environment.locale != environment.locale
+            || self.components.environment.locale_settings.languages
+                != environment.locale_settings.languages;
         self.keyboard_moved |=
             self.components.environment.keyboard_height != environment.keyboard_height;
         let ratio = self.components.environment.pixel_ratio;
@@ -1029,6 +1226,9 @@ impl<M: TextEngine> Core<M> {
         if changed {
             // What reads a part that changed runs again.
             self.components.runtime.set_environment(environment);
+        }
+        if language_changed {
+            self.localize_menus();
         }
         // A main window that keeps its placement saves it as it changes.
         if let Some(state) = environment.window_state {
@@ -1069,7 +1269,16 @@ impl<M: TextEngine> Core<M> {
     /// Wakes the engine when a component's task is woken (from any
     /// thread): it then calls [`Self::run_component_tasks`].
     pub fn set_task_notify(&mut self, notify: Arc<dyn Fn() + Send + Sync>) {
-        self.components.executor.set_notify(notify);
+        self.components.executor.set_notify(notify.clone());
+        self.components.downloads.set_notify(notify);
+    }
+
+    /// Where a platform's last stop acknowledgement goes after this core's
+    /// engine is gone: the engine's control handle keeps it, and the core
+    /// registers its staging directories and cancel requests with it.
+    #[doc(hidden)]
+    pub fn set_download_cleanup(&mut self, cleanup: crate::webview::downloads::DownloadCleanup) {
+        self.components.downloads.set_cleanup(cleanup);
     }
 
     /// The tokio runtime the components' tasks are polled in the context
@@ -1104,6 +1313,74 @@ impl<M: TextEngine> Core<M> {
                 self.component_failed(host, message);
             }
         }
+    }
+
+    /// Whether something runs as the app quits ([`crate::element::desktop::on_app_quit`],
+    /// `Application.on("quit")`): the engine gives it time to.
+    pub fn has_quit_listeners(&self) -> bool {
+        !self.components.executor.quit.borrow().is_empty()
+    }
+
+    /// The app quits: starts each quit listener's work, oldest first, as
+    /// tasks the engine runs ([`Core::run_component_tasks`]) until
+    /// [`Core::quit_pending`] is false or
+    /// [`QUIT_TIMEOUT`](crate::element::desktop::QUIT_TIMEOUT) has passed.
+    /// Whether any started.
+    pub fn start_quit(&mut self) -> bool {
+        let _entered = self.components.runtime.enter();
+        let executor = self.components.executor.clone();
+        let listeners = executor.quit.borrow().all();
+        for listener in listeners {
+            match caught(|| listener()) {
+                Ok(future) => {
+                    let pending = crate::element::quit::Pending::new(&executor.quitting);
+                    // Detached: it runs until it ends or the engine stops.
+                    drop(crate::element::task::spawn_future(&executor, async move {
+                        future.await;
+                        drop(pending);
+                    }));
+                }
+                Err(message) => log::error!(target: "js", "a quit listener failed: {message}"),
+            }
+        }
+        self.apply_actions();
+        self.quit_pending()
+    }
+
+    /// The user asked to quit while the app listens to quit requests:
+    /// each listener hears it, oldest first.
+    fn quit_requested(&mut self) {
+        let _entered = self.components.runtime.enter();
+        let listeners = self.components.executor.quit_requests.borrow().all();
+        for listener in listeners {
+            if let Err(message) = caught(|| listener()) {
+                log::error!(target: "js", "a quit request listener failed: {message}");
+            }
+        }
+        self.apply_actions();
+    }
+
+    /// Tells the platform whether its quit requests go to the app, when
+    /// that changed since the last call (a listener came or went): whether
+    /// it did.
+    pub(super) fn sync_quit_requests(&mut self) -> bool {
+        let asks = !self.components.executor.quit_requests.borrow().is_empty();
+        if asks == self.components.asks_quit {
+            return false;
+        }
+        self.components.asks_quit = asks;
+        let _ = self.apply_op(crate::Op::Command {
+            id: crate::ROOT_ID,
+            command: crate::Command::Desktop(Box::new(
+                crate::desktop::DesktopCommand::SetQuitOnRequest(!asks),
+            )),
+        });
+        true
+    }
+
+    /// Whether the work quit listeners started is still running.
+    pub fn quit_pending(&self) -> bool {
+        self.components.executor.quitting.get() > 0
     }
 
     /// Runs the closures that waited for the app's answer to the events
@@ -1335,9 +1612,7 @@ impl<M: TextEngine> Core<M> {
                 if was_empty || place == Placement::Each {
                     self.components.mark(parent);
                 }
-                if let Some(joined) = self.components.instances.get_mut(&child) {
-                    joined.joined = true;
-                }
+                self.join_content(child);
                 match place {
                     // Before its next JS sibling, else before what the
                     // view puts after the children.
@@ -1441,17 +1716,7 @@ impl<M: TextEngine> Core<M> {
             Op::Listen { id, event, enabled } if self.is_host(id) => {
                 let inst = self.components.instances.get_mut(&id).expect("host");
                 inst.js_events.set(event, enabled);
-                let base = self.base_of(id);
-                let own = self.components.instances[&base]
-                    .root
-                    .as_ref()
-                    .is_some_and(|r| r.events.contains(event));
-                let slot = self.target_listens(base, event, enabled || own);
-                Ok(Some(Op::Listen {
-                    id,
-                    event,
-                    enabled: enabled || own || slot,
-                }))
+                Ok(Some(self.host_listen(id, event)))
             }
             Op::Rust(op) => {
                 self.run_rust(op);
@@ -1463,6 +1728,111 @@ impl<M: TextEngine> Core<M> {
             }
             op => Ok(Some(op)),
         }
+    }
+
+    /// Whether the host `id`'s node listens to `event` for someone outside
+    /// its component's view: JS on the host, or a view above giving an
+    /// element of this component (or of one whose root it is) a listener.
+    fn outside_listens(&self, id: NodeId, event: EventKind) -> bool {
+        let mut at = Some(self.base_of(id));
+        while let Some(host) = at {
+            let Some(inst) = self.components.instances.get(&host) else {
+                break;
+            };
+            if inst.js_events.contains(event) || inst.given_events.contains(event) {
+                return true;
+            }
+            at = inst.above;
+        }
+        false
+    }
+
+    /// What the host `id`'s node listens to of `event`: its root's own,
+    /// the slot whose props it takes and those outside its view.
+    fn host_listen(&mut self, id: NodeId, event: EventKind) -> Op {
+        let outside = self.outside_listens(id, event);
+        let base = self.base_of(id);
+        let own = self.components.instances[&base]
+            .root
+            .as_ref()
+            .is_some_and(|r| r.events.contains(event));
+        let slot = self.target_listens(base, event, outside || own);
+        Op::Listen {
+            id,
+            event,
+            enabled: outside || own || slot,
+        }
+    }
+
+    /// Gives the nested component on `id` the listeners `handlers` of the
+    /// view it is in (in place of what that view gave it before): its node
+    /// listens to their events as long as they are given.
+    pub(super) fn set_given_handlers(
+        &mut self,
+        id: NodeId,
+        handlers: Vec<(EventKind, Listener<EventPayload>)>,
+    ) {
+        let mut events = EventMask::default();
+        for (kind, _) in &handlers {
+            events.set(*kind, true);
+        }
+        let Some(inst) = self.components.instances.get_mut(&id) else {
+            return;
+        };
+        let old = std::mem::replace(&mut inst.given_events, events);
+        inst.given_handlers = handlers;
+        let mut changed = old.bits() ^ events.bits();
+        while changed != 0 {
+            let kind = EventKind::ALL[changed.trailing_zeros() as usize];
+            changed &= changed - 1;
+            let op = self.host_listen(id, kind);
+            let _ = self.apply_op(op);
+        }
+    }
+
+    /// Runs the listeners of `kind` the views above give the host `base`
+    /// (and the components whose root it is), each in the component whose
+    /// view gave it; false when none was given.
+    fn handle_given(&mut self, base: NodeId, kind: EventKind, payload: &EventPayload) -> bool {
+        let mut listeners = Vec::new();
+        let mut at = Some(base);
+        while let Some(host) = at {
+            let Some(inst) = self.components.instances.get(&host) else {
+                break;
+            };
+            if inst.given_events.contains(kind)
+                && let Some(&owner) = self.components.owners.get(&host)
+            {
+                listeners.extend(
+                    inst.given_handlers
+                        .iter()
+                        .filter(|(k, _)| *k == kind)
+                        .map(|(_, l)| (owner, l.clone())),
+                );
+            }
+            at = inst.above;
+        }
+        let mut handled = false;
+        for (owner, listener) in listeners {
+            handled |= self.run_listener(owner, &listener, payload);
+        }
+        handled
+    }
+
+    /// Whether JS listens to `kind` on the host whose node `base` makes
+    /// (the top one of its chain).
+    fn js_listens(&self, base: NodeId, kind: EventKind) -> bool {
+        let mut at = Some(base);
+        while let Some(host) = at {
+            let Some(inst) = self.components.instances.get(&host) else {
+                break;
+            };
+            if inst.js_events.contains(kind) {
+                return true;
+            }
+            at = inst.above;
+        }
+        false
     }
 
     /// The number of rows of the list cell `cell` is in.
@@ -1528,8 +1898,14 @@ impl<M: TextEngine> Core<M> {
             RustCall::Op(run) => {
                 let mut cx = ModuleCx::default();
                 // The app's code: a panic rejects the call (its actions are
-                // dropped) instead of unwinding through the engine.
-                let result = match caught(|| run(&mut cx)) {
+                // dropped) instead of unwinding through the engine. It runs
+                // in the graph, as a listener does: it may `spawn` and use
+                // signals.
+                let ran = {
+                    let _entered = self.components.runtime.enter();
+                    caught(|| run(&mut cx))
+                };
+                let result = match ran {
                     Ok(result) => {
                         for action in std::mem::take(&mut cx.actions) {
                             self.apply_action(action);
@@ -1712,6 +2088,13 @@ impl<M: TextEngine> Core<M> {
         let instance = Instance::new(inner, spec, Vec::new(), app_style);
         self.components.instances.insert(host, Box::new(instance));
         self.components.mark(host);
+        // No box of its own while its view styles none of its layout and
+        // holds one node: that node is laid out in its place, so an app's
+        // `flex-1` on a component's slot (a menu's trigger) fills the
+        // component's parent (#2008).
+        if let Ok(k) = self.key(host) {
+            self.lay_out_through(k);
+        }
     }
 
     /// `$name` on a host: a prop of its component.
@@ -1920,6 +2303,29 @@ impl<M: TextEngine> Core<M> {
         }
     }
 
+    /// Node `id` joined a host as its children: the components in it, the
+    /// node itself or inside its plain views however deep
+    /// (`tabs().child(view().child(tab()))`), are `joined`, so their views
+    /// wait to be placed and read the context of the host's view as a
+    /// direct child does. A component's own content joins it in turn.
+    fn join_content(&mut self, id: NodeId) {
+        let mut stack = vec![id];
+        while let Some(id) = stack.pop() {
+            if let Some(inst) = self.components.instances.get_mut(&id) {
+                inst.joined = true;
+                continue;
+            }
+            if let Ok(k) = self.key(id) {
+                stack.extend(
+                    self.nodes[k as usize]
+                        .children
+                        .iter()
+                        .map(|&c| self.nodes[c as usize].id),
+                );
+            }
+        }
+    }
+
     /// Whether `host` is a component that runs once, made by JS (no owner
     /// placed it) or passed by a view as a nested component's content
     /// (`joined`), whose view is not made yet, out of the tree: the view
@@ -2042,6 +2448,17 @@ impl<M: TextEngine> Core<M> {
             at = owner.parent();
         }
         None
+    }
+
+    /// The window the component that runs once under `owner` shows in (its
+    /// root node), the main window's when there is none.
+    fn window_of_owner(&self, owner: crate::element::Owner) -> NodeId {
+        if self.window_ids.is_empty() {
+            return crate::ROOT_ID;
+        }
+        self.host_of_owner(owner)
+            .and_then(|host| self.key(host).ok())
+            .map_or(crate::ROOT_ID, |key| self.key_window(key))
     }
 
     /// Makes `inst`'s view on `host` (once: a view made already takes its
@@ -2368,6 +2785,7 @@ impl<M: TextEngine> Core<M> {
         }
         let user = cx.user.clone();
         let top_js = cx.js;
+        let given_events = cx.given_events;
         let classes = self.apply_el_styles(
             host,
             &el.style,
@@ -2387,8 +2805,9 @@ impl<M: TextEngine> Core<M> {
                 text.clone(),
             );
         }
-        // The host listens to its component's events and to JS's.
-        let js = top_js.unwrap_or(inst.js_events);
+        // The host listens to its component's events, JS's and those the
+        // views above give it.
+        let js = top_js.unwrap_or(inst.js_events) | given_events;
         self.apply_handlers(host, host, &el, old_events | js, js, inst);
         let mut events = EventMask::default();
         for (kind, _) in &el.handlers {
@@ -2485,6 +2904,7 @@ impl<M: TextEngine> Core<M> {
             combined: false,
             app: None,
             js: None,
+            given_events: inst.given_events,
             inset_padding: None,
             inset_margin: None,
             test_id: None,
@@ -2523,6 +2943,7 @@ impl<M: TextEngine> Core<M> {
             let (outer, given) = (above.user.clone(), above.given.clone());
             app = above.app_style.clone();
             cx.js = Some(above.js_events);
+            cx.given_events = cx.given_events | above.given_events;
             at = above.above;
             if let Some(given) = &given {
                 take(&mut cx, given);
@@ -2982,6 +3403,21 @@ impl<M: TextEngine> Core<M> {
             // its focus (Android: an input that gains a sibling would lose
             // the keyboard on each keystroke).
             let ids: Vec<NodeId> = wanted().copied().collect();
+            // A first fill appends them in order: no child to find its place
+            // among (from the end, each would scan the ones placed already).
+            let empty = self
+                .key(parent)
+                .is_ok_and(|k| self.nodes[k as usize].children.is_empty());
+            if empty {
+                for &child in &ids {
+                    let _ = self.apply_op(Op::Insert {
+                        parent,
+                        child,
+                        before: None,
+                    });
+                }
+                return out;
+            }
             let mut before = None;
             for &child in ids.iter().rev() {
                 if !self.precedes(parent, child, before) {
@@ -3009,6 +3445,18 @@ impl<M: TextEngine> Core<M> {
         host: NodeId,
         inst: &mut Instance,
     ) -> (Vec<Expanded>, Option<usize>) {
+        // Kept rows update through their item bindings. In the same order,
+        // matching would only move these elements into the output unchanged.
+        if old.len() == new.len()
+            && old.iter().zip(&new).all(|(previous, (owner, el))| {
+                owner.is_none()
+                    && matches!(&el.kind, ElKind::Keep)
+                    && el.key.is_some()
+                    && el.key == previous.key
+            })
+        {
+            return (old, None);
+        }
         // `children_each`: one wrapper per JS child, keyed by it; in a view,
         // a region following them.
         let new = if new
@@ -3940,9 +4388,20 @@ impl<M: TextEngine> Core<M> {
         let kept = prev.is_some();
         let (id, old_attrs, old_style, old_classes, old_events, old_children, old_text) = match prev
         {
-            Some(p) => (
-                p.id, p.attrs, p.style, p.classes, p.events, p.children, p.text,
-            ),
+            Some(mut p) => {
+                // Bindings may have changed the node since this element
+                // was applied. Diff against those latest values, even
+                // when the new element has no bindings.
+                if let Some(applied) = inst.bound.remove(&p.id) {
+                    p.attrs = applied.attrs;
+                    p.style = applied.style;
+                    p.classes = applied.classes;
+                    p.text = applied.text;
+                }
+                (
+                    p.id, p.attrs, p.style, p.classes, p.events, p.children, p.text,
+                )
+            }
             None => {
                 let id = self.components.alloc();
                 let _ = self.apply_op(Op::Create { id, tag: el.tag });
@@ -3985,6 +4444,10 @@ impl<M: TextEngine> Core<M> {
             // Made again, it hears this run's listeners only.
             if kept {
                 inst.event_handlers.retain(|(n, _)| *n != id);
+            }
+            // The view's listeners of its node's events, after its root's.
+            if self.is_host(id) {
+                self.set_given_handlers(id, std::mem::take(&mut el.handlers));
             }
             inst.event_handlers
                 .extend(c.on_event.into_iter().map(|listener| (id, listener)));
@@ -4226,13 +4689,13 @@ impl<M: TextEngine> Core<M> {
             let made = std::cell::Cell::new(false);
             crate::element::computed(move || {
                 let (count, keys) = rows();
-                let splice = match (&*last.borrow(), &keys) {
-                    (Some(old), Some(new)) => crate::element::virtual_list::splice(old, new),
+                let diff = match (&*last.borrow(), &keys) {
+                    (Some(old), Some(new)) => ListDiff::new(old, new),
                     _ => None,
                 };
                 last.replace(keys.clone());
                 if made.replace(true) {
-                    move_rows(&cells, splice, count);
+                    move_rows(&cells, diff.as_ref(), count);
                     count_signal.set(count as usize);
                     patches.borrow_mut().push(super::views::Patch::Rows {
                         list: id,
@@ -4255,17 +4718,9 @@ impl<M: TextEngine> Core<M> {
         };
         self.send_list_rows(id, before.as_ref(), count, keys.as_ref());
         if before.is_none()
-            && let Some(index) = list.initial_index
+            && let Some(command) = list.initial_scroll
         {
-            let _ = self.apply_op(Op::Command {
-                id,
-                command: Command::ScrollToIndex {
-                    index,
-                    animated: false,
-                    view_position: crate::geometry::Percentage(0.0),
-                    view_offset: Points::ZERO,
-                },
-            });
+            let _ = self.apply_op(Op::Command { id, command });
         }
         let state = self.components.virtual_lists.get_mut(&id).expect("list");
         state.row = list.row;
@@ -4286,7 +4741,7 @@ impl<M: TextEngine> Core<M> {
     }
 
     /// Sends list `id` its rows' changes from `before` (none: a new list):
-    /// a splice when the keys say rows came or went, then the count.
+    /// how the keys say rows came, went or moved, then the count.
     fn send_list_rows(
         &mut self,
         id: NodeId,
@@ -4295,11 +4750,11 @@ impl<M: TextEngine> Core<M> {
         keys: Option<&Rc<[u64]>>,
     ) {
         if let (Some((_, Some(old))), Some(new)) = (before, keys)
-            && let Some((at, removed, inserted)) = crate::element::virtual_list::splice(old, new)
+            && let Some(diff) = ListDiff::new(old, new)
         {
             let _ = self.apply_op(Op::SetProp {
                 id,
-                prop: Prop::Splice(at, removed, inserted),
+                prop: Prop::ListDiff(Rc::new(diff)),
             });
         }
         if before.map(|(count, _)| *count) != Some(count) {
@@ -4524,7 +4979,13 @@ impl<M: TextEngine> Core<M> {
     }
 
     fn release_id(&mut self, id: NodeId) {
-        self.components.owners.remove(&id);
+        self.components.release_generation = self.components.release_generation.wrapping_add(1);
+        if let Some(host) = self.components.owners.remove(&id) {
+            // Cells can replace/empty their static root outside a region's
+            // matching pass. Their released bindings need the same sweep
+            // even if the next region only populates new nodes.
+            self.components.released_hosts.insert(host);
+        }
         self.forget_node_extras(id);
         // A root component's host is its view's: only the name goes.
         if self.is_alias(id) {
@@ -4551,6 +5012,9 @@ impl<M: TextEngine> Core<M> {
     /// Frees an expanded element and what it rendered (a slot's node is
     /// JS's: it only leaves the tree).
     pub(super) fn release_expanded(&mut self, e: Expanded) {
+        // Slot/JS nodes can lose this view's part without being deleted or
+        // leaving `owners`, so count expanded releases as well as raw IDs.
+        self.components.release_generation = self.components.release_generation.wrapping_add(1);
         match e.part {
             Part::Slot => {
                 self.drop_slot_target(e.id);
@@ -4717,6 +5181,131 @@ impl<M: TextEngine> Core<M> {
         handled
     }
 
+    /// Whether node `id` has a listener for `event` (a JS handler or a Rust
+    /// component's), as the platform sees it mounted. The engine skips
+    /// nodes without one when it fans a key notification out.
+    #[doc(hidden)]
+    pub fn listens(&self, id: NodeId, event: EventKind) -> bool {
+        self.key(id)
+            .is_ok_and(|key| self.nodes[key as usize].mounted_events().contains(event))
+    }
+
+    /// Whether `id` or an enabled logical ancestor up to its window root
+    /// hears a key transition (`KeyDown` or `KeyUp`) or has a capture rule
+    /// that is not `None`. Follows the logical tree (`node.parent`), so an
+    /// overlay's content finds the views it is logically in even where a
+    /// backend mounts it elsewhere. No allocation: a walk per transition.
+    #[doc(hidden)]
+    pub fn key_interest(&self, id: NodeId) -> bool {
+        let Ok(mut key) = self.key(id) else {
+            return false;
+        };
+        let window = self.key_window(key);
+        loop {
+            let node = &self.nodes[key as usize];
+            let disabled = node
+                .props
+                .as_ref()
+                .is_some_and(|p| p.accessibility.state.disabled);
+            if !disabled {
+                let events = node.mounted_events();
+                if events.contains(EventKind::KeyDown) || events.contains(EventKind::KeyUp) {
+                    return true;
+                }
+                if node
+                    .props
+                    .as_ref()
+                    .is_some_and(|p| !p.key_capture.is_none())
+                {
+                    return true;
+                }
+            }
+            if node.id == window || node.parent == NO_KEY {
+                return false;
+            }
+            key = node.parent;
+        }
+    }
+
+    /// The views a key notification on `id` reaches, in order: `id`, then
+    /// each enabled ancestor, up to and including the root of `id`'s window.
+    /// The engine notifies every one of them (Rust and JS listeners alike)
+    /// from one platform event; a native window is a keyboard boundary even
+    /// when its declarative root remains in another window's logical tree.
+    /// A disabled view hears nothing, and its enabled ancestors still do.
+    #[doc(hidden)]
+    pub fn key_path(&self, id: NodeId, out: &mut Vec<NodeId>) {
+        out.clear();
+        let Ok(mut key) = self.key(id) else {
+            return;
+        };
+        let window = self.key_window(key);
+        loop {
+            let node = &self.nodes[key as usize];
+            let disabled = node
+                .props
+                .as_ref()
+                .is_some_and(|p| p.accessibility.state.disabled);
+            if !disabled {
+                out.push(node.id);
+            }
+            if node.id == window || node.parent == NO_KEY {
+                return;
+            }
+            key = node.parent;
+        }
+    }
+
+    /// Whether `id` or an enabled ancestor within its window captures the
+    /// transition whose canonical shortcut stroke is `keystroke` under its
+    /// mounted [`crate::KeyCapture`] rule (`captureKeys`). The platform
+    /// decides before native defaults from the stroke its own shortcut
+    /// vocabulary names, never from [`crate::KeyEvent`]'s `key` or `code`;
+    /// `None` (a key no shortcut names) is captured only by
+    /// [`crate::KeyCapture::All`]. A focused native text input keeps the
+    /// keys that edit it: nothing captures them.
+    #[doc(hidden)]
+    pub fn key_captured(&self, id: NodeId, keystroke: Option<&crate::keymap::Keystroke>) -> bool {
+        let Ok(mut key) = self.key(id) else {
+            return false;
+        };
+        // A native text input owns the keys that edit it: an ancestor's
+        // capture never intercepts its typing, caret or editing commands.
+        if self.nodes[key as usize].kind == Kind::Input {
+            return false;
+        }
+        let window = self.key_window(key);
+        loop {
+            let node = &self.nodes[key as usize];
+            let disabled = node
+                .props
+                .as_ref()
+                .is_some_and(|p| p.accessibility.state.disabled);
+            if !disabled
+                && node
+                    .props
+                    .as_ref()
+                    .is_some_and(|p| p.key_capture.captures_key(keystroke))
+            {
+                return true;
+            }
+            if node.id == window || node.parent == NO_KEY {
+                return false;
+            }
+            key = node.parent;
+        }
+    }
+
+    /// The root of the window `key` is in, `key` itself when it is one.
+    pub(super) fn key_window(&self, key: Key) -> NodeId {
+        let node = &self.nodes[key as usize];
+        if node.kind == Kind::Modal && self.window_ids.values().any(|(root, _)| *root == node.id) {
+            node.id
+        } else {
+            self.window_of(key)
+        }
+    }
+
     fn flush_component_emits(&mut self) {
         // What views' listeners emitted reaches its listeners (JS hears it
         // in this turn).
@@ -4755,6 +5344,13 @@ impl<M: TextEngine> Core<M> {
     }
 
     fn dispatch_event(&mut self, id: NodeId, kind: EventKind, payload: &EventPayload) -> bool {
+        // Before a cancelled press's release is dropped: it still ends the
+        // span's press.
+        self.span_state(id, kind);
+        // A cancelled press's release reaches no one, JS included.
+        if self.drop_cancelled_press(id, kind, payload) {
+            return true;
+        }
         // Touches come on the root with the listening nodes around each
         // finger: the components hear theirs, JS its own.
         if kind == EventKind::Touch && id == ROOT_ID {
@@ -4766,8 +5362,17 @@ impl<M: TextEngine> Core<M> {
         }
         // Hints follow the pointer on their anchors, whoever else listens.
         if matches!(kind, EventKind::MouseEnter | EventKind::MouseLeave) {
-            self.overlay_hover(id, kind);
+            let at = match payload {
+                EventPayload::Mouse(mouse) => Some(mouse.page_position),
+                _ => None,
+            };
+            self.overlay_hover(id, kind, at);
         }
+        // A download event's listener gets a handle bound to the native
+        // web view node the platform reported, not the component host its
+        // handlers were registered on: only this dispatch can make one.
+        let _target = matches!(kind, EventKind::DownloadPending | EventKind::Download)
+            .then(|| crate::element::download_target(id, Rc::downgrade(&self.components.executor)));
         if self.platform_event(id, kind, payload) {
             return true;
         }
@@ -4778,7 +5383,15 @@ impl<M: TextEngine> Core<M> {
             if let Some(slot) = self.adopted_host(base) {
                 self.handle(slot, base, kind, payload);
             }
-            return self.handle(base, base, kind, payload);
+            let own = self.handle(base, base, kind, payload);
+            // A context menu has one listener: a component showing its own
+            // keeps it.
+            if own && kind == EventKind::ContextMenu {
+                return true;
+            }
+            let given = self.handle_given(base, kind, payload);
+            // JS listening on the host hears it too.
+            return (own || given) && !self.js_listens(base, kind);
         }
         // A component's own list reports its viewable rows as they settle.
         if kind == EventKind::ViewableItemsChange && self.components.virtual_lists.contains_key(&id)
@@ -4830,6 +5443,7 @@ impl<M: TextEngine> Core<M> {
         kind: EventKind,
         payload: &EventPayload,
     ) -> bool {
+        let id = self.base_of(id);
         let mut handled = false;
         let mut from = 0;
         while let Some((at, listener)) = self.next_handler(host, id, kind, from) {
@@ -4943,6 +5557,52 @@ impl<M: TextEngine> Core<M> {
         (parent != NO_KEY).then(|| self.nodes[parent as usize].id)
     }
 
+    /// Reads (`enabled` `None`) or changes whether the app launches at
+    /// login: on the backend's thread when the runner gave the core one,
+    /// the answer (on or not) delivered in a task here; without one the app
+    /// does not launch at login, and a change fails.
+    fn login_item_action(
+        &mut self,
+        enabled: Option<bool>,
+        answer: crate::element::AnswerSlot<Result<bool, crate::desktop::LaunchAtLoginError>>,
+    ) {
+        use crate::desktop::{LaunchAtLoginError, LoginItemStatus};
+        // Launching at login acts on the application as a whole: an app
+        // declaring capabilities needs `application` to change it, and is
+        // told it does not launch at login otherwise.
+        if !self.access.allows_application() {
+            answer.borrow_mut().deliver(match enabled {
+                None => Ok(false),
+                Some(_) => Err(LaunchAtLoginError::Denied),
+            });
+            return;
+        }
+        let Some(items) = self.login_item.as_mut() else {
+            answer.borrow_mut().deliver(match enabled {
+                None => Ok(false),
+                Some(_) => Err(LaunchAtLoginError::Unavailable),
+            });
+            return;
+        };
+        let result = items.call(enabled);
+        crate::element::task::spawn_raw(
+            &self.components.executor,
+            crate::ROOT_ID,
+            Box::pin(async move {
+                let result = match result.await {
+                    // Nothing to change where the platform has no login
+                    // item for the app (a sandboxed Linux app).
+                    Ok(LoginItemStatus::Unavailable) if enabled.is_some() => {
+                        Err(LaunchAtLoginError::Unavailable)
+                    }
+                    Ok(status) => Ok(status == LoginItemStatus::Enabled),
+                    Err(error) => Err(LaunchAtLoginError::System(error)),
+                };
+                answer.borrow_mut().deliver(result);
+            }),
+        );
+    }
+
     /// Applies what the app asks about notifications: granted and where
     /// the platform shows them, the platform answers with
     /// [`EventKind::Notification`]; otherwise the answer is given here.
@@ -4987,6 +5647,12 @@ impl<M: TextEngine> Core<M> {
                 }
                 NotificationCommand::Close(id)
             }
+            NotificationAction::CloseAll => {
+                if !available {
+                    return;
+                }
+                NotificationCommand::CloseAll
+            }
             NotificationAction::SetBadge(count) => {
                 if !allowed {
                     return;
@@ -5013,12 +5679,85 @@ impl<M: TextEngine> Core<M> {
         });
     }
 
+    /// The app's address, which the engine shares with every VM's
+    /// `System` (`UrlScheme.url()` reads it there).
+    #[doc(hidden)]
+    pub fn app_url_cell(&self) -> crate::url_scheme::AppUrlCell {
+        self.components.url_schemes.address.clone()
+    }
+
     /// Hands `url`, a link the system gave the app, to the listener, or
     /// keeps it for the next; drops it when the app does not claim it.
-    fn url_scheme(&mut self, url: String) {
+    /// `page`: the address of the page the app is (the web), which needs
+    /// no scheme of the app's; `quiet` only takes it as the address;
+    /// `change`, an address the app moved to without making the move,
+    /// goes to the change listener instead of `open`.
+    fn url_scheme(
+        &mut self,
+        url: String,
+        page: bool,
+        quiet: bool,
+        change: Option<crate::url_scheme::AppUrlChangeReason>,
+    ) {
         let links = &mut self.components.url_schemes;
-        if let Err(dropped) = crate::url_scheme::check_url(&url, &links.schemes) {
+        // A file the system opened the app with (nsh.json `fileTypes`): the
+        // platforms report it as a `file://` URL, the core hands it to the
+        // app as a file ([`crate::file_type`]), never as a link.
+        if !page && change.is_none() && crate::file_type::is_file_url(&url) {
+            if !links
+                .schemes
+                .iter()
+                .any(|s| s == crate::file_type::FILE_SCHEME)
+            {
+                log::warn!("file dropped: the app declares no file types (nsh.json `fileTypes`)");
+                return;
+            }
+            let Some(path) = crate::file_type::file_path(&url) else {
+                log::warn!("file dropped: {url} is not a local file");
+                return;
+            };
+            let files = &mut self.components.open_files;
+            if let Some(answer) = files.next.take() {
+                answer.borrow_mut().deliver(vec![path]);
+                return;
+            }
+            if files.pending.len() == crate::file_type::MAX_PENDING {
+                log::warn!(
+                    "file dropped: {} came while nothing listened",
+                    crate::file_type::MAX_PENDING
+                );
+                files.pending.pop_front();
+            }
+            files.pending.push_back(path);
+            return;
+        }
+        let checked = if page {
+            crate::url_scheme::check_page_url(&url)
+        } else {
+            crate::url_scheme::check_url(&url, &links.schemes)
+        };
+        if let Err(dropped) = checked {
             log::warn!("link dropped: {dropped}");
+            return;
+        }
+        self.components.url_schemes.address.set(url.clone());
+        if quiet {
+            return;
+        }
+        let links = &mut self.components.url_schemes;
+        if let Some(reason) = change {
+            if !links.hears_changes {
+                return;
+            }
+            let change = crate::url_scheme::AppUrlChange { url, reason };
+            if let Some(answer) = links.next_change.take() {
+                answer.borrow_mut().deliver(change);
+                return;
+            }
+            if links.changes.len() == crate::url_scheme::MAX_PENDING {
+                links.changes.pop_front();
+            }
+            links.changes.push_back(change);
             return;
         }
         if let Some(answer) = links.next.take() {
@@ -5193,7 +5932,7 @@ impl<M: TextEngine> Core<M> {
                 answer.borrow_mut().deliver(available);
                 return;
             }
-            AudioAction::Open { command, sink } => {
+            AudioAction::Open { mut command, sink } => {
                 debug_assert!(matches!(
                     command,
                     AudioCommand::Load { .. }
@@ -5213,16 +5952,33 @@ impl<M: TextEngine> Core<M> {
                     );
                     return;
                 }
+                // A sound loads what the check granted (`Access::media_url`).
                 if let AudioCommand::Open { src, .. } | AudioCommand::LoadUrl { url: src, .. } =
-                    &command
-                    && !self.access.allows_media(src)
+                    &mut command
                 {
-                    sink.send(failed(AudioError::NotAllowed, "the source is not granted"));
-                    sink.close();
-                    self.deny(format!(
-                        "`{src}` is not granted by capabilities.network in nsh.json"
-                    ));
-                    return;
+                    match self.media_source(src) {
+                        Some(granted) => {
+                            if let Some(url) = granted {
+                                *src = url.to_string();
+                            }
+                        }
+                        None => {
+                            let base = self.base_url.as_deref();
+                            let capability = crate::access::media_capability(src, base);
+                            let advice = crate::access::media_grant_advice(src, base);
+                            // Worded without the app's text: the player's
+                            // error names the capability from it.
+                            sink.send(failed(
+                                AudioError::NotAllowed,
+                                &format!("{}{capability}", super::SOURCE_NOT_GRANTED),
+                            ));
+                            sink.close();
+                            self.deny(format!(
+                                "`{src}` is not granted by capabilities.{capability}: {advice}"
+                            ));
+                            return;
+                        }
+                    }
                 }
                 if self.audio.is_none() && !self.components.environment.audio {
                     sink.send(failed(AudioError::Unavailable, "nothing plays sound here"));
@@ -5265,6 +6021,7 @@ impl<M: TextEngine> Core<M> {
             Action::Command(id, command) => {
                 let _ = self.apply_op(Op::Command { id, command });
             }
+            Action::FocusBack { to, from } => self.focus_back = Some((to, from)),
             Action::Dialog(mut dialog, answer) => {
                 dialog.id = self.components.next_dialog;
                 self.components.next_dialog += 1;
@@ -5299,13 +6056,26 @@ impl<M: TextEngine> Core<M> {
             Action::Frame(answer) => self.wait_frame(answer),
             Action::Appearance(appearance) => self.set_appearance(appearance),
             Action::Tokens(tokens) => self.set_tokens(tokens),
+            Action::Translations(translations) => self.set_translations(translations),
+            Action::Locale(locale) => self.components.locale_request = Some(locale),
+            Action::MainThread(task) => self.components.main_thread.push(task),
             Action::BuiltInScrollbars(source, theme) => {
                 self.set_builtin_scrollbars(theme.map(|theme| (source, theme)))
             }
             Action::Measure(id, answer) => self.components.measures.push((id, answer)),
+            Action::MeasureScrollPosition(id, answer) => {
+                self.components.scroll_positions.push((id, answer))
+            }
+            Action::Evaluate(node, script, timeout, answer) => {
+                self.start_web_evaluation(node, script, timeout, answer)
+            }
+            Action::WebEvaluationTimeout(request) => self.timeout_web_evaluation(request),
+            Action::CanvasRenderTimeout(id) => self.timeout_canvas_render(id),
             Action::TransitionTime(id, answer) => {
                 self.components.transition_times.push((id, answer))
             }
+            Action::TextContent(id, answer) => self.components.text_contents.push((id, answer)),
+            Action::PressAt(id, press, answer) => self.components.presses.push((id, press, answer)),
             // A terminal decodes no images: the answer is at once, and no
             // request goes to the platform.
             Action::ImageInfo(_, answer)
@@ -5408,10 +6178,12 @@ impl<M: TextEngine> Core<M> {
                 let id = self.components.next_clipboard_read;
                 self.components.next_clipboard_read += 1;
                 let command = match &read {
-                    ClipboardRead::Text(_) => Command::ReadClipboard {
-                        id,
-                        has_only: false,
-                    },
+                    ClipboardRead::Text(_) | ClipboardRead::CheckedText(_) => {
+                        Command::ReadClipboard {
+                            id,
+                            has_only: false,
+                        }
+                    }
                     ClipboardRead::Has(_) => Command::ReadClipboard { id, has_only: true },
                     ClipboardRead::Image(_) | ClipboardRead::CheckedImage(_) => {
                         Command::ReadClipboardImage {
@@ -5445,6 +6217,16 @@ impl<M: TextEngine> Core<M> {
                     command: Command::HostCall { id, name, args },
                 });
             }
+            // Dropped without a host, as an SDK channel drops it without
+            // an embedding app.
+            Action::HostPost { name, args } => {
+                if self.components.environment.host {
+                    let _ = self.apply_op(Op::Command {
+                        id: crate::ROOT_ID,
+                        command: Command::HostPost { name, args },
+                    });
+                }
+            }
             // A call timed out (`runtime/host.rs`), its answer dropped: its
             // slot waits no more.
             Action::ForgetHostCalls => {
@@ -5471,6 +6253,7 @@ impl<M: TextEngine> Core<M> {
             Action::Speech(action) => self.speech_action(action),
             Action::Audio(action) => self.audio_action(action),
             Action::Notification(action) => self.notification_action(action),
+            Action::LoginItem(enabled, answer) => self.login_item_action(enabled, answer),
             Action::NextUrlSchemeOpen(answer) => {
                 let links = &mut self.components.url_schemes;
                 match links.pending.pop_front() {
@@ -5478,10 +6261,87 @@ impl<M: TextEngine> Core<M> {
                     None => links.next = Some(answer),
                 }
             }
+            Action::NextOpenFiles(answer) => {
+                let files = &mut self.components.open_files;
+                if files.pending.is_empty() {
+                    files.next = Some(answer);
+                } else {
+                    answer
+                        .borrow_mut()
+                        .deliver(files.pending.drain(..).collect());
+                }
+            }
+            Action::NextSecondInstance(answer) => {
+                let launches = &mut self.components.second_instances;
+                match launches.pending.pop_front() {
+                    Some(launch) => answer.borrow_mut().deliver(launch),
+                    None => launches.next = Some(answer),
+                }
+            }
+            Action::NextAppUrlChange(answer) => {
+                let links = &mut self.components.url_schemes;
+                links.hears_changes = true;
+                match links.changes.pop_front() {
+                    Some(change) => answer.borrow_mut().deliver(change),
+                    None => links.next_change = Some(answer),
+                }
+            }
+            Action::AppUrl(answer) => {
+                let address = self.components.url_schemes.address.get();
+                answer.borrow_mut().deliver(address);
+            }
+            Action::SetAppUrl(url, history) => {
+                // Checked where the app called (`set_app_url`, `setUrl`);
+                // where the app is the page, the address stays of its
+                // origin (both refuse others first).
+                let address = self.components.url_schemes.address.clone();
+                if let Some(base) = address.page_base()
+                    && !crate::url_scheme::same_origin(Some(base.as_str()), &url)
+                {
+                    log::warn!("set_app_url: {url} is not of the page's origin");
+                    return;
+                }
+                // Again for `setUrl`, which wrote it as it was called: in
+                // order with the page's address the core took since.
+                address.set(url.clone());
+                // The platform shows it: the web in its history entries,
+                // iOS and macOS to the system when the app opts in
+                // (Handoff).
+                let command = match history {
+                    crate::url_scheme::HistoryBehavior::Push => Command::PushAppUrl(url),
+                    _ => Command::SetAppUrl(url),
+                };
+                let _ = self.apply_op(Op::Command {
+                    id: crate::ROOT_ID,
+                    command,
+                });
+            }
             Action::WebInputAvailable(answer) => {
                 let available =
                     self.components.environment.web_input && self.access.allows_web_input();
                 answer.borrow_mut().deliver(available);
+            }
+            Action::WebEvaluateAvailable(answer) => {
+                let available =
+                    self.components.environment.web_evaluate && self.access.allows_webviews();
+                answer.borrow_mut().deliver(available);
+            }
+            Action::WebViewAvailable(answer) => {
+                let available =
+                    self.components.environment.web_views && self.access.allows_webviews();
+                answer.borrow_mut().deliver(available);
+            }
+            Action::DownloadDecision {
+                node,
+                id,
+                decision,
+                answer,
+            } => {
+                let effects = self
+                    .components
+                    .downloads
+                    .decide(node, &id, decision, answer);
+                self.apply_download_effects(effects);
             }
             Action::PickScreenColor(answer) => {
                 if !self.components.environment.screen_color {
@@ -5496,6 +6356,7 @@ impl<M: TextEngine> Core<M> {
                     command: Command::PickScreenColor { id },
                 });
             }
+            Action::RenderCanvas(request, answer) => self.start_canvas_render(*request, answer),
             Action::FileRequest(request, answer) => {
                 use crate::file_dialog::FileRequest;
                 if !self.components.environment.file_requests {
@@ -5527,6 +6388,175 @@ impl<M: TextEngine> Core<M> {
                 });
             }
         }
+    }
+
+    /// Applies what the downloads ask of the core
+    /// ([`crate::webview::downloads::Effect`]).
+    fn apply_download_effects(&mut self, effects: Vec<crate::webview::downloads::Effect>) {
+        use crate::webview::downloads::Effect;
+        for effect in effects {
+            match effect {
+                Effect::Event {
+                    node,
+                    kind,
+                    payload,
+                } => {
+                    self.events
+                        .push(crate::element::JsEvent::Event(node, kind, payload));
+                }
+                Effect::Command {
+                    node,
+                    operation,
+                    track,
+                } => {
+                    let id = self.alloc_webview_request();
+                    self.components.downloads.track(id, track);
+                    let _ = self.apply_op(Op::Command {
+                        id: node,
+                        command: Command::WebViewRequest(crate::webview::WebViewRequest {
+                            id,
+                            operation,
+                        }),
+                    });
+                }
+                Effect::Answer { slot, result } => slot.borrow_mut().deliver(result),
+            }
+        }
+    }
+
+    /// A request id no outstanding download command uses (downloads and
+    /// the app's platform replies share one id space per core).
+    fn alloc_webview_request(&mut self) -> u64 {
+        loop {
+            let id = self.components.next_webview_request;
+            self.components.next_webview_request = id.wrapping_add(1);
+            if !self.components.downloads.tracks(id) {
+                break id;
+            }
+        }
+    }
+
+    /// The node `id` is released (it unmounted): its downloads are
+    /// cancelled with [`crate::webview::CancelReason::Teardown`]. The
+    /// sessions (and their staging files) stay until the platform confirms
+    /// its writer stopped, even though the node is gone: the reply or end
+    /// still reaches the core, and only then is cleanup allowed.
+    pub(super) fn webview_released(&mut self, id: NodeId) {
+        let effects = self.components.downloads.teardown(id);
+        // The node still exists but this commit's command queue was already
+        // drained: put the cancel commands straight into the batch, before
+        // the node's Delete, so the platform can still stop its writer.
+        for effect in effects {
+            match effect {
+                crate::webview::downloads::Effect::Event {
+                    node,
+                    kind,
+                    payload,
+                } => self
+                    .events
+                    .push(crate::element::JsEvent::Event(node, kind, payload)),
+                crate::webview::downloads::Effect::Command {
+                    node,
+                    operation,
+                    track,
+                } => {
+                    let request = self.alloc_webview_request();
+                    self.components.downloads.track(request, track);
+                    self.mount.push(crate::MountItem::Command {
+                        id: node,
+                        command: Command::WebViewRequest(crate::webview::WebViewRequest {
+                            id: request,
+                            operation,
+                        }),
+                    });
+                }
+                crate::webview::downloads::Effect::Answer { slot, result } => {
+                    slot.borrow_mut().deliver(result);
+                }
+            }
+        }
+    }
+
+    /// A platform's report of a download ([`EventKind::DownloadOffer`],
+    /// `DownloadProgress`, `DownloadEnd`): consumed here, so it never
+    /// reaches a listener or JS.
+    fn download_event(&mut self, id: NodeId, kind: EventKind, payload: &EventPayload) -> bool {
+        match kind {
+            EventKind::DownloadOffer => {
+                let EventPayload::Json(value) = payload else {
+                    return true;
+                };
+                let Some(offer) = crate::webview::downloads::parse_offer(value) else {
+                    log::debug!(target: "js", "web view: dropped a malformed download offer: {value}");
+                    return true;
+                };
+                let events = self
+                    .key(id)
+                    .ok()
+                    .map(|key| self.nodes[key as usize].events)
+                    .unwrap_or_default();
+                let mode = if events.contains(EventKind::DownloadPending) {
+                    crate::webview::downloads::Mode::Manual
+                } else if events.contains(EventKind::Download) {
+                    crate::webview::downloads::Mode::Automatic
+                } else {
+                    crate::webview::downloads::Mode::None
+                };
+                let automatic =
+                    crate::webview::downloads::automatic_destination(&offer.id, &offer.filename);
+                let effects = self.components.downloads.offer(id, offer, mode, automatic);
+                self.apply_download_effects(effects);
+            }
+            EventKind::DownloadProgress => {
+                // Progress is not an app event yet; the platform may still
+                // report it, and it is dropped here.
+            }
+            EventKind::DownloadEnd => {
+                let EventPayload::Json(value) = payload else {
+                    return true;
+                };
+                let Some(end) = crate::webview::downloads::parse_end(value) else {
+                    log::debug!(target: "js", "web view: dropped a malformed download end: {value}");
+                    return true;
+                };
+                let effects = self.components.downloads.end(id, end);
+                self.apply_download_effects(effects);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Applies the downloads' file work and deadlines (once per commit).
+    pub(super) fn poll_downloads(&mut self) {
+        let effects = self.components.downloads.poll(crate::time::now());
+        if !effects.is_empty() {
+            self.apply_download_effects(effects);
+        }
+    }
+
+    /// The downloads' listeners as a round's final masks leave them: a web
+    /// view whose `onDownload` and `onDownloadPending` listeners are both
+    /// gone can neither hear of its downloads nor decide their offers, so
+    /// they are cancelled ([`crate::webview::CancelReason::NoListener`]).
+    /// The view stays mounted, and a listener removed and added back in the
+    /// same turn changes nothing: only the mask the turn ended with counts.
+    pub(super) fn sync_download_listeners(&mut self) {
+        let nodes = self.components.downloads.unobserved_nodes(|node| {
+            self.key(node).is_ok_and(|key| {
+                let events = self.nodes[key as usize].events;
+                events.contains(EventKind::Download) || events.contains(EventKind::DownloadPending)
+            })
+        });
+        for node in nodes {
+            let effects = self.components.downloads.lost_listener(node);
+            self.apply_download_effects(effects);
+        }
+    }
+
+    /// When the downloads' next deadline is due (the engine wakes then).
+    pub fn download_deadline(&self) -> Option<crate::time::Instant> {
+        self.components.downloads.deadline()
     }
 
     /// Native animations that ended: the components' resolve their
@@ -5662,6 +6692,7 @@ impl<M: TextEngine> Core<M> {
         let ClipboardAnswer {
             has,
             text,
+            denied,
             image,
             too_large,
             files,
@@ -5669,6 +6700,9 @@ impl<M: TextEngine> Core<M> {
         let image = image.filter(|i| !i.url.is_empty());
         match self.components.clipboard_reads.remove(&id) {
             Some(ClipboardRead::Text(slot)) => slot.borrow_mut().deliver(text.unwrap_or_default()),
+            Some(ClipboardRead::CheckedText(slot)) => slot
+                .borrow_mut()
+                .deliver((!denied).then(|| text.unwrap_or_default())),
             Some(ClipboardRead::Has(slot) | ClipboardRead::HasImage(slot)) => {
                 slot.borrow_mut().deliver(has)
             }
@@ -5703,6 +6737,12 @@ impl<M: TextEngine> Core<M> {
     /// Events the components handle before anything else: dialog answers
     /// (theirs never reach JS), insets of screens and modals.
     fn platform_event(&mut self, id: NodeId, kind: EventKind, payload: &EventPayload) -> bool {
+        if matches!(
+            kind,
+            EventKind::DownloadOffer | EventKind::DownloadProgress | EventKind::DownloadEnd
+        ) {
+            return self.download_event(id, kind, payload);
+        }
         let number = |key: &str| match payload {
             EventPayload::Map(entries) => entries.iter().find_map(|(k, v)| match v {
                 crate::PayloadValue::Number(n) if *k == key => Some(*n),
@@ -5725,6 +6765,10 @@ impl<M: TextEngine> Core<M> {
                             if id == crate::ROOT_ID =>
                         {
                             self.components.runtime.main_close_pressed(*reason);
+                        }
+                        crate::desktop::WindowEvent::QuitRequest if id == crate::ROOT_ID => {
+                            self.quit_requested();
+                            return true;
                         }
                         _ => {}
                     }
@@ -5783,16 +6827,32 @@ impl<M: TextEngine> Core<M> {
                 if item < crate::element::menus::FIRST_ID {
                     return false;
                 }
-                // The desktop's answer of a view's global shortcut: drop a
-                // refused one; its handler runs at each press, not here.
-                if let EventPayload::Map(entries) = payload
-                    && entries.iter().any(|(k, _)| *k == "registered")
-                {
-                    if !entries
-                        .iter()
-                        .any(|(k, v)| *k == "registered" && *v == crate::PayloadValue::Bool(true))
-                    {
-                        menus.borrow_mut().remove_global(item);
+                // The platform's answer to a global shortcut's registration.
+                let registered = match payload {
+                    EventPayload::Map(entries) => entries.iter().find_map(|(k, v)| match v {
+                        crate::PayloadValue::Bool(b) if *k == "registered" => Some(*b),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                if let Some(registered) = registered {
+                    menus.borrow_mut().registered(item, registered);
+                    self.apply_actions();
+                    return true;
+                }
+                let click = menus.borrow().tray_click(item);
+                if let Some(click) = click {
+                    let bounds = match payload {
+                        EventPayload::Map(entries) => entries.iter().find_map(|(k, v)| match v {
+                            crate::PayloadValue::Bounds(b) if *k == "bounds" => Some(*b),
+                            _ => None,
+                        }),
+                        _ => None,
+                    };
+                    let result = caught(|| click(bounds));
+                    self.apply_actions();
+                    if let Err(message) = result {
+                        log::error!(target: "js", "the tray's click failed: {message}");
                     }
                     return true;
                 }
@@ -5827,6 +6887,10 @@ impl<M: TextEngine> Core<M> {
                     id: crate::ROOT_ID,
                     command: Command::Back,
                 });
+                true
+            }
+            EventKind::WebEvaluation => {
+                self.answer_web_evaluation(id, payload);
                 true
             }
             EventKind::ImageInfo if id == crate::ROOT_ID => {
@@ -5894,6 +6958,22 @@ impl<M: TextEngine> Core<M> {
                 self.notification_event(payload);
                 true
             }
+            EventKind::SecondInstance if id == crate::ROOT_ID => {
+                let Some(launch) = crate::single_instance::SecondInstance::from_payload(payload)
+                else {
+                    return false;
+                };
+                let launches = &mut self.components.second_instances;
+                if let Some(answer) = launches.next.take() {
+                    answer.borrow_mut().deliver(launch);
+                } else {
+                    if launches.pending.len() == crate::single_instance::MAX_PENDING {
+                        launches.pending.pop_front();
+                    }
+                    launches.pending.push_back(launch);
+                }
+                true
+            }
             EventKind::UrlScheme if id == crate::ROOT_ID => {
                 let EventPayload::Map(entries) = payload else {
                     return false;
@@ -5905,7 +6985,39 @@ impl<M: TextEngine> Core<M> {
                 let Some(url) = url else {
                     return false;
                 };
-                self.url_scheme(url.clone());
+                let flag = |key: &str| {
+                    entries.iter().find_map(|(k, v)| match v {
+                        crate::PayloadValue::Bool(b) if *k == key => Some(*b),
+                        _ => None,
+                    })
+                };
+                let page = flag(crate::url_scheme::PAGE).unwrap_or(false);
+                let quiet = flag(crate::url_scheme::QUIET).unwrap_or(false);
+                // An address move the app did not make (the web's back or
+                // forward), by its reason; one of a newer platform's reasons
+                // is still the address, quietly.
+                let change = entries.iter().find_map(|(k, v)| match v {
+                    crate::PayloadValue::Str(s) if *k == crate::url_scheme::CHANGE => {
+                        Some(crate::url_scheme::AppUrlChangeReason::parse(s))
+                    }
+                    _ => None,
+                });
+                let (quiet, change) = match change {
+                    Some(None) => (true, None),
+                    Some(reason) => (quiet, reason),
+                    None => (quiet, None),
+                };
+                // The page's base URL (the web), which Rust's `set_app_url`
+                // resolves against.
+                if let Some(base) = entries.iter().find_map(|(k, v)| match v {
+                    crate::PayloadValue::Str(s) if *k == crate::url_scheme::BASE => {
+                        url::Url::parse(s).ok()
+                    }
+                    _ => None,
+                }) {
+                    self.components.url_schemes.address.set_page_base(base);
+                }
+                self.url_scheme(url.clone(), page, quiet, change);
                 true
             }
             EventKind::OpenUrl if id == crate::ROOT_ID => {
@@ -5931,6 +7043,7 @@ impl<M: TextEngine> Core<M> {
                 }
                 true
             }
+            EventKind::CanvasImage if id == crate::ROOT_ID => self.answer_canvas_render(payload),
             EventKind::FileRequest if id == crate::ROOT_ID => {
                 let EventPayload::FileRequest {
                     id: request,
@@ -5943,6 +7056,43 @@ impl<M: TextEngine> Core<M> {
                 if let Some(answer) = self.components.file_requests.remove(request) {
                     answer.deliver(paths.clone(), error.clone());
                 }
+                true
+            }
+            // The platform's answer to a download command
+            // ([`crate::webview::WebViewRequest`]), on the node it was sent
+            // to. A reply whose writer stopped is the only thing that
+            // permits cleaning a staging file.
+            EventKind::WebViewReply => {
+                let EventPayload::Json(reply) = payload else {
+                    return false;
+                };
+                // JSON's numbers may come as floats (`1.0`); `1.5` is no
+                // request.
+                let request = reply.get("id").and_then(|id| {
+                    id.as_u64().or_else(|| {
+                        id.as_f64()
+                            .filter(|n| n.is_finite() && n.fract() == 0.0 && *n >= 0.0)
+                            .map(|n| n as u64)
+                    })
+                });
+                let Some(request) = request else {
+                    log::debug!(target: "js", "web view: dropped a reply without a request's id: {reply}");
+                    return true;
+                };
+                if !self.components.downloads.tracks(request) {
+                    log::debug!(target: "js", "web view: dropped a reply to unknown request {request}: {reply}");
+                    return true;
+                }
+                let result = match reply.get("ok").and_then(crate::JsonValue::as_bool) {
+                    Some(true) => Ok(()),
+                    _ => Err(reply
+                        .get("error")
+                        .and_then(crate::JsonValue::as_str)
+                        .unwrap_or("the web view did not answer")
+                        .to_owned()),
+                };
+                let effects = self.components.downloads.reply(id, request, result);
+                self.apply_download_effects(effects);
                 true
             }
             EventKind::Clipboard if id == crate::ROOT_ID => {
@@ -6037,8 +7187,12 @@ impl<M: TextEngine> Core<M> {
     /// the table JS's and theirs make, listened to while either has one.
     pub(super) fn sync_keys(&mut self) {
         let rust = {
+            // The windows' refs read the graph.
+            let _entered = self.components.runtime.enter();
             let mut keys = self.components.executor.keys.borrow_mut();
-            if !std::mem::take(&mut keys.changed) {
+            // A binding of a window that was not mounted yet is placed
+            // once it is.
+            if !std::mem::take(&mut keys.changed) && !keys.unplaced {
                 return;
             }
             !keys.list.is_empty()
@@ -6061,18 +7215,34 @@ impl<M: TextEngine> Core<M> {
     /// The surface's table: JS's bindings, then the views' (the newest that
     /// may fire wins, so a view's wins over JS's of the same keystroke).
     fn keymap(&self) -> Arc<crate::keymap::Keymap> {
-        let keys = self.components.executor.keys.borrow();
+        let mut keys = self.components.executor.keys.borrow_mut();
         let overlay = self.overlay_key_binding();
         if keys.list.is_empty() && overlay.is_none() {
+            keys.unplaced = false;
             return self.components.js_keymap.clone();
         }
+        let views = {
+            let _entered = self.components.runtime.enter();
+            // Bindings share a few owners (a component's effect binds many):
+            // each is looked up once.
+            let mut known: Vec<(crate::element::Owner, NodeId)> = Vec::new();
+            keys.bindings(|owner| {
+                if let Some(&(_, window)) = known.iter().find(|(o, _)| *o == owner) {
+                    return window;
+                }
+                let window = self.window_of_owner(owner);
+                known.push((owner, window));
+                window
+            })
+        };
+        drop(keys);
         let bindings = self
             .components
             .js_keymap
             .bindings()
             .iter()
             .copied()
-            .chain(keys.list.iter().map(|k| k.binding))
+            .chain(views)
             .chain(overlay)
             .collect();
         Arc::new(crate::keymap::Keymap::new(bindings))
@@ -6275,12 +7445,12 @@ fn dispose_rows(rows: &std::rc::Weak<RefCell<CellRowMap>>) {
     }
 }
 
-/// Moves the live cells of a view's list as its rows moved (`splice`, now
+/// Moves the live cells of a view's list as its rows moved (`diff`, now
 /// `count` rows): each keeps its row, at the row's new index. A cell whose
 /// row went keeps its index (the list frees it, and binds it to another row
 /// before showing it again) while that is a row; past the rows, its content
 /// is disposed, before its bindings could read there.
-fn move_rows(cells: &CellRows, splice: Option<(u32, u32, u32)>, count: u32) {
+fn move_rows(cells: &CellRows, diff: Option<&ListDiff>, count: u32) {
     let parts: Vec<_> = cells
         .borrow()
         .iter()
@@ -6293,17 +7463,9 @@ fn move_rows(cells: &CellRows, splice: Option<(u32, u32, u32)>, count: u32) {
             continue;
         }
         let i = index.get_untracked();
-        let to = match splice {
-            Some((at, removed, inserted)) => {
-                let (at, removed, inserted) = (at as usize, removed as usize, inserted as usize);
-                if i < at || (at..at + removed).contains(&i) {
-                    i
-                } else {
-                    i - removed + inserted
-                }
-            }
-            None => i,
-        };
+        let to = diff
+            .and_then(|d| d.new_index(i as u32))
+            .map_or(i, |(to, _)| to as usize);
         if to < count as usize {
             index.set(to);
         } else {

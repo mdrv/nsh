@@ -1,5 +1,8 @@
 {
   "name": "API Modules",
   "id": "com.example.api-modules",
-  "schemes": ["compat"]
+  "version": "1.2.3",
+  "build": 7,
+  "schemes": ["compat"],
+  "locales": ["de", "zh-CN"]
 }

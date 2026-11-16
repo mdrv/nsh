@@ -14,8 +14,15 @@ rather than updating it as a side effect of a feature change.
 Rust and mixed apps also need Cargo and the target’s native build prerequisites;
 TSX apps use the prebuilt runtime. Check only the target the user needs in
 [Platforms and prerequisites](#platforms-and-prerequisites). Follow the environment’s
-permissions when installing tools. If setup is unavailable, continue with code and
+permissions when installing tools, and leave installing toolchains to the user: never
+pipe a downloaded script into a shell. If setup is unavailable, continue with code and
 state which checks remain unverified.
+
+For Cargo, the user may prefer [huacnlee/cargo](https://github.com/huacnlee/cargo), the
+Cargo NSH is developed with: dependencies built once for every project and Git worktree,
+and a build directory that stays under a size limit. It replaces `~/.cargo/bin/cargo`,
+so mention it and let the user install it from its README; `cargo -V` names it. The
+standard Cargo works the same.
 
 For a new app, choose an unused destination and pass an explicit template:
 
@@ -57,7 +64,7 @@ Every command takes `[ENTRY]`: the app's directory (default `.`) or a TSX entry 
 - **`nsh build` does not type check.** Only `nsh check` does. `nsh check` does not see what only the bundler knows: text in a `View`, a capabilities typo, a missing asset. Run both on TSX; see [tsx.md](tsx.md#who-reports-what).
 - `nsh check` downloads TypeScript's native compiler once. Offline, pass `--tsc <path>` or set `NSH_TSC`.
 - `nsh test PATH` with a directory runs `cargo test` for each crate. With a test file, it runs only that file.
-- `.nsh/` is generated and git-ignored: `types/`, `rust/` (runner sources), `out/` (default output). Cargo keeps `target/` and respects `CARGO_TARGET_DIR`.
+- `.nsh/` is generated and git-ignored: `types/`, `rust/` (runner sources), `out/` (default output). Cargo keeps `target/` and respects `CARGO_TARGET_DIR`; huacnlee/cargo builds under `~/.cargo/targets/` and still puts the binaries in `target/`.
 - Every command refreshes `.nsh/types` to the `nsh` you run.
 - With `rust` or `mixed`, `nsh-*` crates come from crates.io at the CLI's version, or a checkout with `--nsh-source <dir>`. An app on another version is retargeted to this CLI, and only a real API change stops it. All NSH crates must come from one place.
 
@@ -113,7 +120,7 @@ Each desktop packages only on itself. Phones are reached from a computer.
 | `windows` | Windows 10 1809+ | WebView2 for web views | Rust |
 | `ios`, `ios-simulator` (package only) | iOS 15+; from macOS | Xcode and a simulator runtime | `rustup target add aarch64-apple-ios-sim aarch64-apple-ios` |
 | `catalyst` (run only) | Mac, iPhone-sized window | Xcode | `rustup target add aarch64-apple-ios-macabi` |
-| `android` | API 28+; from macOS, Linux or Windows | Android SDK (`ANDROID_HOME`), a JDK, a device or emulator | The NDK, and `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android` |
+| `android` | API 26+; from macOS, Linux or Windows | Android SDK (`ANDROID_HOME`), a JDK, a device or emulator | The NDK, and `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android` |
 | `web` | Modern browsers | - | `rustup target add wasm32-unknown-unknown`, `clang`, `llvm-ar` |
 | `gpui` (run only) | macOS, Windows, Linux with a GPU | Inside a GPUI app | TSX and mixed entries; a Rust root embeds instead |
 | `tui` (run only) | A terminal | - | - |
@@ -137,7 +144,7 @@ Notes:
 | Conditional UI | `when(os() == Os::Ios, \|\| ..)` | `<If when={platform.os === "ios"}>` |
 | Android back button | `on_back_press(listener)` | `BackHandler.on("press", listener)` from `nsh/mobile` |
 | Bar over the iOS keyboard | `input_accessory_view(id)` | `InputAccessoryView` from `nsh/mobile` |
-| Windows and menus | `nsh_core::element::desktop`: `window()`, `current_window()` (`WindowHandle`: `set(WindowAttributes)`, `set_mode`, `close`, ...), `title_bar`, `set_application_menu`, `popup_menu` | `<Window>`, `Window.open`, `currentWindow()` (`WindowRef`: `set({ title, titleBar })`, `setMode`, `close`, ...), `Menu`, `titleBar` from `nsh/desktop` |
+| Windows and menus | `nsh_core::element::desktop`: `window()`, `current_window()` (`WindowRef`: `set(WindowAttributes)`, `set_mode`, `close`, ...), `title_bar`, `set_application_menu`, `popup_menu` | `<Window>`, `Window.open`, `currentWindow()` (`WindowRef`: `set({ title, titleBar })`, `setMode`, `close`, ...), `Menu`, `titleBar` from `nsh/desktop` |
 | Status bar | `.status_bar(StatusBarStyle::Light)` on `nav_page()` or `dialog()` | `statusBar={{ foreground: "light" }}` on `NavPage` or `Dialog` |
 | Target-gated Rust | `#[cfg(target_os = "macos")]`, `#[cfg(target_arch = "wasm32")]` | - |
 | A view of the OS | `native(name)`, registered with `#[native_components(macos)]` | `nativeComponent(name, spec)` |

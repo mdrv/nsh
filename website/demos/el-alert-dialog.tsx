@@ -1,6 +1,6 @@
 import { mount, signal, Text, View } from "nsh";
 import { AlertDialog, Button } from "nsh/base";
-import { button, buttonText, desktop, focusRing, hoverFill, Inspector, Panel, pressSink, size, Stage, ui, wide } from "./palette";
+import { button, buttonText, desktop, focusRing, hoverFill, Inspector, Panel, pressSink, sectionSurface, size, Stage, ui, wide } from "./palette";
 
 type Options = Parameters<typeof AlertDialog.show>[0];
 
@@ -71,7 +71,7 @@ function App() {
           <View style={{ flex: 1, flexDirection: "row", gap: 16 }}>
             {/* A row per alert: what it shows, and a button as wide as its label at the end. */}
             <Stage width={400}>
-              <View style={{ ...ui().card, borderRadius: 14, overflow: "hidden" }}>
+              <View style={{ ...sectionSurface(), overflow: "hidden" }}>
                 <Each of={alerts}>
                   {(a, i) => (
                     <>
@@ -98,7 +98,7 @@ function App() {
           <View style={{ gap: 10 }}>
             <Each of={alerts}>
               {(a) => (
-                <Button onPress={() => show(a().options)} style={row()} activeStyle={press.activeStyle} hoverStyle={hoverFill()} focusStyle={focusRing()}>
+                <Button onPress={() => show(a().options)} style={row()} activeStyle={press.activeStyle} hoverStyle={hoverFill()} focusVisibleStyle={focusRing()}>
                   <Text style={{ color: a().danger ? ui().danger : ui().text, fontSize: 16, fontWeight: "600" }}>{a().label}</Text>
                   <Text style={{ color: ui().muted, fontSize: 13 }}>{a().detail}</Text>
                 </Button>

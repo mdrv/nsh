@@ -1,6 +1,7 @@
 //! The surface's environment: one signal per part
 //! (window, safe area, keyboard, color scheme, font scale, screen reader,
 //! reduced motion, pixel ratio, locale, locale settings, lifecycle, the
+//! wake count, the
 //! desktop window's state and the displays)
 //! written when the platform reports a
 //! change, read through read-only accessors; `nsh/device` (`platform`) and
@@ -51,9 +52,14 @@ enum Part {
     WindowState,
     Displays,
     Fps,
+    PerfStats,
+    Shaders,
+    WakeCount,
+    HorizontalSizeClass,
+    VerticalSizeClass,
 }
 
-const PARTS: usize = 15;
+const PARTS: usize = 20;
 
 /// The environment's part of a context's state.
 pub(crate) struct Env {
@@ -76,8 +82,24 @@ pub(crate) struct Env {
     /// The tokens the app's theme file gives ([`set_theme_tokens`]), taken
     /// in when the entry hands the theme to the renderer ([`take_theme`]).
     theme: RefCell<ThemeTokens>,
+    /// The theme file the app was built with (`nsh.json`), which
+    /// `setTheme(null)` gives back (`None`: it has none).
+    built_theme: RefCell<Option<String>>,
     /// The displays the platform reported last.
     displays: RefCell<Vec<Display>>,
+    /// What `appInfo()` reports: the build's ([`set_app_info`]).
+    app: RefCell<AppInfo>,
+}
+
+/// The app as it was built (`appInfo()`), from the JSON the bundler writes.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct AppInfo {
+    id: Option<String>,
+    name: Option<String>,
+    version: Option<String>,
+    build: Option<f64>,
+    development: bool,
 }
 
 impl Default for Env {
@@ -92,10 +114,55 @@ impl Default for Env {
             tokens_signal: Cell::new(UNDEFINED),
             tokens_version: Cell::new(0),
             theme: RefCell::new(ThemeTokens::default()),
+            built_theme: RefCell::default(),
             displays: RefCell::default(),
+            app: RefCell::default(),
         }
     }
 }
+
+/// Takes in the app's information as the build wrote it (`setup`'s fifth
+/// argument); what this runtime cannot read is left out.
+pub(crate) fn set_app_info(cx: *mut JsContext, json: &str) {
+    match serde_json::from_str(json) {
+        Ok(info) => *env(cx).app.borrow_mut() = info,
+        Err(e) => log::warn!("appInfo: {e}, ignored"),
+    }
+}
+
+/// `appInfo()`: the app as it was built.
+unsafe extern "C" fn app_info(
+    cx: *mut JsContext,
+    _this: JsValue,
+    _argc: c_int,
+    _argv: *mut JsValue,
+) -> JsValue {
+    let app = env(cx).app.borrow();
+    let text = |value: &Option<String>| match value {
+        Some(value) => string(cx, value),
+        None => qjs::JS_NULL,
+    };
+    object(
+        cx,
+        &[
+            (c"id", text(&app.id)),
+            (c"name", text(&app.name)),
+            (c"version", text(&app.version)),
+            (c"build", app.build.map_or(qjs::JS_NULL, qjs::JS_NewFloat64)),
+            (c"development", boolean(app.development)),
+        ],
+    )
+}
+
+/// `appInfo` of `nsh`.
+pub(crate) const APP_INFO_EXPORT: crate::modules::Item = (
+    "appInfo",
+    Export::Function(app_info, 0),
+    Ts::function(
+        "The app as it was built: its id, name, version and build number\n(`nsh.json`'s; a package's as `nsh package` and `nsh publish` name and\nversion it, `--id`, `--name`, `--version` and `--build` included, with\nversion `1.0.0` and build `1` where nothing gives them), and whether it\nis a development build (`nsh run`, `nsh dev`, `nsh test`, `nsh build`\nwithout `--release`). `nsh/updater`'s `shellInfo()` reports the\ninstalled app's.",
+        &["(): AppInfo"],
+    ),
+);
 
 fn env<'a>(cx: *mut JsContext) -> &'a Env {
     // SAFETY: a projection of the state's field, reached by shared
@@ -129,6 +196,9 @@ pub(crate) fn init(cx: *mut JsContext) {
         } else if i == Part::Fps as usize {
             // No performance monitor until the platform installs one.
             boolean(false)
+        } else if i == Part::PerfStats as usize {
+            // No stats until the monitor measured a second.
+            qjs::JS_NULL
         } else {
             UNDEFINED
         };
@@ -175,11 +245,89 @@ pub(crate) fn set_theme_tokens(cx: *mut JsContext, theme: ThemeTokens) {
 /// op reaches it, after the turn of the first render, which reads them
 /// already.
 pub(crate) fn take_theme(cx: *mut JsContext, json: &str) {
-    let tokens = env(cx).theme.borrow().of(json);
+    let e = env(cx);
+    e.built_theme.replace(Some(json.to_owned()));
+    let tokens = e.theme.borrow().of(json);
     if let Some(tokens) = tokens {
         set_tokens(cx, Arc::new(tokens));
     }
 }
+
+/// A theme file that sets nothing: the default theme's tokens, which an app
+/// built without a theme has.
+const NO_THEME: &str = r#"{"cssVars":{}}"#;
+
+/// `setTheme(theme)`: the app's theme is `theme` from now on, as if
+/// `nsh.json` had it, read whole or not at all (a `TypeError` names each
+/// value it cannot read); `null` gives back the one the app was built with,
+/// as the entry gave it ([`take_theme`]). `token()` reads the new tokens at
+/// once; the core has them when this turn's ops reach it.
+unsafe extern "C" fn set_theme(
+    cx: *mut JsContext,
+    _this: JsValue,
+    argc: c_int,
+    argv: *mut JsValue,
+) -> JsValue {
+    let e = env(cx);
+    let v = arg(argc, argv, 0);
+    // SAFETY: inline tag checks.
+    let nullish = unsafe { qjs::JS_IsNull(v) || qjs::JS_IsUndefined(v) };
+    // SAFETY: an inline tag check.
+    let object = unsafe { qjs::JS_IsObject(v) };
+    let (json, tokens) = if nullish {
+        let json = e.built_theme.borrow().clone();
+        let json = json.unwrap_or_else(|| NO_THEME.to_owned());
+        let tokens = e.theme.borrow().of(&json);
+        (json, tokens)
+    } else if object {
+        // SAFETY: a context reference and a dup for the converter.
+        let value = unsafe {
+            let rcx = rquickjs::Ctx::from_raw(ptr::NonNull::new_unchecked(cx));
+            rquickjs::Value::from_raw(rcx, qjs::JS_DupValue(cx, v))
+        };
+        let Ok(json) = crate::protocol::to_json(&value) else {
+            return qjs::JS_EXCEPTION;
+        };
+        let json = json.to_string();
+        let checked = e.theme.borrow().checked(&json);
+        match checked {
+            Some(Err(what)) => return type_error(cx, &format!("setTheme: {what}")),
+            Some(Ok(tokens)) => (json, Some(tokens)),
+            // No UI set reads themes: the core says so.
+            None => (json, None),
+        }
+    } else {
+        return type_error(cx, "setTheme: expected a theme ({ cssVars }) or null");
+    };
+    let op = nsh_core::Op::SetProp {
+        id: nsh_core::ROOT_ID,
+        prop: nsh_core::Prop::UiTheme(json.into()),
+    };
+    if let Err(err) = crate::dom::push_op(cx, op) {
+        return err;
+    }
+    if let Some(tokens) = tokens {
+        set_tokens(cx, Arc::new(tokens));
+    }
+    reactive::finish_value(cx, UNDEFINED)
+}
+
+/// Throws a `TypeError` of `message`.
+fn type_error(cx: *mut JsContext, message: &str) -> JsValue {
+    let message = std::ffi::CString::new(message.replace('\0', "")).unwrap_or_default();
+    // SAFETY: throws on a live context; `%s` reads the C string.
+    unsafe { qjs::JS_ThrowTypeError(cx, c"%s".as_ptr(), message.as_ptr()) }
+}
+
+/// `setTheme` of `nsh`.
+pub(crate) const SET_THEME_EXPORT: crate::modules::Item = (
+    "setTheme",
+    Export::Function(set_theme, 1),
+    Ts::function(
+        "Makes `theme` the app's theme while it runs, in place of `nsh.json`'s\n`\"theme\"` and over shadcn/ui's tokens as that one is: `token()` reads it\nat once, and classes naming tokens, `nsh/base` and Rust components'\n`theme()` follow with the next frame. An embedding app's theme overrides\nstill win. `null` gives back the theme the app was built with. The theme\nis read whole: a value NSH cannot read (a color it does not know, a value\nthat is no color in one appearance where the other's is) throws a\n`TypeError` naming it, and the theme shown stays.",
+        &["(theme: Theme | null): void"],
+    ),
+);
 
 /// `token(name)`: the design token `name` in the appearance shown (a
 /// color as `#rrggbbaa`, a number, a font family), `undefined` when there
@@ -351,6 +499,18 @@ pub(crate) fn set_environment(cx: *mut JsContext, next: &Environment) -> Result<
             object(cx, &[(c"width", number(w)), (c"height", number(h))]),
         ));
     }
+    if changed(&|p| p.horizontal_size_class() == next.horizontal_size_class()) {
+        writes.push((
+            Part::HorizontalSizeClass,
+            string(cx, next.horizontal_size_class().name()),
+        ));
+    }
+    if changed(&|p| p.vertical_size_class() == next.vertical_size_class()) {
+        writes.push((
+            Part::VerticalSizeClass,
+            string(cx, next.vertical_size_class().name()),
+        ));
+    }
     if changed(&|p| p.safe_area == next.safe_area) {
         writes.push((Part::SafeArea, object(cx, &insets(&next.safe_area))));
     }
@@ -434,6 +594,12 @@ pub(crate) fn set_environment(cx: *mut JsContext, next: &Environment) -> Result<
     if changed(&|p| p.lifecycle == next.lifecycle) {
         writes.push((Part::Lifecycle, string(cx, next.lifecycle.name())));
     }
+    if changed(&|p| p.wake_count == next.wake_count) {
+        writes.push((Part::WakeCount, number(next.wake_count as f32)));
+    }
+    if changed(&|p| p.shaders == next.shaders) {
+        writes.push((Part::Shaders, boolean(next.shaders)));
+    }
     if changed(&|p| p.window_state == next.window_state) {
         writes.push((
             Part::WindowState,
@@ -497,6 +663,23 @@ pub(crate) fn set_fps_enabled(cx: *mut JsContext, enabled: bool) -> Result<(), (
     }
 }
 
+/// Takes in what the performance monitor measured last (`perfStats()`):
+/// `None` while it does not measure.
+pub(crate) fn set_perf_stats(
+    cx: *mut JsContext,
+    stats: Option<&nsh_core::platform::PerfStats>,
+) -> Result<(), ()> {
+    let value = stats.map_or(qjs::JS_NULL, |stats| to_js(cx, stats));
+    reactive::set_signal(cx, env(cx).signals[Part::PerfStats as usize].get(), value);
+    let failed = reactive::finish_value(cx, UNDEFINED);
+    // SAFETY: an inline tag check.
+    if unsafe { qjs::JS_IsException(failed) } {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
 /// `value` as JS (owned): what Rust's conversion makes of it, `undefined`
 /// when it fails (it does not for the environment's plain objects).
 pub(crate) fn to_js<T: nsh_core::element::JsValue>(cx: *mut JsContext, value: &T) -> JsValue {
@@ -536,6 +719,46 @@ pub(crate) fn displays(cx: *mut JsContext) -> JsValue {
 
 pub(crate) fn current(cx: *mut JsContext) -> Environment {
     (*env(cx).current.borrow()).unwrap_or_default()
+}
+
+/// The user's locale and preferred languages, read so that what reads them
+/// (`nsh/i18n`'s `t`) runs again when they change.
+pub(crate) fn tracked_languages(
+    cx: *mut JsContext,
+) -> (nsh_core::platform::Locale, nsh_core::platform::Languages) {
+    for part in [Part::Locale, Part::LocaleSettings] {
+        let accessor = env(cx).accessors[part as usize].get();
+        // SAFETY: calling the accessor reads (and tracks) the signal; its
+        // value is freed at once.
+        unsafe {
+            let value = qjs::JS_Call(cx, accessor, UNDEFINED, 0, ptr::null_mut());
+            qjs::JS_FreeValue(cx, value);
+        }
+    }
+    let current = current(cx);
+    (current.locale, current.locale_settings.languages)
+}
+
+/// Shows the app in `locale` at once (`setLocale`): `locale()`, `t` and
+/// `Intl` read it from now on; the engine keeps it in the environment it
+/// reports after.
+pub(crate) fn show_locale(cx: *mut JsContext, locale: nsh_core::platform::Locale) {
+    let e = env(cx);
+    let mut current = e.current.borrow_mut();
+    let mut next = current.unwrap_or_default();
+    if next.locale == locale {
+        return;
+    }
+    // `localeSettings()` follows when the engine reports it.
+    next.locale = locale;
+    next.locale_settings.languages = next.locale_settings.languages.preferring(locale);
+    *current = Some(next);
+    drop(current);
+    reactive::set_signal(
+        cx,
+        e.signals[Part::Locale as usize].get(),
+        string(cx, locale.as_str()),
+    );
 }
 
 /// The user's locale (`Intl`'s default), read where it is used: a change
@@ -616,7 +839,7 @@ pub(crate) const ELEMENTS: &[Item] = &[(
     "Input",
     Export::Value(|cx| crate::dom::host_component(cx, "input", true)),
     Ts::function(
-        "A native text input (UITextField / UITextView, EditText); `ref` has\n`focus()`, `blur()` and `setSelection(start, end)`.",
+        "A native text input (UITextField / UITextView, EditText); `ref` has\n`focus()`, `blur()`, `setSelection(start, end)` and `insertText(text)`.",
         &["(props: InputProps): JSX.Element"],
     ),
 )];
@@ -680,6 +903,7 @@ fn platform(cx: *mut JsContext) -> JsValue {
     object(
         cx,
         &[
+            (c"name", string(cx, e.platform_name())),
             (c"os", string(cx, e.os.name())),
             (c"version", string(cx, &os_version(&e))),
             (c"idiom", string(cx, idiom(&e))),
@@ -690,8 +914,9 @@ fn platform(cx: *mut JsContext) -> JsValue {
     )
 }
 
-/// `platform.select(spec)`: this OS's value, else `mobile` / `desktop`,
-/// else `native` (not on the web), else `default`.
+/// `platform.select(spec)`: this platform's name (when built outside NSH),
+/// else its OS, else `mobile` / `desktop`, else `native` (not on the web),
+/// else `default`.
 unsafe extern "C" fn platform_select(
     cx: *mut JsContext,
     _this: JsValue,
@@ -705,12 +930,16 @@ unsafe extern "C" fn platform_select(
     }
     let env = current(cx);
     let kind = if env.desktop() { "desktop" } else { "mobile" };
-    let keys = [env.os.name(), kind, "native", "default"];
-    for key in keys
+    let external = env.platform.filter(|&name| name != env.os.name());
+    let rest = [env.os.name(), kind, "native", "default"];
+    for key in external
         .into_iter()
+        .chain(rest)
         .filter(|k| *k != "native" || env.os != Os::Web)
     {
-        let key = std::ffi::CString::new(key).unwrap_or_default();
+        let Ok(key) = std::ffi::CString::new(key) else {
+            continue;
+        };
         let v = unsafe { qjs::JS_GetPropertyStr(cx, spec, key.as_ptr()) };
         if !unsafe { qjs::JS_IsUndefined(v) } {
             return v;
@@ -721,6 +950,22 @@ unsafe extern "C" fn platform_select(
 
 /// The exports of `nsh/device`.
 pub(crate) const DEVICE_EXPORTS: &[Item] = &[
+    (
+        "horizontalSizeClass",
+        Export::Value(|cx| accessor(cx, Part::HorizontalSizeClass)),
+        Ts::value(
+            "Horizontal space (reactive): UIKit's trait on iOS; elsewhere compact below 600pt of window width, regular at 600pt and above.",
+            "Accessor<SizeClass>",
+        ),
+    ),
+    (
+        "verticalSizeClass",
+        Export::Value(|cx| accessor(cx, Part::VerticalSizeClass)),
+        Ts::value(
+            "Vertical space (reactive): UIKit's trait on iOS; elsewhere compact below 600pt of window height, regular at 600pt and above.",
+            "Accessor<SizeClass>",
+        ),
+    ),
     (
         "windowSize",
         Export::Value(|cx| accessor(cx, Part::Window)),
@@ -751,6 +996,14 @@ pub(crate) const DEVICE_EXPORTS: &[Item] = &[
         Ts::value(
             "Whether the performance monitor measures (reactive): on with `--fps`,\n`NSH_FPS=1` or `setFpsEnabled(true)` where the platform has one.",
             "Accessor<boolean>",
+        ),
+    ),
+    (
+        "perfStats",
+        Export::Value(|cx| accessor(cx, Part::PerfStats)),
+        Ts::value(
+            "What the performance monitor measured over the last second (reactive):\nits frame rate and more, read once a second while it measures\n(`fpsEnabled()`), `null` while it does not and until its first second.",
+            "Accessor<PerfStats | null>",
         ),
     ),
     (
@@ -794,6 +1047,14 @@ pub(crate) const DEVICE_EXPORTS: &[Item] = &[
         ),
     ),
     (
+        "wakeCount",
+        Export::Value(|cx| accessor(cx, Part::WakeCount)),
+        Ts::value(
+            "How many times the system woke from sleep while the app ran, 0 until\nthe first wake (reactive): an effect that reads it runs again after each\nwake. A sleep may leave `lifecycle()` as it was (a laptop's lid closed\nand opened with the app in front), while network connections and timers\ndid not live through it: check or open them again there. macOS, Windows\nand Linux count wakes; on iOS and Android a sleeping device takes the\napp to the background, which `lifecycle()` reports.",
+            "Accessor<number>",
+        ),
+    ),
+    (
         "platform",
         Export::Value(platform),
         Ts::value(
@@ -801,10 +1062,21 @@ pub(crate) const DEVICE_EXPORTS: &[Item] = &[
             "PlatformInfo",
         ),
     ),
+    (
+        "shadersAvailable",
+        Export::Value(|cx| accessor(cx, Part::Shaders)),
+        Ts::value(
+            "Whether the platform draws shader views (`Shader`, `ShaderEffect`,\n`ShaderTransition`, `ScreenEffect`, `ScreenTransition`) (reactive).\n`false` where the platform was built without a renderer or draws in a\nterminal's cells; elsewhere `true` until the first shader mounts on a\nmachine without a GPU (WebGL 2 in a browser), when it turns `false` for\ngood. Show a shader while it holds and the app's own drawing (a `Canvas`,\nan image) otherwise.",
+            "Accessor<boolean>",
+        ),
+    ),
 ];
 
 /// `nsh/device`'s types.
-pub(crate) const DEVICE_TYPES: &str = r#"export interface PlatformSelectSpec<T> {
+pub(crate) const DEVICE_TYPES: &str = r#"/** Space available along one axis of the surface. */
+export type SizeClass = "compact" | "regular";
+
+export interface PlatformSelectSpec<T> {
   ios?: T;
   android?: T;
   macos?: T;
@@ -820,6 +1092,22 @@ pub(crate) const DEVICE_TYPES: &str = r#"export interface PlatformSelectSpec<T> 
   /** Every platform but the web. */
   native?: T;
   default?: T;
+  /** A platform built outside NSH, by its `platform.name` (`"miniprogram"`, ...). */
+  [platform: string]: T | undefined;
+}
+
+/** What the performance monitor measured over the last second
+ * (`perfStats()`). */
+export interface PerfStats {
+  /** Frames shown per second: display refreshes in which the app changed
+   * something. An idle app reads low, which is not slowness. */
+  readonly fps: number;
+  /** The rate the display refreshes at (Hz), once the monitor saw it
+   * refresh. */
+  readonly refreshRate: number | null;
+  /** The share of recent frames that took longer than one refresh, from 0
+   * to 1 (`0.05` is 5%), as Rust's `dropped` (a `Percentage`) reads it. */
+  readonly dropped: number;
 }
 
 /** The user's locale settings beside the locale (`localeSettings()`). */
@@ -857,6 +1145,11 @@ export interface LocaleSettings {
 }
 
 export interface PlatformInfo {
+  /** The platform the app runs on: the OS's name on NSH's own platforms
+   * (`"ios"`, `"android"`, `"macos"`, `"windows"`, `"linux"`, `"web"`), or
+   * the name of a platform built outside NSH (`"miniprogram"`), whose OS is
+   * `os`: handle a name you do not know. */
+  readonly name: OS | (string & {});
   /** The operating system (`"ios"`, `"android"`, `"macos"`, `"windows"`,
    * `"linux"`, `"web"`). */
   readonly os: OS;
@@ -879,9 +1172,10 @@ export interface PlatformInfo {
   /** The app runs under Mac Catalyst, in the Mac or the iPad idiom
    * (`os` is `"ios"`, `desktop` false). */
   readonly catalyst: boolean;
-  /** The value for this platform: its OS (`ios`, `macos`, `web`, ...),
-   * else `desktop` / `mobile` (by `platform.desktop`), else `native` (not
-   * on the web), else `default`. */
+  /** The value for this platform: its `name` (`"miniprogram"`, ...),
+   * else its OS (`ios`, `macos`, `web`, ...), else `desktop` / `mobile`
+   * (by `platform.desktop`), else `native` (not on the web), else
+   * `default`. */
   select<T>(spec: PlatformSelectSpec<T>): T | undefined;
 }
 "#;
