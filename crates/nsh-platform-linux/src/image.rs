@@ -664,6 +664,11 @@ pub(crate) struct ImageState {
     /// The source's picture, once loaded, and the lease that keeps it.
     image: Option<Picture>,
     lease: Lease,
+    /// The previous source's picture, while the next one loads: a frame
+    /// swapped every paint (a viewport, a camera preview) shows the last
+    /// one instead of dropping to the placeholder for a paint.
+    stale: Option<Picture>,
+    stale_lease: Lease,
     /// The source's load running (a first one, or a larger size).
     load: Option<Load>,
     /// The placeholder's picture, until the image shows.
@@ -880,8 +885,8 @@ pub(crate) fn set(
         image.generation += 1;
         if !same_source {
             image.source = source.cloned();
-            image.image = None;
-            image.lease = Lease::none();
+            image.stale = image.image.take();
+            image.stale_lease = std::mem::take(&mut image.lease);
             image.load = None;
             image.fade = None;
             if let Some(mut p) = image.playback.take() {
@@ -1086,6 +1091,8 @@ pub(crate) fn resized(surface: &Surface, view: &NshView) {
         }
         image.image = Some(picture);
         image.lease = lease;
+        image.stale = None;
+        image.stale_lease = Lease::none();
         drop(s);
         view.changed();
     };
@@ -1154,6 +1161,8 @@ fn loaded(
             Ok((picture, lease)) => {
                 image.image = Some(picture.clone());
                 image.lease = lease.clone();
+                image.stale = None;
+                image.stale_lease = Lease::none();
                 if let Some(mut old) = image.playback.take() {
                     old.pause();
                 }
@@ -1381,7 +1390,7 @@ pub(crate) fn draw(snapshot: &gtk::Snapshot, state: &ViewState, scale: f32) {
         let shown = (&placeholder.texture, placeholder.natural);
         draw_one(snapshot, state, image, shown, source, scale);
     }
-    let Some(picture) = &image.image else {
+    let Some(picture) = image.image.as_ref().or(image.stale.as_ref()) else {
         return;
     };
     let texture = image
