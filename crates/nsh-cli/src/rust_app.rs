@@ -2545,6 +2545,10 @@ opt-level = \"s\"
                 "\n[profile.dev.package.{package}]\nopt-level = 3\n"
             ));
         }
+        // Dependencies' debuginfo is what makes the hosts' links slow (a
+        // bevy-scale app's runner links gigabytes of it); leave it out. The
+        // app's own crates keep theirs.
+        manifest.push_str("\n[profile.dev.package.\"*\"]\ndebug = false\n");
         if let Some(source) = self.nsh.source() {
             manifest.push_str("\n[patch.crates-io]\n");
             let mut patches = String::new();
