@@ -22,6 +22,32 @@ Nothing is published to crates.io; when consumers pin instead of
 path-depending, they will pin a git tag (none cut yet — cut one when the
 patch set stabilizes, in the mdrv-gpui style `mdrv-nsh-<version>`).
 
+## Sync history
+
+**2026-11-16: merged upstream/main (v0.5.0 nightly line, 752 commits).**
+The merge retired three of the five patches — upstream built the same
+features, in most places better:
+
+- **Global shortcuts** (was 321201ca): upstream ships
+  `register_global_shortcut` / `unregister_global_shortcut` /
+  `unregister_all_global_shortcuts` on the desktop element with
+  registration answers (`Answer<bool>` — the desktop's accept/refuse is
+  delivered, not guessed), tray support, and the Linux portal flow
+  documented down to the Hyprland bind. Our simpler fn is deleted.
+- **Rust-app capabilities** (was d690f0a4): upstream reads
+  `nsh.json` `capabilities` for Rust apps (`app_access` →
+  `capabilities_ref`); the runner-side `policy_from_manifest` is gone.
+- **`baseParts`** (was 03770fba): upstream's `rust_sets()` serves a Rust
+  app `nsh/base`'s core part only — "registering every part would link
+  every component into the module, the ones the app never makes
+  included" — which is our size win (bench: 10.78 MB → 5.15 MB main
+  wasm, brotli 2.63 MB → 1.33 MB) without the knob. Apps drop
+  `"baseParts"` from `nsh.json`; the key is unknown now.
+- Upstream also gained the input surface mdrv games asked for:
+  continuous `on_pinch` (`PinchEvent.delta` per event), `on_key_down` /
+  `on_key_up` (`KeyEvent` with the DOM's `key`/`code`), `on_mouse_up`,
+  `PinchPhase`.
+
 ## Patches
 
 ### linux: overlay windows on Wayland's layer shell (674350bf, pushed)
@@ -31,49 +57,30 @@ instead of stacking ordinary windows. Verified on Hyprland 0.57: glass HUD
 on overlay (layer 3), bar on level 2, anchor math exact. Hyprland 0.57
 configures binds in Lua (`hl.bind` in `hyprland.lua`); `hyprctl keyword
 bind` is "unknown request" and `wtype`'s virtual keyboard does not fire
-compositor binds.
+compositor binds. Survived the merge untouched except the
+`gtk4-layer-shell` dep line (upstream made gstreamer optional in the same
+section; both kept).
 
-### engine: Rust apps declare capabilities in nsh.json (d690f0a4, pushed)
+### cli: lighter dev profiles for the generated workspace
 
-Rust apps had no way to ask for portal/device capabilities the way TSX
-apps do; `nsh.json` is the app's manifest, so that is where the
-declaration belongs.
+`write_workspace_manifest` adds `[profile.dev.package."*"] debug = false`
+next to the existing per-crate `opt-level = 3` overrides.
 
-### core: Global shortcuts for Rust apps (321201ca, pushed)
+The problem is real and measured: an app whose crates pull Bevy
+(`nsh-bevy-test`) linked its development runner for over an hour and
+peaked ~10 GB of RSS — dependency debuginfo alone (bevy_render, wgpu,
+hickory, ...) dwarfs everything else, and the describe program links the
+same tree again. With debuginfo left out of dependencies, links drop to
+minutes and the memory spike goes with them; the app's own crates keep
+their debuginfo (where breakpoints live anyway), and TSX apps feel it
+only as faster dev rebuilds of the same binaries.
 
-`desktop_el::global_shortcut("ctrl+alt+b", on_press)`. Verified with a
-Hyprland bind. Dispatch probe when debugging: `hyprctl eval 'return
-hl.dispatch(hl.dsp.global("appid:shortcut"))'`.
+Pair it with mold in the app (`.cargo/config.toml`,
+`rustflags = ["-C", "link-arg=-fuse-ld=mold"]`) — that part is per-app,
+not patched into the CLI.
 
-### cli: `baseParts` — serve a subset of `nsh/base` (03770fba)
-
-The web size problem: the features `editor, highlight, plot, rich-editor,
-term` are requested by `nsh-engine` and `nsh-platform-web`'s own manifests,
-so nothing an app or the generated members do can remove them — feature
-unification only ever adds. Manifest-level stripping is a dead end (three
-attempts relinked byte-identical artifacts).
-
-The working lever is nsh's own: `nsh_base::parts` — _what no part
-registers is left out of the binary_, dependencies included (syntect,
-ropey, vte), at link time. The generated runtimes hardcoded the full
-`registry()`; `nsh.json "baseParts"` lets a Rust app list the parts it
-serves instead.
-
-- Files: `crates/nsh-cli/src/rust_app.rs` (field, parse, `base_set`),
-  `crates/nsh-cli/src/package.rs` (`_base_parts` on `AppConfig`, so the
-  validator does not warn — same pattern as `_theme`/`_resolve`).
-- Rust apps only (a `"root"` must be set): TSX apps load base parts by
-  gate (`nsh_part_*`) per chunk, so a trimmed registry would break their
-  bundles at load. The guard lives in `base_set`.
-- Default unchanged (`registry()`): every existing app builds exactly as
-  before. One knob, all of the app's runtimes (web, native runners, test
-  runner, TUI host) — one app, one base set.
-- Measured on nsh-bench: packaged main wasm 10.78 MB → 5.15 MB, brotli
-  2.63 MB → **1.33 MB**; site 11.4 MB → 6.1 MB. Renders fully in
-  Chromium, empty console.
-- _upstream?_ yes — the knob follows the lite runtime's own philosophy,
-  and the CLI cannot know which parts a Rust app mounts, so the app must
-  say.
+- _upstream?_ yes — every Rust app with heavy dependencies benefits; TSX
+  apps pay nothing.
 
 ## Tooling
 
@@ -94,16 +101,18 @@ out of tree (`/x/m/v270/nsh/`, never committed).
 
 ## Consumers
 
+- `nsh-bevy-test` (`/g/nsh-bevy-test`) — Bevy 3D viewport embedded in an
+  nsh app (drag-orbit, pinch zoom, WASD walks the duck); the game-input
+  eval app.
 - `nsh-bench` (`/g/_ext/nsh-bench`) — the visual/scroll benchmark and the
-  web-size eval app (`baseParts: ["core"]`).
-- `nsh-layer-test` (`/g/nsh-layer-test`) — layer-shell + global-shortcut
-  demo, the verification app for the first three patches.
-- Future mdrv games — the reason `baseParts` exists.
+  web-size eval app.
+- `nsh-layer-test` (`/g/nsh-layer-test`) — layer-shell +
+  global-shortcut demo, the verification app for the layer-shell patch.
 
 ## Considered, not patched
 
 - **Renaming the fork** (`mdrv-nsh`): cosmetic, high churn, no functional
   reason yet. Revisit when the fork needs a public identity of its own.
 - **Trimming nsh-engine / nsh-platform-web's `nsh-base` features**:
-  impossible from the app side; would churn every platform crate for a
-  win `baseParts` already delivers.
+  impossible from the app side; upstream's `rust_sets()` delivers the win
+  for Rust apps automatically.
