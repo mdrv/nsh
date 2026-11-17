@@ -129,14 +129,21 @@ pub(crate) fn menu_icon(surface: &Surface, source: &ImageSource) -> Option<gio::
 
 /// Loads `source` fitted in a `side` × `side` pixel square, off the main
 /// thread; `done` runs on the main thread with it (an animation's first
-/// frame), and whether it is an SVG (a template, painted in the panel's
-/// text color). For pixels that leave GTK: the tray's icon.
+/// frame), and whether it is a template to paint in the panel's text
+/// color: an SVG, unless it declares a color of its own (then it means
+/// to keep its colors — a colored tray icon, not a mask). For pixels
+/// that leave GTK: the tray's icon.
 pub(crate) fn load_icon(
     surface: &Surface,
     source: &ImageSource,
     side: u32,
     done: impl FnOnce(Result<(gdk::Texture, bool), String>) + 'static,
 ) {
+    let colored = source
+        .data
+        .as_ref()
+        .map(|data| svg_declares_color(data.bytes()))
+        .unwrap_or(false);
     let want = Want {
         size: nsh_core::geometry::size(Points(side as f32), Points(side as f32)),
         scale: 1.0,
@@ -150,11 +157,46 @@ pub(crate) fn load_icon(
         Priority::Normal,
         None,
         Box::new(move |result| {
-            done(result.map(|(p, _)| (p.texture, matches!(p.natural, Natural::Vector(_)))))
+            done(result.map(|(p, _)| {
+                (
+                    p.texture,
+                    matches!(p.natural, Natural::Vector(_)) && !colored,
+                )
+            }))
         }),
     ) {
         load.detach();
     }
+}
+
+/// Whether an SVG names any explicit hex color other than a gray: a
+/// mask-style icon omits colors (or stays black/white/gray), a colored
+/// one names them.
+fn svg_declares_color(bytes: &[u8]) -> bool {
+    let text = std::str::from_utf8(bytes).unwrap_or("");
+    for (at, _) in text.match_indices('#') {
+        for len in [6, 3] {
+            let Some(hex) = text.get(at + 1..at + 1 + len) else {
+                continue;
+            };
+            let Ok(value) = u32::from_str_radix(hex, 16) else {
+                continue;
+            };
+            let (r, g, b) = if len == 6 {
+                (value >> 16 & 0xff, value >> 8 & 0xff, value & 0xff)
+            } else {
+                (
+                    (value >> 8 & 0xf) * 17,
+                    (value >> 4 & 0xf) * 17,
+                    (value & 0xf) * 17,
+                )
+            };
+            if r != g || g != b {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Frames of an animated image decoded at most (as iOS; longer ones stop
