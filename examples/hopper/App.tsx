@@ -1,4 +1,5 @@
 import { type JSX, mount, platform, Scroll, signal, Text, View } from "nsh";
+import { Window } from "nsh/desktop";
 import { createNavStack, NavPage, NavStack } from "nsh/base";
 import { safeAreaInsets } from "nsh";
 import { FlightPlan } from "./cards/FlightPlan";
@@ -50,7 +51,7 @@ function Header(props: { title: string; back?: boolean }) {
           accessibilityLabel="Back"
           hitSlop={8}
           activeStyle={{ opacity: 0.5 }}
-          style={{ flexDirection: "row", alignItems: "center", gap: 2, paddingRight: 6, cursor: "pointer" }}
+          style={{ flexDirection: "row", alignItems: "center", gap: 2, paddingRight: 6 }}
         >
           <Icon name="back" size={18} tint={color.accent} />
           <Text style={{ fontSize: 15, color: color.accent }}>Back</Text>
@@ -175,4 +176,4 @@ function App() {
   );
 }
 
-mount(App);
+mount(() => <Window id="main">{App}</Window>);

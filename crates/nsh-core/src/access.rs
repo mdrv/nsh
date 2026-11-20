@@ -23,6 +23,9 @@
 //! }
 //! ```
 //!
+//! `share` lets the app show the system's share sheet (`Share` of `nsh`,
+//! [`crate::share`]): what it shares leaves the app where the user sends
+//! it, and the files it shares are also checked against `fs.read`.
 //! `openUrl` lets the app open URLs outside it (`openUrl` of `nsh/device`,
 //! [`crate::open_url`]: the browser, the mail or phone app, other apps'
 //! schemes): `true` for every scheme, `{ "schemes": [...] }` for those
@@ -48,8 +51,8 @@
 //! the windows `windows` grants need none); `homeDir` lets `os.homedir()` tell the
 //! user's home directory. An app without `"capabilities"` (a standalone
 //! app, its developer's own) retains unrestricted HTTP, web views, the
-//! status bar, the clipboard, the picker, speech recognition, opening URLs,
-//! the application and the home directory; raw sockets, processes, the
+//! status bar, the clipboard, the picker, the share sheet, speech
+//! recognition, opening URLs, the application and the home directory; raw sockets, processes, the
 //! filesystem and the host's functions always require an explicit
 //! declaration.
 
@@ -400,14 +403,13 @@ pub(crate) fn in_root(path: &Path, (expanded, canonical): &(PathBuf, PathBuf)) -
 }
 
 /// Whether apps have the native file system here that `capabilities.fs`
-/// grants (`fs/promises`, local media files): on the desktops (macOS,
-/// Windows, Linux), never on iOS, Android or the web.
+/// grants (`fs/promises`, local media files, shared files): on every
+/// native OS (the desktops, iOS, Android — the capability confines each
+/// call to the roots the app declares, whatever the sandbox around
+/// them), never on the web, whose `fs/promises` works on the host's
+/// private virtual file system and whose pages name no local file.
 pub fn native_files(os: crate::platform::Os) -> bool {
-    cfg!(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows"
-    )) && os.is_desktop()
+    cfg!(not(target_arch = "wasm32")) && os != crate::platform::Os::Web
 }
 
 /// The `capabilities.fs.read` roots local media files are read under, as
@@ -429,7 +431,7 @@ pub struct MediaFiles {
 impl MediaFiles {
     /// `access`'s read roots, expanded against `data_dir` and `paths`.
     /// Where the platform has no file system for apps (`available`
-    /// false: iOS, Android, as for `fs/promises`), none.
+    /// false: the web, as for `fs/promises`), none.
     pub fn new(
         access: &Access,
         data_dir: Option<&Path>,
@@ -647,6 +649,10 @@ pub struct Capabilities {
     /// The app may show the system's picker (`nsh/picker`): the files the
     /// user picks in it reach the app.
     pub picker: bool,
+    /// The app may show the system's share sheet (`Share` of `nsh`): the
+    /// text, links and files it shares leave the app where the user sends
+    /// them.
+    pub share: bool,
     /// The app may recognize the user's speech (`Speech` of `nsh`): the
     /// microphone listens while a session runs, and the transcript reaches
     /// the app.
@@ -670,7 +676,8 @@ pub struct Capabilities {
     /// `None`: none.
     pub open_url: Option<OpenUrlGrant>,
     /// The windows the app may open and what they may do (`nsh/desktop`'s
-    /// `Window`); `None`: none besides its main one.
+    /// `Window`); `None`: no window of the app's own. The first window needs
+    /// the grant too: no window is privileged.
     pub windows: Option<WindowsGrant>,
 }
 
@@ -685,7 +692,7 @@ pub struct WindowsGrant {
     pub kinds: Vec<crate::desktop::WindowKind>,
     /// The levels its windows may float at; empty: every level.
     pub levels: Vec<crate::desktop::WindowLevel>,
-    /// How many windows it may have open at once besides the main one;
+    /// How many windows it may have open at once, its first window included;
     /// `None`: any number.
     pub max: Option<u32>,
     /// Overlays and click-through windows (`pointerEvents: "none"`).
@@ -803,7 +810,8 @@ const RELATIVE_ADVICE: &str = "a relative path names no file in a native app: na
 const ASSET_ADVICE: &str = "bundled files are named by a path inside the app's files";
 
 /// [`media_grant_advice`] for a local file.
-const LOCAL_FILE_ADVICE: &str = "a local file is read under capabilities.fs.read in nsh.json: add a root that holds it (desktop apps)";
+const LOCAL_FILE_ADVICE: &str =
+    "a local file is read under capabilities.fs.read in nsh.json: add a root that holds it";
 
 /// [`media_grant_advice`] for a protocol-relative source without a base.
 const NO_SCHEME_ADVICE: &str =
@@ -930,8 +938,12 @@ fn local_file(uri: &str) -> Option<Option<PathBuf>> {
     (drive || rooted).then(|| Some(PathBuf::from(uri)))
 }
 
-/// The path `file:` URL `uri` names. The web has no local files to name.
-fn file_url_path(uri: &str) -> Option<PathBuf> {
+/// The path `file:` URL `uri` names, decoded as a URL is (percent
+/// encoding included). What [`media_url`] checks is what the platforms'
+/// loaders read: they resolve `file:` sources with this, never by
+/// stripping the prefix. The web has no local files to name.
+#[doc(hidden)]
+pub fn file_url_path(uri: &str) -> Option<PathBuf> {
     #[cfg(target_arch = "wasm32")]
     {
         let _ = uri;
@@ -1088,6 +1100,7 @@ impl Capabilities {
             status_bar: true,
             clipboard: true,
             picker: true,
+            share: true,
             speech: true,
             notifications: true,
             audio: true,
@@ -1147,13 +1160,14 @@ impl Capabilities {
     /// `dropped`: lenient, recording what unknown keys dropped; `None`:
     /// strict.
     fn parse(value: &Value, mut dropped: Option<&mut Vec<String>>) -> Result<Self, String> {
-        const KNOWN: [&str; 15] = [
+        const KNOWN: [&str; 16] = [
             "windows",
             "network",
             "webview",
             "statusBar",
             "clipboard",
             "picker",
+            "share",
             "speech",
             "notifications",
             "audio",
@@ -1294,6 +1308,11 @@ impl Capabilities {
             caps.picker = picker
                 .as_bool()
                 .ok_or("capabilities.picker must be a boolean")?;
+        }
+        if let Some(share) = obj.get("share") {
+            caps.share = share
+                .as_bool()
+                .ok_or("capabilities.share must be a boolean")?;
         }
         if let Some(speech) = obj.get("speech") {
             caps.speech = speech
@@ -1563,6 +1582,9 @@ impl Capabilities {
         obj.insert("clipboard".into(), self.clipboard.into());
         obj.insert("picker".into(), self.picker.into());
         // Only when granted: older runtimes read what newer signers write.
+        if self.share {
+            obj.insert("share".into(), true.into());
+        }
         if self.speech {
             obj.insert("speech".into(), true.into());
         }
@@ -1655,8 +1677,11 @@ fn valid_command(command: &str) -> bool {
         && !command.contains(['\0', '*'])
         // `absolute`, not `Path::is_absolute`: in the browser that is false for
         // every path, so `/bin/sh` refused the whole manifest and the app never
-        // started there.
-        && (absolute(Path::new(command))
+        // started there. A rooted path counts on Windows too, where
+        // `is_absolute` wants a drive (`/bin/sh`): one manifest serves every
+        // platform.
+        && (Path::new(command).has_root()
+            || absolute(Path::new(command))
             // A bare name has no drive (`C:git` is relative to the host's
             // directory on drive C).
             || (!command.contains(['/', '\\', ':']) && command != "." && command != ".."))
@@ -2402,8 +2427,8 @@ impl Access {
     /// Leaves out of `attributes` what the app's capabilities do not grant
     /// a window (an ungranted level, click-through without `overlay`) and
     /// returns their
-    /// names, for a warning. The main window needs no `windows` grant for
-    /// the rest.
+    /// names, for a warning. Without a `windows` grant only the defaults
+    /// remain; no window is privileged.
     pub fn deny_window_attributes(
         &self,
         attributes: &mut crate::desktop::WindowAttributes,
@@ -2433,6 +2458,12 @@ impl Access {
     /// Whether the app may set the status bar.
     pub fn allows_status_bar(&self) -> bool {
         self.each(|c| c.status_bar)
+    }
+
+    /// Whether the app may show the system's share sheet (`Share` of
+    /// `nsh`).
+    pub fn allows_share(&self) -> bool {
+        self.each(|c| c.share)
     }
 
     /// Whether the app may read and write the system clipboard.
@@ -2565,8 +2596,6 @@ mod tests {
             ]
         );
     }
-    use std::cell::Cell;
-
     use super::*;
 
     fn caps(json: &str) -> Capabilities {
@@ -3037,6 +3066,31 @@ mod tests {
     }
 
     #[test]
+    fn the_share_sheet_is_granted_by_both_sides() {
+        let declared = caps(r#"{ "share": true }"#);
+        assert!(declared.share);
+        assert_eq!(declared.to_json()["share"], serde_json::json!(true));
+        assert!(
+            Access {
+                declared: declared.clone(),
+                granted: None,
+            }
+            .allows_share()
+        );
+        // The embedding app grants less.
+        assert!(
+            !Access {
+                declared,
+                granted: Some(caps("{}")),
+            }
+            .allows_share()
+        );
+        // Apps without a declaration keep it.
+        assert!(Access::all().allows_share());
+        assert!(Capabilities::from_json(&serde_json::json!({ "share": "yes" })).is_err());
+    }
+
+    #[test]
     fn denies_unless_listed() {
         let access = Access {
             declared: caps("{}"),
@@ -3056,6 +3110,7 @@ mod tests {
         assert!(!access.allows_status_bar());
         assert!(!access.allows_clipboard());
         assert!(!access.allows_picker());
+        assert!(!access.allows_share());
         assert!(!access.allows_speech());
         assert!(!access.allows_audio());
         assert!(!access.allows_application());
@@ -3836,7 +3891,7 @@ mod tests {
             granted: None,
         };
         let files = MediaFiles::new(&access, None, &TrustedPaths::default(), true);
-        let resolves = || RESOLVES.with(Cell::get);
+        let resolves = || RESOLVES.with(std::cell::Cell::get);
         let before = resolves();
         for outside in [
             root.join("elsewhere/x.png"),
@@ -4213,6 +4268,36 @@ mod tests {
             assert_eq!(again(&path(&data.join("link/b.png"))), None);
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `capabilities.fs` roots gate the file system every native OS has —
+    /// the desktops', iOS's, Android's; the web has none to gate.
+    #[test]
+    fn every_native_os_has_the_files_the_capability_gates() {
+        use crate::platform::Os;
+        for os in [Os::MacOs, Os::Windows, Os::Linux, Os::Ios, Os::Android] {
+            assert!(native_files(os), "{os:?}");
+        }
+        assert!(!native_files(Os::Web));
+    }
+
+    /// A `file:` URL's path is the URL's decoded path: `%20` is a space,
+    /// `file://localhost/` names no host that refuses.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn file_urls_name_their_decoded_path() {
+        assert_eq!(
+            file_url_path("file:///tmp/a%20b.png"),
+            Some(PathBuf::from("/tmp/a b.png"))
+        );
+        assert_eq!(
+            file_url_path("file://localhost/tmp/a.png"),
+            Some(PathBuf::from("/tmp/a.png"))
+        );
+        #[cfg(unix)]
+        assert_eq!(file_url_path("file://host/tmp/a.png"), None);
+        assert_eq!(file_url_path("not a url"), None);
+        assert_eq!(file_url_path("https://a/b"), None);
     }
 
     /// A refused source's advice names the host it resolves to, as the

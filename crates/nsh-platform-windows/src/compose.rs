@@ -1,9 +1,12 @@
-//! Window composition: web views between the content nsh draws below them
-//! and the content it draws above them.
+//! Window composition: web views, and native components that bring a
+//! visual of their own (`crate::native`), between the content nsh draws
+//! below them and the content it draws above them. A component's visual
+//! takes a web view's place below: it is stacked and placed the same way.
 //!
-//! A window without web views draws its whole tree into its flip-model
-//! swap chain ([`crate::render::frame`]) and has no composition at all.
-//! The first web view of a surface makes its [`Composition`]: a
+//! A window without web views or composed components draws its whole tree
+//! into its flip-model swap chain ([`crate::render::frame`]) and has no
+//! composition at all. The first of them in a surface makes its
+//! [`Composition`]: a
 //! DirectComposition target on the window, above the window's own swap
 //! chain, whose root holds, bottom to top, each web view's visual
 //! ([`Portal`], the WebView2 controller's root visual target) and after
@@ -33,6 +36,12 @@
 //! made again after it is lost ([`crate::gfx::generation`]); the
 //! DirectComposition device has no rendering device of its own (no
 //! DirectComposition surfaces are used), so it survives a device loss.
+//!
+//! The target is in the window's lower composition slot, below its child
+//! windows. While a see-through window shows backdrop views
+//! (`windows={{ backdrop }}`), it moves to the upper slot, above them, and
+//! the lower one holds the system's blur under those views
+//! ([`crate::backdrop`]); it moves back after the last one.
 
 use std::{
     cell::{Cell, RefCell},
@@ -66,21 +75,23 @@ use windows_numerics::Matrix3x2;
 
 use crate::gfx::{self, Gfx};
 
-/// Where a frame put a web view: what its visuals are set to.
+/// Where a frame put a composed item (a web view, a component's visual,
+/// [`crate::NativeComponent::placed`]): what its visuals are set to.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Placement {
-    /// The web view's pixels (its own coordinates times the window's
-    /// scale) to window pixels.
-    pub(crate) matrix: Matrix3x2,
+#[non_exhaustive]
+pub struct Placement {
+    /// The item's pixels (its own coordinates times the window's scale) to
+    /// window pixels.
+    pub matrix: Matrix3x2,
     /// Its size in pixels.
-    pub(crate) size: (i32, i32),
+    pub size: (i32, i32),
     /// What its clipping ancestors leave visible (window pixels).
-    pub(crate) clip: D2D_RECT_F,
+    pub clip: D2D_RECT_F,
     /// Its own corner radii in pixels (clockwise from the top left) when
     /// it clips its content, else zeros.
-    pub(crate) radii: [f32; 4],
+    pub radii: [f32; 4],
     /// The opacity it is drawn with (its own and its ancestors').
-    pub(crate) alpha: f32,
+    pub alpha: f32,
 }
 
 impl Placement {
@@ -100,10 +111,15 @@ impl Placement {
 }
 
 /// The DirectComposition tree of one surface's window. Made with its first
-/// web view, gone with its last (each [`Portal`] holds it).
+/// web view or composed component, gone with the last (each [`Portal`],
+/// and each composed component's item, holds it).
 pub(crate) struct Composition {
     device: IDCompositionDesktopDevice,
-    _target: IDCompositionTarget,
+    /// The window, and the target on it: in its lower slot, or in its
+    /// upper one while it shows backdrops ([`Composition::backdrops_placed`]).
+    hwnd: HWND,
+    target: RefCell<IDCompositionTarget>,
+    topmost: Cell<bool>,
     root: IDCompositionVisual2,
     /// The layers made so far: layer `i` holds what is drawn after the
     /// `i`-th web view that something is drawn after.
@@ -113,6 +129,10 @@ pub(crate) struct Composition {
     /// A transparent window's swap chain, below everything else
     /// ([`Composition::set_base`]).
     base: RefCell<Option<IDCompositionVisual2>>,
+    /// The blur under the backdrop views the window shows, and whether it
+    /// could not be made in this window (it is not tried again).
+    backdrops: RefCell<Option<crate::backdrop::Backdrops>>,
+    backdrops_failed: Cell<bool>,
 }
 
 /// What nsh draws above a web view: a composition swap chain the size of
@@ -143,11 +163,15 @@ impl Composition {
             device.Commit()?;
             Ok(Rc::new(Composition {
                 device,
-                _target: target,
+                hwnd,
+                target: RefCell::new(target),
+                topmost: Cell::new(false),
                 root,
                 layers: RefCell::default(),
                 order: RefCell::default(),
                 base: RefCell::default(),
+                backdrops: RefCell::default(),
+                backdrops_failed: Cell::new(false),
             }))
         }
     }
@@ -222,6 +246,11 @@ impl Composition {
         };
         layer.target = Some(bitmap.clone());
         Ok(bitmap)
+    }
+
+    /// Its device, on which composed components make their visuals.
+    pub(crate) fn device(&self) -> &IDCompositionDesktopDevice {
+        &self.device
     }
 
     /// Shows what was drawn into the first `used` layers.
@@ -323,6 +352,100 @@ impl Composition {
     #[cfg(test)]
     pub(crate) fn has_base(&self) -> bool {
         self.base.borrow().is_some()
+    }
+
+    /// Shows the system's blur under the backdrop views a frame drew, at
+    /// `at` ([`crate::backdrop`]): with the first, the target moves to the
+    /// window's upper slot and the blur takes the lower one; after the
+    /// last, the target moves back. A window where the blur cannot be made
+    /// shows none from then on, its views' own backgrounds as before.
+    pub(crate) fn backdrops_placed(&self, at: &[Placement]) {
+        let mut backdrops = self.backdrops.borrow_mut();
+        if at.is_empty() {
+            if backdrops.is_some() {
+                // Closes the blur's target first: the tree goes back to its slot.
+                *backdrops = None;
+                self.move_down();
+            }
+            return;
+        }
+        if backdrops.is_none() {
+            if self.backdrops_failed.get() {
+                return;
+            }
+            match self
+                .set_topmost(true)
+                .and_then(|()| crate::backdrop::Backdrops::new(self.hwnd))
+            {
+                Ok(b) => *backdrops = Some(b),
+                Err(err) => {
+                    drop(backdrops);
+                    self.give_up(&err);
+                    return;
+                }
+            }
+        }
+        if let Some(b) = backdrops.as_mut()
+            && let Err(err) = b.place(at)
+        {
+            *backdrops = None;
+            drop(backdrops);
+            self.give_up(&err);
+        }
+    }
+
+    /// A blur that could not be made or placed: logged once, not tried
+    /// again in this window, and the tree goes back below the child windows.
+    fn give_up(&self, err: &windows::core::Error) {
+        log::warn!("compose: no backdrop in this window: {err}");
+        self.backdrops_failed.set(true);
+        self.move_down();
+    }
+
+    fn move_down(&self) {
+        if let Err(err) = self.set_topmost(false) {
+            log::warn!("compose: target not moved back below child windows: {err}");
+        }
+    }
+
+    /// The window shows backdrops: its frames are drawn whole, as they
+    /// find where the views are.
+    pub(crate) fn has_backdrops(&self) -> bool {
+        self.backdrops.borrow().is_some()
+    }
+
+    /// The target is in the window's upper slot.
+    #[cfg(test)]
+    pub(crate) fn topmost(&self) -> bool {
+        self.topmost.get()
+    }
+
+    /// Moves the tree to a target in the window's upper slot (`topmost`),
+    /// above its child windows, or its lower one, in one commit.
+    fn set_topmost(&self, topmost: bool) -> Result<()> {
+        if self.topmost.get() == topmost {
+            return Ok(());
+        }
+        // SAFETY: plain calls on the live device, targets and tree, on
+        // their thread; the old target is released once the root moved.
+        unsafe {
+            let target = self.device.CreateTargetForHwnd(self.hwnd, topmost)?;
+            let old = self.target.borrow();
+            old.SetRoot(None)?;
+            if let Err(err) = target
+                .SetRoot(&self.root)
+                .and_then(|()| self.device.Commit())
+            {
+                // The tree stays where it was rather than leave the window empty.
+                let _ = target.SetRoot(None);
+                let _ = old.SetRoot(&self.root);
+                return Err(err);
+            }
+            drop(old);
+            *self.target.borrow_mut() = target;
+        }
+        self.topmost.set(topmost);
+        Ok(())
     }
 
     /// Drops what lives on the lost device (the layers' swap chains).
@@ -525,6 +648,125 @@ mod tests {
             r(0.0, 0.0, 10.0, 10.0),
             r(10.0, 0.0, 20.0, 10.0)
         )));
+    }
+
+    /// A see-through window's composition, and its window.
+    fn see_through() -> (Rc<crate::app::AppView>, Rc<Composition>) {
+        let app = crate::app::AppView::new(
+            None,
+            crate::app::AppOptions {
+                size: (200, 120),
+                transparent: true,
+                skip_taskbar: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = app
+            .surface()
+            .base
+            .borrow()
+            .clone()
+            .expect("a see-through window's composition");
+        (app, c)
+    }
+
+    /// Where a frame drew a 100 by 50 pixel card with rounded corners.
+    fn card() -> Placement {
+        Placement {
+            matrix: Matrix3x2::translation(10.0, 10.0),
+            size: (100, 50),
+            clip: r(0.0, 0.0, 200.0, 120.0),
+            radii: [8.0; 4],
+            alpha: 1.0,
+        }
+    }
+
+    /// A device of the test's own, to try the window's slots with.
+    fn other_device() -> IDCompositionDesktopDevice {
+        // SAFETY: a plain call.
+        unsafe { DCompositionCreateDevice2(None) }.unwrap()
+    }
+
+    /// With the first backdrop view the target moves above the window's
+    /// child windows and the blur takes the slot below them; after the
+    /// last the target moves back down and the slot above is free again.
+    #[test]
+    fn backdrops_move_the_target_up_and_back() {
+        if !crate::backdrop::supported() {
+            return;
+        }
+        let (app, c) = see_through();
+        let hwnd = app.hwnd();
+        assert!(!c.topmost());
+        c.backdrops_placed(&[card()]);
+        assert!(c.topmost());
+        assert!(c.has_backdrops());
+        let other = other_device();
+        // SAFETY: plain calls on the test's own device and window.
+        unsafe {
+            assert!(other.CreateTargetForHwnd(hwnd, true).is_err());
+            assert!(other.CreateTargetForHwnd(hwnd, false).is_err());
+        }
+        c.backdrops_placed(&[]);
+        assert!(!c.topmost());
+        assert!(!c.has_backdrops());
+        // SAFETY: as above.
+        unsafe {
+            assert!(other.CreateTargetForHwnd(hwnd, true).is_ok());
+            assert!(other.CreateTargetForHwnd(hwnd, false).is_err());
+        }
+        // SAFETY: the test's own window.
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd) };
+    }
+
+    /// A window whose slot above its child windows is taken shows no blur
+    /// and keeps its target below them, and does not try again once the
+    /// slot is free.
+    #[test]
+    fn a_backdrop_that_cannot_be_made_is_not_tried_again() {
+        if !crate::backdrop::supported() {
+            return;
+        }
+        let (app, c) = see_through();
+        let hwnd = app.hwnd();
+        let other = other_device();
+        // SAFETY: a plain call on the test's own device and window.
+        let taken = unsafe { other.CreateTargetForHwnd(hwnd, true) }.unwrap();
+        c.backdrops_placed(&[card()]);
+        assert!(!c.topmost());
+        assert!(!c.has_backdrops());
+        drop(taken);
+        c.backdrops_placed(&[card()]);
+        assert!(!c.topmost());
+        assert!(!c.has_backdrops());
+        // SAFETY: the test's own window.
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd) };
+    }
+
+    /// A blur that can no longer be placed is dropped and the target moves
+    /// back below the child windows.
+    #[test]
+    fn a_backdrop_that_cannot_be_placed_is_given_up() {
+        if !crate::backdrop::supported() {
+            return;
+        }
+        let (app, c) = see_through();
+        c.backdrops_placed(&[card()]);
+        assert!(c.has_backdrops());
+        crate::backdrop::close_compositor();
+        let moved = Placement {
+            matrix: Matrix3x2::translation(20.0, 10.0),
+            ..card()
+        };
+        c.backdrops_placed(&[moved]);
+        assert!(!c.has_backdrops());
+        assert!(!c.topmost());
+        c.backdrops_placed(&[card()]);
+        assert!(!c.has_backdrops());
+        assert!(!c.topmost());
+        // SAFETY: the test's own window.
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(app.hwnd()) };
     }
 
     #[test]

@@ -39,6 +39,7 @@ fn app() -> impl IntoElement {
 
 ```tsx tabs
 import { List, mount, Text, View } from "nsh";
+import { Window } from "nsh/desktop";
 
 const contacts = Array.from({ length: 1000 }, (_, i) => ({ id: i, name: `Contact ${i + 1}` }));
 
@@ -56,7 +57,11 @@ function App() {
   );
 }
 
-mount(App);
+mount(() => (
+  <Window id="main">
+    <App />
+  </Window>
+));
 ```
 
 In TSX, `List` is generic: `List<T>` checks that `each` and the row function agree on the item type, which TypeScript
@@ -133,7 +138,8 @@ touches and UI tests meet each row once.
 
 Lists also take the scrolling props of [`Scroll`](./scroll.md#scrolling) (the `Scrollable` methods in Rust):
 `pagingEnabled`, `snapToInterval`, `snapToOffsets`, `snapToAlignment`, `disableIntervalMomentum`, `decelerationRate`,
-`bounces`, `contentInset`, `contentOffset`, `keyboardShouldPersistTaps`, `scrollEventThrottle` and `scrollable`.
+`bounces`, `contentInset`, `scrollbarInset`, `contentOffset`, `keyboardShouldPersistTaps`, `scrollEventThrottle` and
+`scrollable`.
 Lists keep their scale.
 
 The props every element takes ([common props](./index.md#common-props)) go to the list's scroll view as they are:

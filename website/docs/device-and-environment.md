@@ -55,6 +55,7 @@ pub fn App() -> impl IntoElement {
 ```tsx tabs
 import { mount, Text, View, safeArea } from "nsh";
 import { colorScheme, fontScale, windowSize } from "nsh";
+import { Window } from "nsh/desktop";
 
 function App() {
   return (
@@ -66,12 +67,16 @@ function App() {
   );
 }
 
-mount(App);
+mount(() => (
+  <Window id="main">
+    <App />
+  </Window>
+));
 ```
 
 ## Window size and responsive layout
 
-`window()` (TSX: `windowSize()`) is the size of the surface NSH renders into: the screen on a phone, the window on an iPad in split view or on a Mac, the host view when NSH is embedded. Use it to change the layout, not only sizes:
+`window()` (TSX: `windowSize()`) is the size of the surface NSH renders into: the screen on a phone, the window on an iPad in split view, the host view when NSH is embedded. On the desktops the app host is invisible, so this is the host surface's size, not the calling window's; read a window's own `state()?.contentBounds` and `state()?.scaleFactor` for layout inside it. Use it to change the layout, not only sizes:
 
 ```rust tabs
 use nsh_core::prelude::*;
@@ -378,7 +383,7 @@ effect(() => {
 });
 ```
 
-Use `background` to pause work, and save what the user changes as they change it: the system may suspend an app seconds after it moves to the background, before an effect that reads the change has run. An app shown inside a native app follows that app's state, and where an app has several windows (an iPad, a desktop) a view follows the window it is in. Standalone apps and views embedded in AppKit and Win32 apps are in the `background` too on macOS and Windows while the screen is locked or turned off and while their window is on another desktop (a Space, a virtual desktop). On Windows, an app moves to `background` when the user signs out, Windows shuts down or restarts, or an installer closes it, and its handlers run before the session ends; then the app quits ([`Application.on("quit")`](../modules/nsh-desktop.md#quitting)). In tests, `app.setLifecycle("background")` of `nsh/test` moves the app there ([Testing](./testing-and-trace.md#steps)).
+Use `background` to pause work, and save what the user changes as they change it: the system may suspend an app seconds after it moves to the background, before an effect that reads the change has run. An app shown inside a native app follows that app's state, and where an app has several windows (an iPad, a desktop) a view follows the window it is in. Standalone apps and views embedded in AppKit and Win32 apps are in the `background` too on macOS and Windows while the screen is locked or turned off and while their window is on another desktop (a Space, a virtual desktop). On Windows, an app moves to `background` when the user signs out, Windows shuts down or restarts, or an installer closes it, and its handlers run before the session ends; then the app quits ([`Application.on("quit")`](../modules/nsh-desktop.md#quitting)). A standalone app on Linux does the same when the user signs out or the system shuts down or restarts, and when it is sent `SIGTERM` (as systemd does to end a session or stop a service). In tests, `app.setLifecycle("background")` of `nsh/test` moves the app there ([Testing](./testing-and-trace.md#steps)).
 
 ## After a sleep
 
@@ -516,7 +521,7 @@ In a terminal ([the terminal backend](./tui.md)), `platform.idiom` is `"terminal
 
 ## The app's data directory
 
-`data_dir()` in Rust, `process.dataDir` in TSX, is the directory the app keeps its own files in, such as a SQLite database: `<data dir>/<app id>`, beside its `storage.json`, on every native platform, Android and iOS included. It is `None` (`null`) where the host keeps no files for the app, such as the web. The directory may not exist yet, so create it before writing.
+`data_dir()` in Rust, `process.dataDir` in TSX, is the directory the app keeps its own files in, such as a SQLite database, beside its `storage.json`, on every native platform, Android and iOS included. By default it is the app's id in the system's directory for apps' data: `~/Library/Application Support/<id>` on macOS, `%APPDATA%\<id>` on Windows, `$XDG_DATA_HOME/<id>` (`~/.local/share/<id>`) on Linux; an app embedded in another keeps it in the embedding app's. A desktop app can name its own with `nsh.json` `dataDir` ([Project structure](./project-structure.md)), and `process.dataDir` and `${dataDir}` follow it. It is `None` (`null`) where the host keeps no files for the app, such as the web. The directory may not exist yet, so create it before writing.
 
 A packaged desktop app writes its log lines to `logs/app.log` there: `log_file()` in Rust, `process.logFile` in TSX
 ([Log files and levels on the desktop](./dev-server-and-debugging.md#log-files-and-levels-on-the-desktop)).
@@ -554,7 +559,7 @@ import { pixelRatio } from "nsh";
 <View style={{ height: 1 / pixelRatio(), backgroundColor: "#d0d7de" }} />
 ```
 
-`pixel_ratio()` and `pixelRatio()` are reactive, so a hairline follows a window moved to a screen with another density.
+`pixel_ratio()` and `pixelRatio()` are reactive. On the desktops they report the host display's scale; a window moved to a screen with another density reports its own scale in `state()?.scaleFactor`.
 
 ## Right to left
 

@@ -17,7 +17,8 @@
 //! view and list around them) at once, a level at a time down to their
 //! leaves, so nothing visible is late. The rest come in later turns,
 //! nearest the viewport first, at most [`PACE_VIEWS`] views or
-//! [`PACE_TIME`] a turn; the core asks for a display frame while some
+//! [`PACE_TIME`] a turn, in the turns of display frames only
+//! ([`Core::hold_paced_mounts`]); the core asks for a display frame while some
 //! wait ([`Core::has_paced_mounts`]). A list's cell that waits has made
 //! none of its views: the list places them with the cell (`update_lists`),
 //! so they are ranked by where they are when the cell is made, not last
@@ -36,8 +37,11 @@
 //!
 //! Nothing waits that may show away from its frame or lays out on its own
 //! ([`Core::never_culled`]: sticky, followers, overlays, screens, modals,
-//! transformed or animated views), nor anything outside scroll views and
-//! lists, whose content shows wherever its frame is.
+//! views scaled, rotated or moved by a value of no known bound), nor
+//! anything outside scroll views and lists, whose content shows wherever
+//! its frame is. A view translated by a bounded value (an entrance's slide,
+//! `animation/reach.rs`) waits like any other, its rectangle widened by
+//! how far it may move.
 
 use std::time::Duration;
 
@@ -92,6 +96,19 @@ impl<M: TextEngine> Core<M> {
         self.pace.in_turn = true;
         self.reset_pace();
         self.reset_list_motion();
+    }
+
+    /// This turn is not a display frame's: waiting views out of sight stay
+    /// waiting, for the next frame's turn (what shows is still made at
+    /// once). Call after [`Core::begin_mount_turn`]. Without it, every
+    /// turn makes a slice of what waits, and the turns between two frames
+    /// (a timer, a message from the main thread) each commit one more.
+    pub fn hold_paced_mounts(&mut self) {
+        // Views waited when the turn began (`reset_pace`: content culling's
+        // flag is cleared by then, for its window to be worked out again).
+        if self.pace.made >= PACE_AFTER {
+            self.pace.paced = PACE_VIEWS;
+        }
     }
 
     /// Whether views wait to be made in a later turn: ask the platform for
@@ -181,9 +198,10 @@ impl<M: TextEngine> Core<M> {
 
     /// How far waiting `key`'s frame is from showing, in points: 0 when it
     /// meets the viewport of every scroll view and list around it, or when
-    /// that cannot be told (it is empty, or a transform or a zoom is
-    /// between it and the viewport), so it is made now; the most when it
-    /// has no frame (not laid out).
+    /// that cannot be told (it is empty, or a zoom or a transform of no
+    /// known reach is between it and the viewport), so it is made now; the
+    /// most when it has no frame (not laid out). A transform whose reach is
+    /// known (`Core::reach_of`) widens its rectangle by as much.
     fn sight(&self, key: Key) -> f32 {
         let node = &self.nodes[key as usize];
         let f = node.frame;
@@ -197,16 +215,20 @@ impl<M: TextEngine> Core<M> {
         if w <= 0.0 || h <= 0.0 {
             return 0.0;
         }
-        let mut r = (x, y, x + w, y + h);
+        // Widened by how far its transform may move it (`Core::reach_of`).
+        let Some((rx, ry)) = self.reach_of(key) else {
+            return 0.0;
+        };
+        let mut r = (x - rx, y - ry, x + w + rx, y + h + ry);
         let mut far = 0.0f32;
         let mut k = node.parent;
         while k != NO_KEY {
             let n = &self.nodes[k as usize];
             let f = n.frame;
+            let moves = self.reach_of(k);
             if !n.created
                 || !(f.origin.x.0.is_finite() && f.origin.y.0.is_finite())
-                || !n.animated.is_empty()
-                || !n.view_style.transform.ops().is_empty()
+                || moves.is_none()
             {
                 // Past the viewports met so far, nothing moves the view
                 // within them.
@@ -236,7 +258,9 @@ impl<M: TextEngine> Core<M> {
                 far = far.max(gap(r, (ox, oy, ox + w, oy + h)));
             }
             let (dx, dy) = (f.origin.x.0 - ox, f.origin.y.0 - oy);
-            r = (r.0 + dx, r.1 + dy, r.2 + dx, r.3 + dy);
+            // Its own transform moves all of it, its viewport included.
+            let (mx, my) = moves.unwrap_or_default();
+            r = (r.0 + dx - mx, r.1 + dy - my, r.2 + dx + mx, r.3 + dy + my);
             if n.is_layout_root() && n.kind != Kind::Cell {
                 break;
             }
@@ -262,12 +286,17 @@ impl<M: TextEngine> Core<M> {
                     continue;
                 };
                 // Made by now, gone, or its parent given up (its parent
-                // holds it back again when it is made).
+                // holds it back again when it is made). Taken out of its
+                // parent, or its parent released, it has none: it waits
+                // again when it is inserted somewhere.
                 if node.id != id
                     || node.created
                     || !node.culled
                     || node.layout.is_none()
-                    || !self.nodes[node.parent as usize].created
+                    || !self
+                        .nodes
+                        .get(node.parent as usize)
+                        .is_some_and(|parent| parent.created)
                     || !self.in_tree(key)
                 {
                     continue;

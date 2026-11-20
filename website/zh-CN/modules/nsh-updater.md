@@ -6,18 +6,19 @@ order: 12.7
 
 # nsh/updater
 
-`nsh/updater` 为打包后的应用检查新版本、下载并替换应用。更新从哪里来由 [`nsh.json` 的 `"updater"`](#nshjson) 决定，调用模块的代码无法指定。每一步都在 Rust 中校验：清单签名、应用 id、版本更新、压缩包的大小和 SHA-256。界面由你自己画，模块负责返回状态和完成工作。从设置来源到发布版本的完整流程见[应用更新](../docs/app-updates.md)。
+`nsh/updater` 为打包后的应用检查新版本、下载并替换应用。更新从哪里来由 [`nsh.json` 的 `"updater"`](#nshjson) 决定，调用模块的代码无法指定。每一步都在 Rust 中校验：清单签名、版本更新、压缩包的大小和 SHA-256。`promptForUpdate()` 用内置的提示询问用户；想自己画界面时，其他函数负责返回状态和完成工作。从设置来源到发布版本的完整流程见[应用更新](../docs/app-updates.md)。
 
 它也能只更新应用的代码：一个更新构建号的[签名包](../docs/signed-packages.md)，应用在所有原生平台（包括 iOS 和 Android）下次启动时运行它（见 [OTA 更新](#ota-更新)）。
 
 ```tsx
-import { checkForUpdate, downloadUpdate, installAndRestart } from "nsh/updater";
+import { promptForUpdate } from "nsh/updater";
+import { checkForUpdate, downloadUpdate, installAndRestart, installOnQuit } from "nsh/updater";
 import { checkForPackage, downloadPackage, restartToPackage, runningPackage, shellInfo } from "nsh/updater";
 ```
 
 这个模块在所有平台上都可以导入：
 
-| 平台 | `checkForUpdate` | `downloadUpdate`、`installAndRestart` | 包 |
+| 平台 | `checkForUpdate` | `downloadUpdate`、`installAndRestart`、`installOnQuit` | 包 |
 | --- | --- | --- | --- |
 | macOS、Windows、Linux（打包后） | 检查来源 | 下载并替换应用 | 检查、下载，`restartToPackage` 重启进入新包 |
 | iOS、Android | 检查来源；`url` 是应用商店链接（`nsh update-manifest --link`） | 拒绝：引导用户打开 `url` | 检查并下载；包在下次启动时运行 |
@@ -25,29 +26,73 @@ import { checkForPackage, downloadPackage, restartToPackage, runningPackage, she
 
 它不需要任何能力声明，`capabilities.network` 对它不生效，因为应用代码无法决定这些请求发往哪里。请求走平台自己的网络栈，和 `fetch` 一样。
 
+## promptForUpdate
+
+```ts
+function promptForUpdate(options?: UpdatePromptOptions | null): Promise<void>;
+
+interface UpdatePromptOptions {
+  channel?: string | null;
+  locale?: string | null;
+  quiet?: boolean | null;
+}
+```
+
+像 [`checkForUpdate`](#checkforupdate) 一样检查新版本（`channel` 和 `locale` 与它的选项相同），然后用 NSH 内置的提示询问用户，就像 macOS 应用的 Sparkle：新版本、更新说明、「Skip This Version」「Remind Me Later」和「Install Update」，接着是下载进度和「Install and Relaunch」或「Install on Quit」。桌面上它是一个独立的小窗口；iOS 和 Android 上 `canInstall` 为 false，用系统提示框，「Update」打开更新的 `url`。样式固定。
+
+提示把用户选择的「跳过这个版本」和「以后自动下载并安装更新」保存在应用的数据目录。传 `quiet: true`（启动时或后台检查）时，已是最新版本、检查失败或用户跳过了这个版本都不显示任何东西；用户选择自动更新后，更新会在后台下载，并在应用退出时安装，不再询问。不传时（「检查更新…」菜单项），用户也会看到已是最新版本或检查失败的提示。提示显示后或没有需要显示的内容时 resolve，从不 reject。
+
+```tsx
+promptForUpdate({ quiet: true }); // 启动时
+<Button onPress={() => promptForUpdate()}>Check for Updates…</Button>;
+```
+
+提示文字为英文。应用名称来自 `nsh.json` 的 `"name"`。
+
 ## checkForUpdate
 
 ```ts
-function checkForUpdate(): Promise<AppUpdate | null>;
+function checkForUpdate(options?: UpdateCheckOptions | null): Promise<AppUpdate | null>;
+
+interface UpdateCheckOptions {
+  channel?: string | null;
+  locale?: string | null;
+}
 
 interface AppUpdate {
   version: string;
   notes?: string | null;
   url: string;
   canInstall: boolean;
+  shell: boolean;
 }
 ```
 
-从 `nsh.json` 中的来源获取清单，返回其中描述的新版本；应用已是最新、没有 `"updater"`，或运行在不更新的环境（Web、`nsh run`）时返回 `null`。正在运行该版本或更高版本的[包](#checkforpackage)时也算最新：应用本身的版本仍是安装时的版本，但代码已经是该版本的。
+从 `nsh.json` 中的来源获取清单，返回其中描述的新版本；应用已是最新、没有 `"updater"`，或运行在不更新的环境（Web、`nsh run`）时返回 `null`。比较的是已安装应用自身的版本，即安装时的版本。正在运行该版本或更高版本的[包](#checkforpackage)时仍会返回更新，`shell` 为 true：代码已经是该版本的，只有已安装的应用（运行时和原生外壳）落后。
 
 | 字段 | 含义 |
 | --- | --- |
 | `version` | 新版本号，semver |
-| `notes` | 更新说明，即清单的 `--notes` 文件内容 |
+| `notes` | 更新说明，即清单的 `--notes` 文件内容；传了 `locale` 且清单有该语言（或其基础语言，如 `zh-TW` 的 `zh`）时为该语言的说明，只下载这一个文件 |
 | `url` | 用户手动获取的地址：压缩包，或 iOS、Android 上的商店页面。`canInstall` 为 false 时交给 [`openUrl`](./nsh.md#openurl) |
-| `canInstall` | 本次运行中 `downloadUpdate` 和 `installAndRestart` 是否可用：装在用户可写位置的桌面打包应用为 true。iOS、Android 上为 false，装在只有系统可写的目录（系统包）时也为 false |
+| `canInstall` | 本次运行中 `downloadUpdate`、`installAndRestart` 和 `installOnQuit` 是否可用：装在用户可写位置的桌面打包应用为 true。iOS、Android 上为 false，装在只有系统可写的目录（系统包）时也为 false |
+| `shell` | 是否只有已安装的应用落后：本次运行的[包](#checkforpackage)已是该版本或更高，更新带来的是更新的运行时和原生外壳，而不是新代码。用包更新的应用可以把它作为更安静的可选步骤提供 |
 
-来源无法访问或清单不可接受时会 reject：设置了 `publicKey` 但签名错误或缺失、清单属于其他应用、URL 不是 HTTPS。版本相同或更旧的清单不算更新，因此过期的清单无法让应用降级。
+来源无法访问或清单不可接受时会 reject：设置了 `publicKey` 但签名错误或缺失、URL 不是 HTTPS。版本相同或更旧的清单不算更新，因此过期的清单无法让应用降级。
+
+`channel` 改查 `nsh.json` 声明的某个[频道](#频道)，而不是默认来源。它只能是名字，不能是地址：包里没有声明的名字在发出任何请求之前就会 reject。`downloadUpdate`、`installAndRestart` 和 `installOnQuit` 使用上一次检查找到的结果，不管它读的是哪个来源。
+
+`locale` 是应用显示的语言，BCP 47 标签，例如 `zh-TW`，可以和系统语言不同。清单里有该语言（`nsh update-manifest --notes zh-TW=<文件>`）或其基础语言（`zh`）的说明时，`notes` 就是它：只下载这一个文件，并按签名清单里的 SHA-256 校验。否则，或者这个文件取不到时，`notes` 是清单的默认说明。`checkForPackage` 也接受 `locale`。
+
+### 频道
+
+想让自愿参加的用户提前拿到新版本的应用，在 `nsh.json` 里再声明一份清单（`"channels": { "beta": "<url>" }`），每次检查时传入用户的选择：
+
+```tsx
+const update = await checkForUpdate(wantsBeta() ? { channel: "beta" } : undefined);
+```
+
+每个频道和默认来源按同样的规则检查：同一个 `publicKey`，只给更新的版本。所以离开频道不会降级：装着 `1.3.0-beta.2` 的应用改查默认来源后，拿到的是 `1.3.0`，不是 `1.2.0`。每个频道的清单照常用 `nsh update-manifest` 生成；频道里压缩包的相对 URL 按它自己的清单所在位置解析。
 
 ## downloadUpdate
 
@@ -60,7 +105,7 @@ interface UpdateProgress {
 }
 ```
 
-把上一次 `checkForUpdate` 找到的更新压缩包下载到应用的数据目录，收到数据时调用 `onProgress`（服务器未给出大小时没有 `total`），然后按清单校验大小和 SHA-256。没有找到更新或 `canInstall` 为 false 时以 `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` reject；下载失败或校验不符时也会 reject。
+把上一次 `checkForUpdate` 找到的更新压缩包下载到应用的数据目录，收到数据时调用 `onProgress`（服务器未给出大小时没有 `total`），然后按清单校验大小和 SHA-256。下载中途中断后会按资源保留分片文件，下次调用时在服务器支持的情况下通过 HTTP `Range` 请求断点续传；服务器忽略 `Range` 或资源已变更时则从头下载。没有找到更新或 `canInstall` 为 false 时以 `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` reject；下载失败或校验不符时也会 reject。
 
 ```tsx
 const progress = signal(0);
@@ -73,9 +118,24 @@ await downloadUpdate(({ received, total }) => progress.set(total ? received / to
 function installAndRestart(): Promise<void>;
 ```
 
-把下载好的压缩包解压到应用旁边，校验新应用（id、可执行文件，macOS 上还有代码签名），替换进去，然后像 `Application.restart()` 一样重启应用：当前进程像用户退出时那样退出，进程结束后新版本启动。Promise 只在失败时才会结束，失败时已安装的应用保持原样：没有下载过更新或应用无法替换时 reject。
+把下载好的压缩包解压到应用旁边，校验新应用（是一个可运行的应用，macOS 上还有代码签名；id 和名称可以改变），替换进去，然后像 `Application.restart()` 一样重启应用：当前进程像用户退出时那样退出，进程结束后新版本启动。Promise 只在失败时才会结束，失败时已安装的应用保持原样：没有下载过更新或应用无法替换时 reject。
 
 Linux 和 macOS 上整个目录或 `.app` 一起替换，保留用户给它起的名字；Windows 上逐个文件替换，有一个失败就全部恢复。
+
+## installOnQuit
+
+```ts
+function installOnQuit(): Promise<void>;
+```
+
+在应用退出时用下载好的更新替换应用，不重新启动：用户下次打开的就是新版本。用于和「安装并重启」并列的「退出时安装」按钮。压缩包现在就解压到应用旁边，并像 `installAndRestart` 那样校验，更新就绪后 Promise resolve；退出时只是把它移到位。没有下载过更新时 reject，`canInstall` 为 false 时以 `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` reject，更新被拒绝时也 reject，应用保持原样。
+
+再次调用会替换等待中的更新（下载了更新的版本后再调一次），调用 `installAndRestart` 则改为立即安装。只有应用正常退出时才会安装，包括为重启而退出（`Application.restart()`，随后启动的就是新版本）；崩溃或被强制结束时不会安装，下一次 `checkForUpdate` 会再次提供这个更新。如果退出时移到位失败（比如用户期间移动了应用），应用保持原样并照常退出，失败写入日志。
+
+```tsx
+await downloadUpdate();
+await installOnQuit(); // 应用继续运行；下次打开时是新版本
+```
 
 ## OTA 更新
 
@@ -84,7 +144,7 @@ OTA（over-the-air，空中下发）更新把打包应用的 TSX 作为签名包
 ### checkForPackage
 
 ```ts
-function checkForPackage(): Promise<PackageUpdate | null>;
+function checkForPackage(options?: { locale?: string | null }): Promise<PackageUpdate | null>;
 
 interface PackageUpdate {
   version: string;
@@ -102,7 +162,7 @@ interface PackageUpdate {
 function downloadPackage(onProgress?: ((progress: UpdateProgress) => void) | null): Promise<void>;
 ```
 
-下载上一次 `checkForPackage` 找到的包，按清单核对大小和 SHA-256，并按应用下次启动时的方式验证它：由某个根密钥认证的发布密钥签名、属于本应用、构建号比当前运行的以及之前运行过的都新、适用于当前运行时。之后它在应用的数据目录中等待下次启动。上次检查没有找到包时以 `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` 拒绝；下载失败或包被拒绝时以说明原因的错误（`package refused: …`）拒绝，且不留下任何文件。
+下载上一次 `checkForPackage` 找到的包，按清单核对大小和 SHA-256，并按应用下次启动时的方式验证它：由某个根密钥认证的发布密钥签名、属于本应用、构建号比当前运行的以及之前运行过的都新、适用于当前运行时。之后它在应用的数据目录中等待下次启动。下载中途中断后会按包保留分片文件，下次调用时在服务器支持的情况下通过 HTTP `Range` 请求断点续传；服务器忽略 `Range` 或包已变更时则从头下载。上次检查没有找到包时以 `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` 拒绝；下载失败或包被拒绝时以说明原因的错误（`package refused: …`）拒绝，被拒绝的包不会留下任何文件。
 
 ### restartToPackage
 
@@ -193,7 +253,7 @@ export const install = () =>
 
 ## nsh.json
 
-`"updater"` 指定一个来源：`github`，即最新 GitHub Release 中带有 `latest.json` 的 `owner/repo`；或 `url`，即自己服务器上的清单，此时必须配 `publicKey`。`publicKey` 是 `nsh keygen` 生成的 `.pub` 文件内容；配了它，未签名的清单会被拒绝。
+`"updater"` 指定一个来源：`github`，即最新 GitHub Release 中带有 `latest.json` 的 `owner/repo`；或 `url`，即自己服务器上的清单，此时必须配 `publicKey`。`publicKey` 是 `nsh keygen` 生成的 `.pub` 文件内容；配了它，未签名的清单会被拒绝。`channels` 声明应用代码可以[按名字选择](#频道)的其他清单。
 
 ```json
 {
@@ -207,11 +267,20 @@ export const install = () =>
 | --- | --- | --- |
 | `github` | string | `owner/repo`：清单是其最新 Release 的附件 `latest.json`，跳过 draft 和 prerelease |
 | `url` | string | 自己服务器上清单的 HTTPS 地址；压缩包的相对地址相对它解析 |
-| `publicKey` | string | 给清单签名（`latest.json.sig`）的 Ed25519 公钥。使用 `url` 时必填 |
+| `channels` | object | 频道名（字母、数字、`-`、`_`、`.`）到它的清单 HTTPS URL，供 `checkForUpdate({ channel })` 使用。需要 `publicKey` |
+| `publicKey` | string | 给清单签名（`latest.json.sig`）的 Ed25519 公钥。使用 `url` 或 `channels` 时必填 |
 | `packages.roots` | string[] | 根公钥（`nsh keygen` 的 `root.pub`），由它们认证的发布密钥为应用的 [OTA 包](#ota-更新)签名。没有它时应用不运行任何包 |
 
 `nsh package` 会校验这些键，并把它们连同应用的 `build` 放进包里，所以来源在构建应用时就已确定。`version` 必须是 semver。`nsh update-manifest` 为一个版本的压缩包和包生成 `latest.json` 和签名（[CLI](../docs/cli.md#nsh-update-manifest)）。
 
 ## Rust
 
-Rust 应用（`nsh.json` 的 `"root"`）直接使用 `nsh-updater` crate，并自带 HTTP 客户端：`Config::check` 校验清单，`Download` 校验压缩包，`Installation::install` 替换应用，`nsh_core::element::desktop::restart()` 启动新版本（[应用更新](../docs/app-updates.md#rust-应用)）。
+Rust 应用（`nsh.json` 的 `"root"`）用 `nsh_core::runtime::prompt_for_update` 显示同样的提示，作为任务运行：
+
+```rust
+use nsh_core::runtime::{UpdatePromptOptions, prompt_for_update};
+
+spawn(prompt_for_update(UpdatePromptOptions::default().quiet(true)));
+```
+
+自己实现流程时，直接使用 `nsh-updater` crate，并自带 HTTP 客户端：`Config::check` 校验清单，`Download` 校验压缩包，`Installation::install` 替换应用，`nsh_core::element::desktop::restart()` 启动新版本（[应用更新](../docs/app-updates.md#rust-应用)）。

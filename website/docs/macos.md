@@ -165,7 +165,7 @@ tooltip) and opens its window from there:
 
 ```tsx
 import { mount } from "nsh";
-import { currentWindow, Tray } from "nsh/desktop";
+import { currentWindow, Tray, Window } from "nsh/desktop";
 import icon from "./tray.svg";
 
 function App() {
@@ -177,7 +177,11 @@ function App() {
   return <Inbox />;
 }
 
-mount(App);
+mount(() => (
+  <Window id="main">
+    <App />
+  </Window>
+));
 ```
 
 A menu bar app often offers to open at login: when the user turns that on, `Application.setLaunchAtLogin(true)` registers the app
@@ -293,6 +297,7 @@ The environment is a desktop's: the safe area and the keyboard height are 0, `id
 [Device and environment](./device-and-environment.md).
 
 Input is a desktop's: the mouse, the trackpad (scrolling with momentum, pinch and rotation) and the keyboard.
+Trackpad tap-to-click briefly shows the app’s `active:` feedback even when the press and release arrive together; press callbacks run at release. Reduced motion keeps immediate visual release.
 A zoomable scroll view zooms with a trackpad pinch or Control + wheel around the pointer, and scrolls both ways while
 zoomed.
 Selectable text is selected by dragging, double- and triple-clicking, and copied with Cmd+C. Escape, Option+Left,
@@ -332,6 +337,10 @@ press action and their row role, and labels and text children remain available t
 
 The app's own shortcuts ([`keymap`](../modules/nsh.md#keymap)) come before these, except activation keys addressed to a focused pressable view, Quit, Hide,
 Minimize and Full Screen, which cannot be bound.
+
+While an input method is composing, its input keeps the keys before app shortcuts are matched, including
+`when: "always"` bindings. This also covers hosted native inputs implementing `NSTextInputClient`.
+Shortcuts resume once the composition ends.
 
 Shortcuts work with any keyboard layout (on a Cyrillic or Greek one, Cmd+C is the key that types C on a US layout).
 A return that commits an input method's composition (Chinese, Japanese, ...) never submits. `onKeyPress` reports

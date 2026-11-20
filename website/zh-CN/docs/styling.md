@@ -347,6 +347,12 @@ tint.set(Some(AdaptiveColor::rgb(0x5080ff, 0x5080ff)));
 <View macos={{ backdrop: { material: "hudWindow", blending: "behindWindow" } }} style={{ height: 64 }} />
 ```
 
+在 Windows 11 及更高版本上，`windows={{ backdrop: { material: "blur" } }}` 用系统对窗口背后内容的模糊填充视图的边框盒（在圆角之内），位于视图自身的背景、边框和内容之下；半透明背景会为它着色。与 `"behindWindow"` 一样，它只在透明窗口中显示。在不透明窗口中、较早的 Windows 上，或系统无法创建模糊时，视图下方不绘制任何内容，视图其余部分照常绘制。外观由系统决定；窗口不活动时，它仍跟随窗口背后的内容变化。Rust 使用 `.windows_backdrop(Some(WindowsBackdrop::default()))`；`None`（默认）不绘制。窗口显示这样的视图时，自带窗口的原生组件（见[原生组件](./native-components.md)）位于 NSH 内容之下，而不是之上。显示这样视图的窗口每一帧都完整重绘；模糊按其祖先裁剪区域的外接矩形裁剪（可能露出祖先圆角之外）；位于 `filter`、`mixBlendMode` 或 3D 变换之内的视图不显示模糊。
+
+```tsx
+<View windows={{ backdrop: { material: "blur" } }} style={{ height: 64, borderRadius: 12, backgroundColor: "rgba(255, 255, 255, 0.4)" }} />
+```
+
 ### 渐进式模糊
 
 沿某条边逐渐增强的模糊（如顶栏下方、图片说明文字背后）由多层 `backdropFilter` 组成：每层比上一层更强，并用 `maskImage` 往后渐显。五层、半径逐层翻倍即可看不出分层：
@@ -376,6 +382,8 @@ function ProgressiveBlur(props: { radius: number; style: ViewStyle }) {
   );
 }
 ```
+
+在 Rust 中，用 `.mask_linear(deg(90.0), [transparent_black(), black(), transparent_black()])` 让两侧渐隐，`.mask_radial([black(), transparent_black()])` 从中心径向渐隐，`.mask_none()` 清除遮罩。角度和色标向量接受信号或闭包；空色标向量清除遮罩。位置使用 `(color, percentage(0.2))` 或 `(color, px(12.0))`。
 
 带遮罩的 `backdropFilter` 只绘制模糊本身，不带系统材质的色调，半径也是精确的，iOS 和 macOS 同样如此。每一层在每帧都要模糊窗口内容，所以层数要少、面积要小。Linux 和 GPUI 不绘制 `backdropFilter`，如果上面的文字必须清晰可读，请给这块区域加上渐隐的 `backgroundImage`。
 
@@ -458,7 +466,20 @@ view()
 | `transitionProperty` | 要动画的属性：`"all"`，或用逗号分隔的名称：颜色（`"colors"`、`"backgroundColor"`、`"borderColor"` 等）、`"opacity"`、`"transform"`（所有变换属性）、`"boxShadow"`、`"borderRadius"` / `"borderWidth"` | `.transition()`、`.transition_all()`、`.transition_colors()`、`.transition_opacity()`、`.transition_transform()`、`.transition_shadow()` |
 | `transitionDuration` | `300`、`"300ms"`、`"0.3s"` | `.duration(300.0)` |
 | `transitionDelay` | 同时长 | `.delay(100.0)` |
-| `transitionTimingFunction` | `"linear"`、`"ease"`、`"ease-in"`、`"ease-out"`、`"ease-in-out"`、`"cubic-bezier(x1, y1, x2, y2)"` | `.ease_linear()`、`.ease_in()`、`.ease_out()`、`.ease_in_out()`、`.ease_bezier(x1, y1, x2, y2)` |
+| `transitionTimingFunction` | `"linear"`、`"ease"`、`"ease-in"`、`"ease-out"`、`"ease-in-out"`、`"cubic-bezier(x1, y1, x2, y2)"`、`"spring(stiffness, damping)"`、`"spring(stiffness, damping, mass)"` | `.ease_linear()`、`.ease_in()`、`.ease_out()`、`.ease_in_out()`、`.ease_bezier(x1, y1, x2, y2)`、`.ease_spring(Spring { .. })` |
+
+`y` 超出 0..1 的 `cubic-bezier()` 会越过目标再回来，与 CSS 一致（`"cubic-bezier(0.3, 1.25, 0.6, 1)"`）。`spring()` 则让过渡按弹簧的物理运动：刚度、阻尼（系数，不是阻尼比）和质量（省略时为 1），从静止开始。弹簧自己决定时长，持续到它稳定为止，因此不使用 `transitionDuration`；`"spring(620, 36)"` 越过目标约 4%，约 380 ms 稳定。对应的类是 `ease-spring-[620,36]`（带质量时为 `ease-spring-[620,36,1]`），弹出层的离开同样会等它的弹簧播放完毕。
+
+```rust tabs
+view()
+    .transition_transform()
+    .ease_spring(Spring { stiffness: 620.0, damping: 36.0, ..Spring::default() })
+    .scale(move || if open.get() { 1.0 } else { 0.95 })
+```
+
+```tsx tabs
+<View class="transition-transform ease-spring-[620,36]" style={{ scale: open() ? 1 : 0.95 }} />
+```
 
 尺寸和位置属于布局而不是样式，不会产生过渡；要为布局变化做动画，使用 `LayoutAnimation`，或用原生动画驱动数值（[动画](./animation.md)）。
 
@@ -507,6 +528,7 @@ view()
 | `textAlignVertical` | | 文字比 `<Text>` 的框矮时的位置：`"top"`（默认）、`"center"` 或 `"bottom"` |
 | `textAlign: "auto"` | | 文字的自然一侧，由其方向决定（默认） |
 | `selectedStyle` | `selected:` | `accessibilityState.selected` 为 `true` 时的样式（选中的 `Button`、标签页） |
+| `transitionTimingFunction: "spring(…)"` | `ease-spring-[…]` | 让过渡按弹簧的刚度、阻尼和质量运动，持续到它稳定为止（[过渡](#过渡)） |
 | | `ios:`、`android:`、`web:` | 只在某个平台生效的类（`ios:pt-2`） |
 
 会变化的值在 CSS 只接受字符串的地方也接受数字：`transform` 可以写成步骤列表，`translate` 和 `scale` 写成 `[x, y]`，`boxShadow` 和 `textShadow` 写成各层。

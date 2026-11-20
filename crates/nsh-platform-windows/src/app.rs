@@ -169,17 +169,17 @@ pub struct AppOptions {
     /// release runner run apps on their own, with none
     /// ([`Limits::standalone`]). See [`AppView::set_limits`].
     pub limits: Limits,
-    /// Where the apps it runs keep their data, each in `<dir>/<app id>`
-    /// (`nsh.json` `"id"`, which travels with the bundle): `None` uses the
-    /// system's data directory ([`nsh_engine::data_dir`]); an app that
-    /// embeds nsh gives its own (its data directory + `/nsh`, say).
+    /// The app's own data directory, used as it is
+    /// ([`nsh_engine::EngineConfig::data_dir`]): the release runner's
+    /// `nsh.json` `"dataDir"`, the development host's `--data-dir`. `None`:
+    /// the one under its id in the system's directory for apps' data.
     pub data_dir: Option<PathBuf>,
     /// Where the apps it runs keep their caches (the images they
     /// downloaded) and how much each keeps: by default the system's cache
     /// directory, each app's in `<dir>/<app id>`. See [`AppView::set_cache`].
     pub cache: nsh_engine::CacheOptions,
     /// The apps' storage (`nsh/storage`), overriding the `storage.json` in
-    /// their directory of [`data_dir`](Self::data_dir).
+    /// their data directory.
     pub storage: Option<Arc<dyn nsh_engine::StorageBackend>>,
     /// The app this view runs owns the process's notifications: the process
     /// takes [`app_id`](Self::app_id) as its AppUserModelID (also what the
@@ -409,16 +409,7 @@ impl AppView {
                 launch.default_mode.unwrap_or(WindowMode::Normal)
             }
         };
-        // SAFETY: a plain query.
-        let visible =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() };
-        if visible {
-            crate::window_state::set_mode(hwnd, mode);
-        } else {
-            self.surface
-                .main_opening_mode
-                .set(Some(mode).filter(|m| *m != WindowMode::Normal));
-        }
+        crate::window_state::set_mode(hwnd, mode);
     }
 
     /// The channel with the apps this view runs (`nsh/host`;
@@ -475,7 +466,8 @@ impl AppView {
             limits: options.limits,
             ui_sets: ui_sets(),
             runtime: None,
-            data_dir: options.data_dir.clone().or_else(nsh_engine::data_dir),
+            support_dir: nsh_engine::support_dir(),
+            data_dir: options.data_dir.clone(),
             cache: options.cache.clone(),
             storage: options.storage.clone(),
             clock: Default::default(),
@@ -743,7 +735,8 @@ fn run_on_this_thread(source: AppSource, options: AppOptions) -> std::process::E
     let kept = match app {
         Some(app) if launch.restore_bounds => {
             let mut config = EngineConfig::new(app);
-            config.data_dir = options.data_dir.clone().or_else(nsh_engine::data_dir);
+            config.support_dir = nsh_engine::support_dir();
+            config.data_dir = options.data_dir.clone();
             config.storage = options.storage.clone();
             config.main_window_placement(&crate::window_state::displays())
         }
@@ -768,14 +761,9 @@ fn run_on_this_thread(source: AppSource, options: AppOptions) -> std::process::E
     crate::linking::attach(view.surface());
     install_shortcuts(&view);
     view.place_main_window(&launch, kept);
-    // nsh.json `window.defaultVisible: false`: the window is made and the
-    // app runs in it, unseen, until it shows it (a tray app).
-    if !held {
-        if launch.visible_at_launch() {
-            view.show();
-        } else {
-            log::info!("the main window starts hidden (nsh.json window.defaultVisible: false)");
-        }
+    // The host never shows: the app opens the windows it declares.
+    if !held && launch.visible_at_launch() {
+        view.show();
     }
     let code = crate::window::run_loop();
     view.stop();
@@ -785,6 +773,9 @@ fn run_on_this_thread(source: AppSource, options: AppOptions) -> std::process::E
     unsafe { windows::Win32::System::Ole::OleUninitialize() };
     STANDALONE.set(false);
     // The new process waits for this one to exit ([`wait_for_replaced_process`]).
+    // An update waiting for the app to quit replaces it now, before a
+    // restart starts it again.
+    nsh_core::restart::run_at_exit();
     if RESTART.take() {
         if cfg!(feature = "dev") {
             // `nsh run` ends with its host and stops the dev server: a host
@@ -810,14 +801,12 @@ pub(crate) fn show_main(surface: &Rc<Surface>, hwnd: HWND) {
     crate::window::set_cloaked(hwnd, true);
     crate::window::fill_background(surface, hwnd);
     surface.paint();
-    crate::window::show(hwnd);
+    crate::window::show_as_it_is(hwnd);
     crate::window::set_cloaked(hwnd, false);
     // The show's own messages worked the state out while the window was
     // still cloaked, and uncloaking sends the window none.
     crate::system::lifecycle_changed(surface);
-    if let Some(mode) = surface.main_opening_mode.take() {
-        crate::window_state::set_mode(hwnd, mode);
-    }
+    crate::window_state::enter_held_mode(hwnd);
 }
 
 /// The content size of `hwnd` in points.
@@ -988,6 +977,73 @@ mod tests {
         );
         crate::shell::apply(surface, hwnd, &backdrop(Backdrop::None));
         assert!(!surface.transparent());
+        // SAFETY: the test's own window.
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    /// A window with its title bar hidden over a backdrop goes without
+    /// DWM's non-client rendering while zoomed, whose own caption buttons
+    /// would show beside the drawn ones, and has it again once restored.
+    #[test]
+    fn a_hidden_title_bar_over_a_backdrop_is_bare_while_zoomed() {
+        use windows::Win32::{
+            Foundation::{LPARAM, WPARAM},
+            Graphics::Dwm::{DWMWA_NCRENDERING_ENABLED, DwmGetWindowAttribute},
+            UI::WindowsAndMessaging::{
+                SIZE_MAXIMIZED, SIZE_RESTORED, SendMessageW, SetWindowLongPtrW, WM_SIZE,
+                WS_MAXIMIZE,
+            },
+        };
+        let view = AppView::make(
+            None,
+            AppOptions {
+                size: (200, 120),
+                skip_taskbar: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+        let hwnd = view.hwnd();
+        let mut attrs = nsh_core::desktop::WindowAttributes::default();
+        let mut title_bar = nsh_core::desktop::TitleBarOptions::default();
+        title_bar.style = nsh_core::desktop::TitleBarStyle::Hidden;
+        attrs.title_bar = Some(title_bar);
+        attrs.backdrop = Some(Backdrop::Window);
+        crate::shell::apply(view.surface(), hwnd, &attrs);
+        let rendering = || {
+            let mut enabled = windows::core::BOOL(0);
+            // SAFETY: a BOOL-sized out value, as the attribute is.
+            unsafe {
+                DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_NCRENDERING_ENABLED,
+                    &mut enabled as *mut windows::core::BOOL as *mut _,
+                    std::mem::size_of::<windows::core::BOOL>() as u32,
+                )
+            }
+            .map(|()| enabled.as_bool())
+            .ok()
+        };
+        let (style, _) = styles(hwnd);
+        // Zoomed as `IsZoomed` reads it and told so, without showing it.
+        let zoom = |zoomed: bool| {
+            let (style, kind) = if zoomed {
+                (style | WS_MAXIMIZE.0, SIZE_MAXIMIZED)
+            } else {
+                (style & !WS_MAXIMIZE.0, SIZE_RESTORED)
+            };
+            // SAFETY: the test's own window, on its thread.
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
+                SendMessageW(hwnd, WM_SIZE, Some(WPARAM(kind as usize)), Some(LPARAM(0)));
+            }
+        };
+        assert_eq!(rendering(), Some(true), "framed");
+        zoom(true);
+        assert_eq!(rendering(), Some(false), "zoomed");
+        zoom(false);
+        assert_eq!(rendering(), Some(true), "restored");
         // SAFETY: the test's own window.
         let _ = unsafe { DestroyWindow(hwnd) };
     }

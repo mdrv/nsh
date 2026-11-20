@@ -55,6 +55,7 @@ pub fn App() -> impl IntoElement {
 ```tsx tabs
 import { mount, Text, View, safeArea } from "nsh";
 import { colorScheme, fontScale, windowSize } from "nsh";
+import { Window } from "nsh/desktop";
 
 function App() {
   return (
@@ -66,12 +67,16 @@ function App() {
   );
 }
 
-mount(App);
+mount(() => (
+  <Window id="main">
+    <App />
+  </Window>
+));
 ```
 
 ## 窗口尺寸与响应式布局
 
-`window()`（TSX：`windowSize()`）是 NSH 渲染目标 surface 的尺寸：手机上是屏幕，iPad 分屏或 Mac 上是窗口，嵌入时是宿主视图。用它来改变布局，而不只是改变尺寸：
+`window()`（TSX：`windowSize()`）是 NSH 渲染目标 surface 的尺寸：手机上是屏幕，iPad 分屏时是窗口，嵌入时是宿主视图。桌面平台上应用宿主不可见，所以这是宿主 surface 的尺寸，不是调用方窗口的尺寸；窗口内的布局应读取它自己的 `state()?.contentBounds` 和 `state()?.scaleFactor`。用它来改变布局，而不只是改变尺寸：
 
 ```rust tabs
 use nsh_core::prelude::*;
@@ -366,7 +371,7 @@ effect(() => {
 });
 ```
 
-用 `background` 暂停工作，并在用户做出更改时就保存它：系统可能在应用进入后台几秒后就将其挂起，早于读取这一变化的副作用运行。显示在原生应用中的应用跟随该应用的状态；应用有多个窗口时（iPad、桌面），视图跟随它所在的窗口。在 macOS 和 Windows 上，屏幕锁定或关闭时、窗口在另一个桌面（Space、虚拟桌面）上时，独立应用以及嵌入 AppKit 和 Win32 应用中的视图也处于 `background`。在 Windows 上，用户注销、Windows 关机或重启、安装程序关闭应用时，应用会进入 `background`，它的处理函数在会话结束前运行；随后应用退出（[`Application.on("quit")`](../modules/nsh-desktop.md#退出)）。在测试中，`nsh/test` 的 `app.setLifecycle("background")` 会把应用移到后台（[测试](./testing-and-trace.md#操作步骤)）。
+用 `background` 暂停工作，并在用户做出更改时就保存它：系统可能在应用进入后台几秒后就将其挂起，早于读取这一变化的副作用运行。显示在原生应用中的应用跟随该应用的状态；应用有多个窗口时（iPad、桌面），视图跟随它所在的窗口。在 macOS 和 Windows 上，屏幕锁定或关闭时、窗口在另一个桌面（Space、虚拟桌面）上时，独立应用以及嵌入 AppKit 和 Win32 应用中的视图也处于 `background`。在 Windows 上，用户注销、Windows 关机或重启、安装程序关闭应用时，应用会进入 `background`，它的处理函数在会话结束前运行；随后应用退出（[`Application.on("quit")`](../modules/nsh-desktop.md#退出)）。Linux 上的独立应用在用户注销、系统关机或重启时，以及收到 `SIGTERM` 时（systemd 结束会话或停止服务时会发送它）也是如此。在测试中，`nsh/test` 的 `app.setLifecycle("background")` 会把应用移到后台（[测试](./testing-and-trace.md#操作步骤)）。
 
 ## 睡眠之后
 
@@ -500,7 +505,7 @@ const hapticsSupported = platform.os === "ios" || (platform.os === "android" && 
 
 ## 应用数据目录
 
-Rust 中的 `data_dir()`，即 TSX 中的 `process.dataDir`，是应用存放自己文件（例如 SQLite 数据库）的目录：`<数据目录>/<应用 id>`，与 `storage.json` 同一目录，在所有原生平台上可用，包括 Android 和 iOS。宿主不为应用保存文件时（例如 Web）为 `None`（`undefined`）。目录可能尚未创建，写入前先创建。
+Rust 中的 `data_dir()`，即 TSX 中的 `process.dataDir`，是应用存放自己文件（例如 SQLite 数据库）的目录，与 `storage.json` 同一目录，在所有原生平台上可用，包括 Android 和 iOS。默认是系统应用数据目录下以应用 id 命名的目录：macOS 为 `~/Library/Application Support/<id>`，Windows 为 `%APPDATA%\<id>`，Linux 为 `$XDG_DATA_HOME/<id>`（`~/.local/share/<id>`）；嵌入到其他应用中时，位于宿主应用的数据目录下。桌面应用可以用 `nsh.json` 的 `dataDir` 指定自己的目录（见[项目结构](./project-structure.md)），`process.dataDir` 和 `${dataDir}` 随之改变。宿主不为应用保存文件时（例如 Web）为 `None`（`undefined`）。目录可能尚未创建，写入前先创建。
 
 打包的桌面应用把日志写到其中的 `logs/app.log`：Rust 中是 `log_file()`，TSX 中是 `process.logFile`
 （[桌面上的日志文件和级别](./dev-server-and-debugging.md#log-files-and-levels-on-the-desktop)）。
@@ -538,7 +543,7 @@ import { pixelRatio } from "nsh";
 <View style={{ height: 1 / pixelRatio(), backgroundColor: "#d0d7de" }} />
 ```
 
-`pixel_ratio()` 和 `pixelRatio()` 都是响应式的，窗口被移到另一块密度不同的屏幕上时，细线会随之调整。
+`pixel_ratio()` 和 `pixelRatio()` 都是响应式的。桌面平台上它们报告宿主显示器的缩放比例；窗口被移到另一块密度不同的屏幕上时，它自己的比例在 `state()?.scaleFactor` 中。
 
 ## 从右到左
 

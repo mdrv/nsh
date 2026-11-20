@@ -76,6 +76,8 @@ mod tabs;
 mod term;
 pub mod terminal;
 pub mod text_view;
+#[cfg(not(target_arch = "wasm32"))]
+mod updater_prompt;
 
 /// `EmojiPicker`'s emoji (`emoji_picker/emoji.tsv`): the native runtimes
 /// embed them; `nsh` publishes them next to a web runtime, which fetches
@@ -128,8 +130,8 @@ pub use crate::{
         accordion_header, accordion_item, accordion_panel, accordion_trigger,
     },
     alert_dialog::{
-        AlertDialog, AlertDialogAction, AlertDialogOptions, AlertDialogPresentation,
-        AlertDialogResult, AlertDialogRole, alert_dialog,
+        AlertDialog, AlertDialogAction, AlertDialogAnswer, AlertDialogInput, AlertDialogOptions,
+        AlertDialogPresentation, AlertDialogResult, AlertDialogRole, alert_dialog,
     },
     avatar::{
         Avatar, AvatarElement, AvatarEvent, AvatarGroup, AvatarGroupElement, AvatarGroupProps,
@@ -180,11 +182,11 @@ pub use crate::{
     hover_card::{HoverCard, HoverCardElement, HoverCardEvent, HoverCardProps, hover_card},
     link::{Link, LinkElement, LinkEvent, LinkOpenWith, LinkProps, link},
     menu::{
-        ContextMenu, ContextMenuElement, ContextMenuProps, Menu, MenuElement, MenuEvent, MenuItem,
-        MenuItemElement, MenuItemEvent, MenuItemProps, MenuList, MenuListElement, MenuListEntry,
-        MenuListProps, MenuProps, MenuSeparator, MenuSeparatorElement, MenuSeparatorProps, Submenu,
-        SubmenuElement, SubmenuEvent, SubmenuProps, context_menu, menu, menu_item, menu_list,
-        menu_separator, submenu,
+        ContextMenu, ContextMenuElement, ContextMenuEvents, ContextMenuProps, Menu, MenuElement,
+        MenuEvent, MenuItem, MenuItemElement, MenuItemEvent, MenuItemProps, MenuList,
+        MenuListElement, MenuListEntry, MenuListProps, MenuProps, MenuSeparator,
+        MenuSeparatorElement, MenuSeparatorProps, Submenu, SubmenuElement, SubmenuEvent,
+        SubmenuProps, context_menu, menu, menu_item, menu_list, menu_separator, submenu,
     },
     menu_button::{
         MenuButton, MenuButtonElement, MenuButtonEvent, MenuButtonItem, MenuButtonProps,
@@ -226,7 +228,7 @@ pub use crate::{
         Select, SelectElement, SelectEntry, SelectEvent, SelectGroup, SelectItem, SelectProps,
         SelectValue, select,
     },
-    sheet::{Sheet, SheetElement, SheetEvent, SheetProps, sheet},
+    sheet::{Sheet, SheetDetent, SheetElement, SheetEvent, SheetProps, sheet},
     slider::{Slider, SliderElement, SliderEvent, SliderProps, SliderScale, SliderValue, slider},
     split_view::{
         ColumnVisibility, SplitView, SplitViewElement, SplitViewEvent, SplitViewProps, split_view,
@@ -513,6 +515,10 @@ pub mod parts {
     /// `TextView`: Markdown and HTML documents.
     pub fn text_view(registry: &mut Registry) {
         registry.register::<TextView>().module::<TextView>();
+        // The window of `promptForUpdate`, which shows the notes in a
+        // `TextView`. Apps on the web do not update.
+        #[cfg(not(target_arch = "wasm32"))]
+        registry.setup(crate::updater_prompt::install);
     }
 
     /// The `Editor`: a code editor.

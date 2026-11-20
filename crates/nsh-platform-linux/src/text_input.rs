@@ -47,6 +47,7 @@ use nsh_core::{
     Points, ResolvedTextStyle, SubmitBehavior, TextAlign,
     geometry::{Point, Size, point, px, size},
     tailwind::state,
+    text_edit::clip_chars,
 };
 
 use crate::{surface::Surface, view::NshView};
@@ -225,6 +226,12 @@ pub(crate) struct InputState {
     pasting: Cell<bool>,
     /// Focus as last reported.
     focused: Cell<bool>,
+    /// A button or finger is down on the editor: `Some(true)` when what
+    /// it does keeps the selection (Shift held, not the primary button).
+    press: Cell<Option<bool>>,
+    /// The press that focused the editor ends by selecting all its text
+    /// (`selectTextOnFocus`), unless it made a selection itself.
+    select_on_release: Cell<bool>,
     /// Selection as last reported (UTF-16).
     selection: Cell<(u32, u32)>,
     /// The caret as last reported, in the view.
@@ -550,6 +557,68 @@ impl Ctx {
             EventKind::Blur
         };
         self.send(kind, || EventPayload::None);
+        input.select_on_release.set(false);
+        if !focused {
+            // A release the editor never saw (a menu took the grab).
+            input.press.set(None);
+        } else if input.config.borrow().select_text_on_focus {
+            match input.press.get() {
+                // A click focuses before GTK places the caret or selects
+                // where it pressed; its release decides.
+                Some(keeps) => input.select_on_release.set(!keeps),
+                // Keyboard, `focus()` and `autoFocus`: whatever GTK's
+                // `gtk-entry-select-on-focus` did, the whole text.
+                None => {
+                    let editor = input.editor.borrow().clone();
+                    editor.select(0, -1);
+                }
+            }
+        }
+    }
+
+    /// A press or release on the editor (`selectTextOnFocus`).
+    fn pointer(&self, event: &gtk::gdk::Event) {
+        use gtk::gdk::EventType as T;
+        let Some(input) = self.input.upgrade() else {
+            return;
+        };
+        match event.event_type() {
+            // Touches are seen as touches: their emulated buttons would
+            // press twice.
+            T::ButtonPress | T::ButtonRelease if event.is_pointer_emulated() => {}
+            T::ButtonPress | T::TouchBegin => {
+                let primary = event
+                    .downcast_ref::<gtk::gdk::ButtonEvent>()
+                    .is_none_or(|b| b.button() == gtk::gdk::BUTTON_PRIMARY);
+                let shift = event
+                    .modifier_state()
+                    .contains(gtk::gdk::ModifierType::SHIFT_MASK);
+                input.press.set(Some(shift || !primary));
+            }
+            T::ButtonRelease | T::TouchEnd | T::TouchCancel => {
+                input.press.set(None);
+                if !input.select_on_release.take() {
+                    return;
+                }
+                // After GTK's own release and drag end, which may still
+                // move the caret (a press inside an old selection). A drag
+                // that selected keeps its range; a double click's second
+                // press selects for itself afterwards.
+                let weak = self.input.clone();
+                glib::idle_add_local_once(move || {
+                    let Some(input) = weak.upgrade() else { return };
+                    let editor = input.editor.borrow().clone();
+                    let (start, end) = editor.selection();
+                    if input.focused.get()
+                        && start == end
+                        && input.config.borrow().select_text_on_focus
+                    {
+                        editor.select(0, -1);
+                    }
+                });
+            }
+            _ => {}
+        }
     }
 
     /// Return submitted the input (`submitBehavior` `submit` or
@@ -571,15 +640,15 @@ impl Ctx {
         }
     }
 
-    /// The part of `text` an insertion into `current` may add
-    /// (`maxLength`).
-    fn allowed<'a>(&self, current: impl FnOnce() -> String, text: &'a str) -> &'a str {
+    /// The part of `text` an insertion into a text of `current` characters
+    /// may add (`maxLength`, [`clip_chars`]).
+    fn allowed<'a>(&self, current: impl FnOnce() -> usize, text: &'a str) -> &'a str {
         let max = self
             .input
             .upgrade()
             .and_then(|input| input.config.borrow().max_length);
         match max {
-            Some(max) => clip_utf16(text, (max as usize).saturating_sub(utf16_len(&current()))),
+            Some(max) => clip_chars(text, (max as usize).saturating_sub(current())),
             None => text,
         }
     }
@@ -699,6 +768,8 @@ pub(crate) fn create(surface: &Rc<Surface>, view: &NshView) {
         pasting: Cell::new(false),
         pending: Cell::new(false),
         focused: Cell::new(false),
+        press: Cell::new(None),
+        select_on_release: Cell::new(false),
         selection: Cell::new((0, 0)),
         caret: Cell::new(Bounds::default()),
         composition: RefCell::new(None),
@@ -748,7 +819,7 @@ fn attach(cx: &Ctx, editor: &Editor, input: &InputState) {
             let c = cx.clone();
             t.connect_insert_text(move |t, text, pos| {
                 let Some(input) = c.user_edit() else { return };
-                let fit = c.allowed(|| t.text().into(), text);
+                let fit = c.allowed(|| usize::from(t.text_length()), text);
                 if !fit.is_empty() {
                     c.inserted(&input, fit);
                 }
@@ -801,10 +872,7 @@ fn attach(cx: &Ctx, editor: &Editor, input: &InputState) {
                     input.lines.borrow_mut().edit(start, end);
                 }
                 let Some(input) = c.user_edit() else { return };
-                let fit = c.allowed(
-                    || b.text(&b.start_iter(), &b.end_iter(), false).into(),
-                    text,
-                );
+                let fit = c.allowed(|| b.char_count().max(0) as usize, text);
                 if !fit.is_empty() {
                     c.inserted(&input, fit);
                 }
@@ -869,6 +937,17 @@ fn attach(cx: &Ctx, editor: &Editor, input: &InputState) {
     // while the window is active.
     let c = cx.clone();
     widget.connect_map(move |w| c.watch_window(w));
+
+    // Whether a focus arrives with a press (`selectTextOnFocus`): seen
+    // before the editor's own gestures, which focus it.
+    let presses = gtk::EventControllerLegacy::new();
+    presses.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let c = cx.clone();
+    presses.connect_event(move |_, event| {
+        c.pointer(event);
+        glib::Propagation::Proceed
+    });
+    widget.add_controller(presses);
 
     // Backspace in an empty input deletes nothing, so no deletion reports
     // it. A return that submits a multiline input is taken here, before the
@@ -1699,11 +1778,6 @@ fn key_of(text: &str) -> &str {
     if text == "\n" { "Enter" } else { text }
 }
 
-/// Length of `s` in UTF-16 units.
-fn utf16_len(s: &str) -> usize {
-    s.chars().map(char::len_utf16).sum()
-}
-
 /// The UTF-16 offset of character `chars` of `s` (clamped to its end).
 fn char_to_utf16(s: &str, chars: usize) -> u32 {
     s.chars().take(chars).map(char::len_utf16).sum::<usize>() as u32
@@ -1720,19 +1794,6 @@ fn utf16_to_char(s: &str, units: u32) -> usize {
         at += c.len_utf16();
     }
     s.chars().count()
-}
-
-/// The longest prefix of `s` that fits in `max` UTF-16 units, cut between
-/// characters.
-fn clip_utf16(s: &str, max: usize) -> &str {
-    let mut units = 0;
-    for (i, c) in s.char_indices() {
-        units += c.len_utf16();
-        if units > max {
-            return &s[..i];
-        }
-    }
-    s
 }
 
 #[cfg(test)]
@@ -1942,7 +2003,6 @@ mod tests {
     #[test]
     fn utf16_offsets() {
         let s = "a😀b";
-        assert_eq!(utf16_len(s), 4);
         assert_eq!(char_to_utf16(s, 0), 0);
         assert_eq!(char_to_utf16(s, 1), 1);
         assert_eq!(char_to_utf16(s, 2), 3);
@@ -1954,17 +2014,6 @@ mod tests {
         assert_eq!(utf16_to_char(s, 3), 2);
         assert_eq!(utf16_to_char(s, 4), 3);
         assert_eq!(utf16_to_char(s, 99), 3);
-    }
-
-    #[test]
-    fn max_length_clipping() {
-        assert_eq!(clip_utf16("hello", 3), "hel");
-        assert_eq!(clip_utf16("hello", 9), "hello");
-        assert_eq!(clip_utf16("hello", 0), "");
-        // A pair is never split.
-        assert_eq!(clip_utf16("a😀", 2), "a");
-        assert_eq!(clip_utf16("a😀", 3), "a😀");
-        assert_eq!(clip_utf16("中文", 1), "中");
     }
 
     #[test]

@@ -276,7 +276,8 @@ pub mod on {
 }
 
 /// The platform a prop is for: everywhere, or inside `ios={{…}}` /
-/// `android={{…}}` / `macos={{…}}` / `desktop={{…}}` / `web={{…}}`.
+/// `android={{…}}` / `macos={{…}}` / `windows={{…}}` / `desktop={{…}}` /
+/// `web={{…}}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     /// Every platform.
@@ -287,6 +288,8 @@ pub enum Platform {
     Android,
     /// `macos={{…}}`.
     Macos,
+    /// `windows={{…}}`.
+    Windows,
     /// `desktop={{…}}` (macOS, Windows, Linux, desktop browsers).
     Desktop,
     /// `web={{…}}`.
@@ -579,7 +582,7 @@ export interface PressEvent {
   /** Position in the root view the view is in (the surface or its modal), as touches' `pageX` / `pageY`. */
   pagePosition: Point;
   modifiers: Modifiers;
-  /** Consecutive clicks at the same place: 1 for a click, 2 for a double click. */
+  /** Consecutive clicks at the same place: 1 for a click, 2 for a double click; 0 when not from a pointer (keyboard Enter / Space or an assistive technology's default action), as the DOM's `detail`. */
   clickCount: number;
 }
 
@@ -768,7 +771,7 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
         EventKind::Wheel,
         on::ALL,
         "(e: WheelEvent) => void",
-        "A mouse wheel or touchpad scrolled over the view (or a view inside it); desktops and the web. The nearest listener hears it. A listener nearer than any scroll view under the pointer takes the wheel: nothing scrolls or zooms natively (a canvas zooms on `e.modifiers.ctrl` and pans otherwise); a scroll view listening, or a view around one, only observes it.",
+        "A mouse wheel or touchpad scrolled over the view (or a view inside it); desktops and the web. The nearest listener hears it. A listener nearer than any scroll view under the pointer takes the wheel: nothing scrolls or zooms natively (a canvas zooms on `e.modifiers.control` and pans otherwise); a scroll view listening, or a view around one, only observes it.",
     ),
     (
         EventKind::Pinch,
@@ -1075,6 +1078,12 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
         "Escape or the Android back button, while this is the top overlay listening to it (it takes the key from the overlays below, the pages and `BackHandler`). Closing is the app's.",
     ),
     (
+        EventKind::DetentChange,
+        on::MODAL,
+        "(e: { detent: SheetDetent }) => void",
+        "The user moved an iOS sheet to another of its `detents` (dragging it, its grabber, a scroll at its edge, a screen reader): set `detent` to it to keep the app's value in step.",
+    ),
+    (
         EventKind::Position,
         on::OVERLAY,
         "(e: OverlayPosition) => void",
@@ -1104,6 +1113,8 @@ pub const INTERNAL_EVENTS: &[EventKind] = &[
     EventKind::Pick,
     EventKind::OpenUrl,
     EventKind::ScreenColor,
+    EventKind::Share,
+    EventKind::AuthSession,
     EventKind::CanvasImage,
     EventKind::FileRequest,
     EventKind::Speech,
@@ -1172,6 +1183,7 @@ pub fn declarations() -> String {
             (Platform::Ios, "IOS", " inside `ios={{…}}`"),
             (Platform::Android, "Android", " inside `android={{…}}`"),
             (Platform::Macos, "MacOS", " inside `macos={{…}}`"),
+            (Platform::Windows, "Windows", " inside `windows={{…}}`"),
             (Platform::Desktop, "Desktop", " inside `desktop={{…}}`"),
             (Platform::Web, "Web", " inside `web={{…}}`"),
         ] {

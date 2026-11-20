@@ -230,8 +230,8 @@ export async function checkForUpdates() {
       await downloadPackage();
       // iOS and Android: nothing to show, the package runs from the next cold start.
       packageReady.set(canRestart);
-      return;
     }
+    // `shell`: the code is current, only the installed app is behind; offer it quietly.
     appUpdate.set(await checkForUpdate());
   } catch (error) {
     console.warn("update check failed:", error); // the next check tries again
@@ -369,7 +369,8 @@ The error starts with `package refused:` and says why:
 | `it is com.example.other, the app is com.example.notes` | The package is another app's |
 | `the package needs runtime 0.5.0 or newer; this runtime is 0.4.0` | Publish for the older runtime, or ship a new app |
 
-Nothing is left behind, and the app keeps running what it ran.
+A refused package leaves nothing behind and the app keeps running what it ran. An interrupted transfer keeps its
+partial file keyed to the package so the next `downloadPackage()` call resumes where it left off.
 
 ### A package does not run at the next start
 

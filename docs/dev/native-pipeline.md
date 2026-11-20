@@ -107,7 +107,8 @@ module:
   lines dropped, the rest joined with a space; whitespace on one line is kept (`{a} {b}` keeps its space).
 - The app's expressions keep their spans, so the source map points at the app.
 - The entry's prologue gives the renderer the app's themes (`setup`: the Tailwind theme and the components' `uiTheme`,
-  the appearance and the status bar's default, `nsh.json` `"statusBar"`, before anything renders). Before any other
+  the appearance and the status bar's default, `nsh.json` `"statusBar"`, before anything renders). The fourth
+  argument to `setup` is the default as a JSON string, or `null` to leave the status bar alone. Before any other
   import, the entry imports `virtual:nsh-app`, whose `setup(null, null, null, null, app)` hands over what `appInfo()`
   reports (`nsh.json`'s id, name, version and build, the package's `--version` and `--build`, and whether the build is
   a development one), so a module reads it at its top level; a runtime that predates the fifth argument ignores it. A font import
@@ -131,7 +132,7 @@ module:
   `ErrorBoundary` is above it, which then shows `fallback(error, reset)`; what fails in the fallback goes to the
   boundary above. A handler's exception goes to the boundary of the owner its node was made under
   (`dom::catch_listener_failure`). Without a boundary nothing changes.
-- Platform-only props (`ios={{…}}`, `android={{…}}`, `macos={{…}}`, `desktop={{…}}`, `web={{…}}`): only the current platform's object
+- Platform-only props (`ios={{…}}`, `android={{…}}`, `macos={{…}}`, `windows={{…}}`, `desktop={{…}}`, `web={{…}}`): only the current platform's object
   is sent, each key as a prop of its own (`platform_props`; the browser runtime's renderer has its own, `platformProps`
   in `nsh-platform-web`'s `browser/dom.js`).
 - The reactive graph and the renderer share one per-context state (`state.rs`).

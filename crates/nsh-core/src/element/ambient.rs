@@ -53,6 +53,9 @@ pub(crate) struct Ambient {
     storage: Option<crate::storage::Store>,
     /// The app's own data directory ([`data_dir`]).
     data_dir: Option<std::path::PathBuf>,
+    /// What `nsh/updater` checks with for Rust code
+    /// ([`crate::runtime::prompt_for_update`]).
+    updater: Option<std::sync::Arc<dyn crate::runtime::UpdaterHost>>,
     /// The displays (desktops), as the platform reports them.
     displays: Option<Signal<Arc<[crate::desktop::Display]>>>,
     /// Whether the performance monitor measures, as the platform reports
@@ -176,6 +179,15 @@ impl super::Runtime {
         with_data(|d| d.ambient.data_dir = dir);
     }
 
+    /// What Rust code checks for updates with ([`updater_host`]).
+    pub(crate) fn set_updater(
+        &self,
+        updater: Option<std::sync::Arc<dyn crate::runtime::UpdaterHost>>,
+    ) {
+        let _entered = self.enter();
+        with_data(|d| d.ambient.updater = updater);
+    }
+
     /// How text is measured (the core's text engine).
     pub(crate) fn set_measure(&self, measure: MeasureFn) {
         let _entered = self.enter();
@@ -289,6 +301,15 @@ pub(super) fn executor() -> Rc<Executor> {
 
 fn act(action: Action) {
     executor().act(action);
+}
+
+/// [`act`] while the engine runs Rust code, else nothing: for cleanups and
+/// handles that may outlive it.
+pub(super) fn act_if_running(action: Action) {
+    if let Some(executor) = super::reactive::try_with_data(|d| d.ambient.executor.clone()).flatten()
+    {
+        executor.act(action);
+    }
 }
 
 // --- The environment ---------------------------------------------------------
@@ -667,6 +688,12 @@ pub fn data_dir() -> Option<std::path::PathBuf> {
     with_data(|d| d.ambient.data_dir.clone())
 }
 
+/// What Rust code checks for updates with: the engine's, `None` where the
+/// app does not update.
+pub(crate) fn updater_host() -> Option<std::sync::Arc<dyn crate::runtime::UpdaterHost>> {
+    with_data(|d| d.ambient.updater.clone())
+}
+
 /// The file the app's log lines are written to (TS: `process.logFile`): a
 /// packaged desktop app's rolling log, `logs/app.log` in the app's data
 /// directory, for a diagnostics report or an "Open logs folder" command
@@ -789,6 +816,72 @@ pub fn can_pick_screen_color() -> bool {
 pub fn pick_screen_color() -> Answer<Option<crate::Hsla>> {
     let (answer, action) = super::services::pick_screen_color();
     act(action);
+    answer
+}
+
+/// Shows the system's share sheet for `request` (TS: `Share.show`;
+/// [`crate::share`]): text, a link or local files the user sends to
+/// another app, a message or mail. To await in a task: the
+/// [`ShareOutcome`](crate::share::ShareOutcome) says whether the user
+/// shared or dismissed it; it fails with the
+/// [`ShareError`](crate::share::ShareError) `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`
+/// where the platform shows no share sheet ([`share_available`]),
+/// `ERR_ACCESS_DENIED` where the app's capabilities do not grant `share`,
+/// and with no code for a request [`ShareRequest::check`](crate::share::ShareRequest::check)
+/// refuses or the platform could not share.
+pub fn share(
+    request: crate::share::ShareRequest,
+) -> Answer<Result<crate::share::ShareOutcome, crate::share::ShareError>> {
+    let (answer, action) = super::services::share(request);
+    act(action);
+    answer
+}
+
+/// Opens a web sign-in session for `request` ([`crate::auth_session`]):
+/// the provider's sign-in page, which redirects to a URL of the request's
+/// callback scheme when the user is done. iOS shows it in an
+/// `ASWebAuthenticationSession`, Android in a Custom Tab, other platforms
+/// in the system browser. To await in a task: the
+/// [`AuthSessionOutcome`](crate::auth_session::AuthSessionOutcome) is the
+/// callback URL, or a cancellation (the user closed the page or came back
+/// without signing in, or a later session replaced it). Outside iOS the
+/// callback comes back as a link of a scheme the app claims (`nsh.json`
+/// `schemes`), which the session takes instead of
+/// [`next_url_scheme_open`]; where neither brings it back, the session
+/// fails with the [`AuthSessionError`](crate::auth_session::AuthSessionError)
+/// `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. It fails with `ERR_ACCESS_DENIED`
+/// where the app's `openUrl` capability does not grant the page's URL, and
+/// with no code for a request
+/// [`AuthSessionRequest::check`](crate::auth_session::AuthSessionRequest::check)
+/// refuses or a page the platform could not show.
+pub fn open_auth_session(
+    request: crate::auth_session::AuthSessionRequest,
+) -> Answer<Result<crate::auth_session::AuthSessionOutcome, crate::auth_session::AuthSessionError>>
+{
+    let (answer, slot) = Answer::new();
+    act(Action::AuthSession(request, slot));
+    answer
+}
+
+/// Closes the app's web sign-in session ([`open_auth_session`]) while it
+/// still waits, as when the app learned the user signed in some other way
+/// (a device code approved on the page, which never redirects back): its
+/// answer resolves now as
+/// [`Cancelled`](crate::auth_session::AuthSessionOutcome::Cancelled), and
+/// iOS and Android take the page off the screen, bringing the app back.
+/// A page in the system browser elsewhere stays open. Only the app's own
+/// session closes; with none waiting, nothing happens.
+pub fn close_auth_session() {
+    act(Action::CloseAuthSession);
+}
+
+/// Whether the system's share sheet shows here (TS: `Share.available()`):
+/// the platform has one (iOS, Android, macOS, browsers with
+/// `navigator.share`) and the app's capabilities grant `share`. To await
+/// in a task.
+pub fn share_available() -> Answer<bool> {
+    let (answer, slot) = Answer::new();
+    act(Action::ShareAvailable(slot));
     answer
 }
 
@@ -1009,8 +1102,8 @@ pub fn next_open_files() -> Answer<Vec<std::path::PathBuf>> {
 /// ...)`): with `nsh.json` `"singleInstance": true`, a second launch on
 /// Windows or Linux hands the running instance its arguments and working
 /// directory and exits; those that came before anything listened first
-/// ([`crate::single_instance`]). The main window is already brought
-/// forward. Never on macOS (Launch Services activates the running app
+/// ([`crate::single_instance`]). The app has already heard `reopen`;
+/// nothing is brought forward implicitly. Never on macOS (Launch Services activates the running app
 /// instead), iOS, Android or the web. To await in a task.
 pub fn next_second_instance() -> Answer<crate::single_instance::SecondInstance> {
     let (answer, slot) = Answer::new();
@@ -1614,6 +1707,8 @@ pub fn component_ref<C: super::Component>() -> super::ComponentRef<C> {
 /// options).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeyOptions {
+    /// Where it fires ([`KeyScope`]).
+    pub scope: KeyScope,
     /// While a text input (or a web view) has the keyboard focus: by
     /// default unless the input uses the keystroke itself.
     pub when: crate::keymap::When,
@@ -1632,6 +1727,19 @@ pub struct KeyOptions {
     /// give way to the control the focus is on (default)
     /// ([`crate::keymap::KeyBinding::for_focus`]).
     pub for_focus: bool,
+}
+
+/// Where a keyboard shortcut fires ([`on_key_with`]; TS: `keymap.bind`'s
+/// `scope`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeyScope {
+    /// The window the shortcut is made in: the window around the component,
+    /// or the window the core finds its component in. A shortcut made in the
+    /// app root (outside every window) is app-wide.
+    #[default]
+    Window,
+    /// Every window: the app's own shortcuts, made in the app root.
+    App,
 }
 
 /// Whether shortcuts follow Apple's conventions here (`mod` is Command):
@@ -1655,10 +1763,12 @@ pub fn try_apple_keys() -> Option<bool> {
 /// lives (TS: `keymap.bind`): `"mod+k"` (`mod` is Command on Apple
 /// platforms, Control elsewhere), `"shift+mod+l"`, `"escape"`, ... (the
 /// keystrokes of `nsh/keymap`). The handler gets the keystroke as written.
-/// It belongs to the window bound in ([`super::desktop::current_window`];
-/// in a component JS places in a window, that window) and fires only for
-/// keys pressed there; a key it does not take goes on as usual. Desktop
-/// platforms fire them; elsewhere they are kept but no key does.
+/// By default it belongs to the window bound in ([`super::desktop::current_window`];
+/// in a component JS places in a window, that window), or to every window
+/// when bound in the app root; [`KeyOptions::scope`] makes the choice
+/// explicit. It fires only for keys pressed there, and a key it does not
+/// take goes on as usual. Desktop platforms fire them; elsewhere they are
+/// kept but no key does.
 ///
 /// # Panics
 ///
@@ -1686,8 +1796,15 @@ pub fn on_key_with(keystroke: &str, options: KeyOptions, handler: impl Fn(&str) 
     let handler: super::keys::KeyHandler = Rc::new(move |k: &str| owner.run(|| handler(k)));
     // It belongs to the window whose tree binds it (`current_window`); with
     // no window around it in Rust (a component JS placed in a `Window`),
-    // the core finds the window its owner's component shows in.
-    let window = super::use_context::<super::desktop::WindowRef>().and_then(|w| w.dialog_root());
+    // the core finds the window its owner's component shows in. An app-wide
+    // binding (`KeyScope::App`) belongs to every window.
+    let (window, app) = match options.scope {
+        KeyScope::App => (None, true),
+        KeyScope::Window => (
+            super::use_context::<super::desktop::WindowRef>().and_then(|w| w.dialog_root()),
+            false,
+        ),
+    };
     let keys = executor().keys.clone();
     let id = keys.borrow_mut().add(
         |id| {
@@ -1698,6 +1815,7 @@ pub fn on_key_with(keystroke: &str, options: KeyOptions, handler: impl Fn(&str) 
         keystroke.into(),
         handler,
         window,
+        app,
         owner,
     );
     let weak = Rc::downgrade(&keys);

@@ -100,6 +100,10 @@ pub(crate) struct Dom {
     /// whose they are (not owned: a row taken out of its `each`, or the
     /// object's finalizer, takes its entry out).
     pending_rows: RefCell<FxHashMap<NodeId, JsValue>>,
+    /// How many `<Window>` scenes the app root declared while it mounted,
+    /// open or not (reset by `mount`): one that starts closed is still the
+    /// app's window, not a plain root.
+    declared_windows: Cell<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +158,22 @@ fn dom<'a>(cx: *mut JsContext) -> &'a Dom {
     // SAFETY: a projection of the state's field; the renderer is only ever
     // reached by shared reference.
     unsafe { &(*crate::state::state(cx)).dom }
+}
+
+/// Starts counting the app root's `<Window>` declarations.
+pub(crate) fn reset_declared_windows(cx: *mut JsContext) {
+    dom(cx).declared_windows.set(0);
+}
+
+/// The app root declared a `<Window>` (open or not).
+pub(crate) fn note_declared_window(cx: *mut JsContext) {
+    let d = dom(cx);
+    d.declared_windows.set(d.declared_windows.get() + 1);
+}
+
+/// How many `<Window>` scenes the app root declared while it mounted.
+pub(crate) fn declared_windows(cx: *mut JsContext) -> u32 {
+    dom(cx).declared_windows.get()
 }
 
 /// The node data an object holds, or null for other values.
@@ -311,6 +331,7 @@ impl Dom {
             dialogs: Cell::new(0),
             lazy_rows: Cell::new(false),
             pending_rows: RefCell::new(FxHashMap::default()),
+            declared_windows: Cell::new(0),
         }
     }
 
@@ -485,7 +506,7 @@ pub(crate) const NODE_METHODS: &[(&str, c_int, &str, &str)] = &[
         1,
         decl!("(transition?: LayoutAnimationAnimation): void"),
         decl!(
-            "Animates the frames this view's change moves in this turn, with `transition` (a phase of `LayoutAnimation.configureNext`: `type`, `duration`, `delay`, `springDamping`, `bezier`; easing in and out over 300 ms without one): its own frame and its subtree's, its siblings' and its ancestors' siblings' that it pushes, and the content of those that it resizes. The rest of the turn (a list that updates, live data) changes at once, as it would without it, and a view that gains or loses children does not carry the change into them. Insertions and removals are not animated. A `LayoutAnimation.configureNext` in the same turn animates every frame instead. E.g. a header that collapses over a list that keeps updating."
+            "Animates the frames this view's change moves in this turn, with `transition` (a phase of `LayoutAnimation.configureNext`: `type`, `duration`, `delay`, `springDamping`, a physical spring's `stiffness` / `damping` / `mass`, `bezier`; easing in and out over 300 ms without one): its own frame and its subtree's, its siblings' and its ancestors' siblings' that it pushes, and the content of those that it resizes. The rest of the turn (a list that updates, live data) changes at once, as it would without it, and a view that gains or loses children does not carry the change into them. Insertions and removals are not animated. A `LayoutAnimation.configureNext` in the same turn animates every frame instead. E.g. a header that collapses over a list that keeps updating."
         ),
     ),
     (
@@ -1462,7 +1483,7 @@ fn set_prop(
         }
         // SAFETY: live node data.
         "component" | "componentSlot" => unsafe { (*p).places = true },
-        "ios" | "android" | "macos" | "desktop" | "web" => {
+        "ios" | "android" | "macos" | "windows" | "desktop" | "web" => {
             return platform_props(cx, node, name, value, prev);
         }
         "contentStyle" | "contentClass" if unsafe { (*p).tag } == Some(Tag::Scroll) => {
@@ -1715,8 +1736,8 @@ pub(crate) fn is_ancestor_of(cx: *mut JsContext, node: NodeId, of: NodeId) -> bo
     is_ancestor(cx, node, of)
 }
 
-/// `ios={{…}}` / `android={{…}}` / `macos={{…}}` / `web={{…}}` /
-/// `desktop={{…}}`: the props of this platform only, each set (or cleared)
+/// `ios={{…}}` / `android={{…}}` / `macos={{…}}` / `windows={{…}}` /
+/// `web={{…}}` / `desktop={{…}}`: the props of this platform only, each set (or cleared)
 /// on its own. Desktop props apply on the desktop OSes and in
 /// desktop-class browsers.
 fn platform_props(
@@ -1771,18 +1792,25 @@ fn platform_props(
             let k = std::ffi::CString::new(key).unwrap_or_default();
             qjs::JS_GetPropertyStr(cx, obj, k.as_ptr())
         };
+        let set = |key: &str, value, old| {
+            if name == "windows" {
+                set_prop(cx, node, &format!("windows.{key}"), value, old)
+            } else {
+                set_prop(cx, node, key, value, old)
+            }
+        };
         let next_keys = keys(value);
         for key in keys(prev) {
             if !next_keys.contains(&key) {
                 let old = get(prev, &key);
-                let r = set_prop(cx, node, &key, UNDEFINED, old);
+                let r = set(&key, UNDEFINED, old);
                 qjs::JS_FreeValue(cx, old);
                 r?;
             }
         }
         for key in next_keys {
             let (v, old) = (get(value, &key), get(prev, &key));
-            let r = set_prop(cx, node, &key, v, old);
+            let r = set(&key, v, old);
             qjs::JS_FreeValue(cx, v);
             qjs::JS_FreeValue(cx, old);
             r?;
@@ -3576,33 +3604,91 @@ pub(crate) unsafe extern "C" fn mount(
         return dispose;
     }
     let root = d.root.get();
+    let windowed = {
+        let env = crate::env::current(cx);
+        env.os.is_desktop() && env.idiom != nsh_core::platform::Idiom::Terminal
+    };
     // SAFETY: reads of the root's children; dups for the dispose function.
     let before: Vec<JsValue> = unsafe { &(*node_ptr(cx, root)).children }
         .iter()
         .map(|&v| unsafe { qjs::JS_DupValue(cx, v) })
         .collect();
-    let (owner, result) = reactive::with_root(cx, || {
-        let props = if unsafe { qjs::JS_IsObject(props) } {
-            unsafe { qjs::JS_DupValue(cx, props) }
-        } else {
-            unsafe { qjs::JS_NewObject(cx) }
-        };
-        let mut args = [props];
-        let out = reactive::untracked_with(cx, || unsafe {
-            qjs::JS_Call(cx, app, UNDEFINED, 1, args.as_mut_ptr())
-        });
-        unsafe { qjs::JS_FreeValue(cx, props) };
-        if unsafe { qjs::JS_IsException(out) } {
-            return Err(out);
+    let (owner, result) = reactive::with_root(
+        cx,
+        || -> Result<Option<crate::window::Implicit>, JsValue> {
+            // A desktop app root is a host: its content is top-level
+            // `<Window>` scenes, each with a root of its own. A released
+            // app that returns views instead is the content of its first
+            // window, as it was the main window's before: the runtime
+            // opens that window (`main`) around it, unless the root turns
+            // out to declare windows of its own.
+            let mut implicit = if windowed {
+                Some(crate::window::begin_implicit(cx)?)
+            } else {
+                None
+            };
+            reset_declared_windows(cx);
+            // The first window's node joins the app root before the root
+            // renders: what the root inserts, and the effects its dynamics
+            // make, go into it rather than the invisible host. A root that
+            // declares windows keeps the node as their home, unopened.
+            let joined = match implicit.as_ref() {
+                Some(implicit) => insert_value(cx, root, implicit.node, None),
+                None => Ok(()),
+            };
+            if let Err(e) = joined {
+                if let Some(implicit) = implicit.take() {
+                    crate::window::discard_implicit(cx, implicit);
+                }
+                return Err(e);
+            }
+            let props = if unsafe { qjs::JS_IsObject(props) } {
+                unsafe { qjs::JS_DupValue(cx, props) }
+            } else {
+                unsafe { qjs::JS_NewObject(cx) }
+            };
+            let mut args = [props];
+            let out = reactive::untracked_with(cx, || unsafe {
+                qjs::JS_Call(cx, app, UNDEFINED, 1, args.as_mut_ptr())
+            });
+            unsafe { qjs::JS_FreeValue(cx, props) };
+            if unsafe { qjs::JS_IsException(out) } {
+                if let Some(implicit) = implicit.take() {
+                    crate::window::discard_implicit(cx, implicit);
+                }
+                return Err(out);
+            }
+            let parent = implicit.as_ref().map_or(root, |implicit| implicit.node);
+            let r = insert_value(cx, parent, out, None);
+            unsafe { qjs::JS_FreeValue(cx, out) };
+            if let Err(e) = r {
+                if let Some(implicit) = implicit.take() {
+                    crate::window::discard_implicit(cx, implicit);
+                }
+                return Err(e);
+            }
+            Ok(implicit)
+        },
+    );
+    let implicit = match result {
+        Ok(implicit) => implicit,
+        Err(e) => {
+            free_values(cx, before);
+            reactive::dispose_owner(cx, owner);
+            return e;
         }
-        let r = insert_value(cx, root, out, None);
-        unsafe { qjs::JS_FreeValue(cx, out) };
-        r
-    });
-    if let Err(e) = result {
-        free_values(cx, before);
-        reactive::dispose_owner(cx, owner);
-        return e;
+    };
+    if let Some(implicit) = implicit {
+        if declared_windows(cx) > 0 {
+            // The root declares the app's windows: they live in its node,
+            // which stays unopened. The old model's main window was not
+            // one of an app's windows either.
+            crate::window::forget_implicit(cx, implicit);
+        } else {
+            // Views and text, or nothing: the main window a released app
+            // rendered in, opened around its content.
+            crate::window::finish_implicit(cx, implicit, owner);
+        }
     }
     let mut data = [qjs::JS_NewFloat64(owner as f64), new_array(cx, before)];
     // SAFETY: the function keeps dups of `data`.
@@ -3649,8 +3735,8 @@ unsafe extern "C" fn unmount(
 /// `setup(tailwind, theme, appearance, statusBar, app)`: the app's Tailwind
 /// theme and the theme of the Rust components (JSON strings, or null), its
 /// appearance (`"light"` / `"dark"`, or null), the status bar's default
-/// (`nsh.json` `"statusBar"` as JSON, or null) and what `appInfo()` reports
-/// (JSON, or null), before anything renders.
+/// (`nsh.json` `"statusBar"` as a JSON string, or null) and what `appInfo()`
+/// reports (JSON, or null), before anything renders.
 unsafe extern "C" fn setup(
     cx: *mut JsContext,
     _this: JsValue,
@@ -3684,7 +3770,11 @@ unsafe extern "C" fn setup(
         crate::env::take_theme(cx, &json);
     }
     // What this runtime cannot read (a newer NSH's) is left out.
-    let status_bar = string_arg(cx, arg(argc, argv, 3))
+    let status_bar = arg(argc, argv, 3);
+    // SAFETY: an inline tag check.
+    let status_bar = (unsafe { qjs::JS_IsString(status_bar) })
+        .then(|| string_arg(cx, status_bar))
+        .flatten()
         .and_then(|json| serde_json::from_str(&json).ok())
         .map(|v| nsh_core::StatusBarSetting::from_json(&v));
     if let Some(setting) = status_bar
@@ -4215,9 +4305,44 @@ unsafe extern "C" fn font(
 
 #[cfg(test)]
 mod tests {
-    use nsh_core::{EventKind, EventPayload, NodeId, Op};
+    use nsh_core::{
+        Command, EventKind, EventPayload, NodeId, Op, ROOT_ID, StatusBarSetting, StatusBarStyle,
+    };
 
     use crate::Host;
+
+    #[test]
+    fn setup_only_sets_the_status_bar_from_a_json_string() {
+        let host = Host::new().unwrap();
+        host.eval_source(
+            r#"
+            import { setup } from "nsh:rt";
+            setup(null, null, null, null, '{"name":"Status bar test"}');
+            setup(null, null, null, '{"foreground":"light","hidden":true}');
+            "#,
+        )
+        .unwrap();
+
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        let settings: Vec<_> = ops
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Command {
+                    id,
+                    command: Command::SetStatusBar(setting),
+                } => Some((id, setting)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            settings,
+            [(
+                ROOT_ID,
+                StatusBarSetting::from(StatusBarStyle::Light).hidden(true)
+            )]
+        );
+    }
 
     /// The ops since the last call, one line each (`Release` and the root's
     /// layout direction left out unless `all`).

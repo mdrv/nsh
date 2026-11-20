@@ -34,6 +34,7 @@ pub fn App() -> impl IntoElement {
 
 ```tsx tabs
 import { List, mount, Text, View } from "nsh";
+import { Window } from "nsh/desktop";
 
 const items = Array.from({ length: 10_000 }, (_, i) => ({ id: i, title: `Item ${i + 1}` }));
 
@@ -49,7 +50,11 @@ function App() {
   );
 }
 
-mount(App);
+mount(() => (
+  <Window id="main">
+    <App />
+  </Window>
+));
 ```
 
 In Rust, `virtual_list(count, row)` takes the number of rows (a value, a signal or a closure) and a function that builds a row from its position (`at.index()`); the rows read your data by that index. In TSX, `each` takes the items and the row function gets the item. Like a [scroll view](./scrolling.md), the list is the viewport and needs a size from its parent (`.flex_1()`, `flex: 1` or a height).
@@ -151,7 +156,7 @@ In both, a row that stays keeps its cell, its content and its measured size wher
 
 ## Props
 
-A list takes every scrolling prop of the scroll view that makes sense for a list (`pagingEnabled`, `snapToInterval`, `snapToOffsets`, `snapToAlignment`, `decelerationRate`, `disableIntervalMomentum`, `bounces`, `scrollable`, `contentInset`, `contentOffset`, `keyboardShouldPersistTaps`, `keyboardDismissMode`, `scrollEventThrottle`, `onScroll`, `onScrollDragStart`, `onScrollDragEnd`, `onMomentumStart`, `onMomentumEnd`, `onScrollEnd`, `scrollValue`, `pullValue`; in Rust the same methods as a scroll view's), described in [Scrolling](./scrolling.md). Lists keep a scale of 1. Its own props:
+A list takes every scrolling prop of the scroll view that makes sense for a list (`pagingEnabled`, `snapToInterval`, `snapToOffsets`, `snapToAlignment`, `decelerationRate`, `disableIntervalMomentum`, `bounces`, `scrollable`, `contentInset`, `scrollbarInset`, `contentOffset`, `keyboardShouldPersistTaps`, `keyboardDismissMode`, `scrollEventThrottle`, `onScroll`, `onScrollDragStart`, `onScrollDragEnd`, `onMomentumStart`, `onMomentumEnd`, `onScrollEnd`, `scrollValue`, `pullValue`; in Rust the same methods as a scroll view's), described in [Scrolling](./scrolling.md). Lists keep a scale of 1. Its own props:
 
 | Prop | Rust | Type | Default | Description |
 |---|---|---|---|---|
@@ -406,6 +411,7 @@ pub fn chat() -> impl IntoElement {
 ```tsx tabs
 import { List, mount, signal, Text, View } from "nsh";
 import { Input } from "nsh/base";
+import { Window } from "nsh/desktop";
 
 type Message = { id: number; text: string; mine: boolean };
 
@@ -463,7 +469,11 @@ function Chat() {
   );
 }
 
-mount(Chat);
+mount(() => (
+  <Window id="main">
+    <Chat />
+  </Window>
+));
 ```
 
 `scroll_to_end(..)` / `scrollToEnd()` on an inverted list scrolls to its start: the newest message.

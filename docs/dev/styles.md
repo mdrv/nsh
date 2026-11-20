@@ -37,7 +37,9 @@
   `transform` lists, `translate` / `scale` pairs, shadows' layers (`{ x, y, blur, spread, color, inset }`),
   `pointerEvents`' `box-none` / `box-only` (React Native's, for the view alone), `textOverflow`'s `ellipsis-start` /
   `ellipsis-middle` (where a clamped text is cut), `textAlign`'s `auto` (React Native's: the text's natural side, by its
-  direction); variants past Tailwind's: `selected:` (`accessibilityState.selected`, `selectedStyle`), `ios:` /
+  direction), `transitionTimingFunction`'s `spring(stiffness, damping[, mass])` (class `ease-spring-[k,c]` /
+  `ease-spring-[k,c,m]`, `Styled::ease_spring`: a transition on a spring's physics that times itself,
+  `Transition::spring`; `animation.md`); variants past Tailwind's: `selected:` (`accessibilityState.selected`, `selectedStyle`), `ios:` /
   `android:` / `web:` (the platform), `terminal:` (drawn in a terminal, `Idiom::Terminal`). A new one joins this list.
 - **CSS's meanings**: inline styles mean what classes mean: a style key is the CSS property of its name (or of the form
   "Forms past CSS's" gives it). Every view, however it is styled, keeps
@@ -82,10 +84,17 @@
   `focus`, `active` (gpui-base's order of value states); the `aria-*` variants are above them (`aria-busy`,
   `aria-checked`, `aria-expanded`, `aria-invalid`, `aria-pressed`, `aria-selected`, by name), as Tailwind's `aria-*` variants come
   after its pseudo-classes, so an open popup's trigger keeps its look while hovered or pressed. `disabled` (any element) applies `disabled:` and drops
-  the node's press listeners from what is mounted, so it shows no press feedback either. A part of a Rust component
+  the node's press listeners from what is mounted. Its own hover, active and focus variants do not match while disabled;
+  value variants such as `checked:` still match. A part of a Rust component
   shows its control's `checked`, `indeterminate` and `disabled` to its own classes and state styles
   (`Interactive::project_checked`, `project_indeterminate`, `project_disabled`, and `project_focused` for the part the keys act on; `Prop::ProjectedStates`; `project_data` its `data-*` attributes, `Prop::ProjectedData`): a switch's thumb styled `checked:translate-x-4`, with no accessibility
-  state or press change on the part, so screen readers hear the control alone. `focus-within:` (and
+  state or press change on the part, so screen readers hear the control alone. A part shows its control's press
+  the same way (`Interactive::project_group_active(group)`, `Prop::ProjectedActive`): the control is a group of an
+  NSH name (`Switch`'s `nsh-switch`), so the platform reports its press, and the part's `active:` classes and active
+  style apply while that group is pressed, besides the part's own press (`classes::styled_states`); a press change of
+  the group restyles those parts in its `restyle_subtree` walk (`group_press_changed`). They change as for any other
+  state: a transform animates with `transition-*`, a width at once, so a thumb that stretches smoothly scales
+  (`origin-left active:scale-x-125` with `transition-transform`). `focus-within:` (and
   `focusWithinStyle`, `.focus_within(..)`) is the core's: the platforms report `FOCUSED` for whatever view the
   keyboard focus reaches, whether or not it tracks it (`input::reported_states`; one report per focus change), and the
   core keeps one focus per surface and puts `state::FOCUS_WITHIN` on it and the views around it in the core's tree
@@ -220,6 +229,10 @@
   `Painter::*_from_view`, `canvas.md`), kept per node in `Style::paint` (`PaintStyle`) and resolved by the core when
   it sends the drawing (`Core::resolved_paint`); views draw nothing with them. `fill-inherit` / `stroke-inherit` set
   nothing (they inherit already).
+- **Accent** (`accentColor`, Tailwind's `accent-*`): CSS's `accent-color`, the color a system control shows its state in.
+  The core passes a native component's own `accentColor` to it as its `accentColor` prop (`Core::sync_accent`), and
+  the control prefers it over the theme color it is otherwise given. Set on the control, not inherited. `nsh/mobile`'s
+  `Switch` reads it (its track when on); the system's segmented control and tab bar could later.
 - **Text style inheritance** (CSS-like): a view's text properties (color, font, size, alignment, ...) pass to the texts and inputs
   inside it, so `class="text-white"` on a button styles its label. So do its `whitespace-*` / `text-wrap` / `text-nowrap`
   (and `truncate`'s no wrapping) and `select-*` classes, as CSS's `white-space` and `user-select: auto` (`Core::inherited_text_props`:
@@ -301,7 +314,7 @@
   the `transform`): a style's `scale` replaces a class's scale and leaves its rotation. The list keeps how many steps
   each property holds (`Pending::transform_counts`), so setting one moves the animated bindings of those after it.
   Applied right to left like CSS; Android has no skew, `zIndex` (stable order of the native views), `boxShadow`
-  (CSS's, the one shadow of styles, classes and typed styles alike; `effects.rs`), `tintColor` (images), `glassTintColor` (Liquid Glass), `objectPosition` (images: where the fitted image sits, CSS's `object-position`; `images.md`), `android={{ elevation }}` (a prop, not a style: Android's material shadow), `macos={{ backdrop }}` (a prop, not a style: macOS's `NSVisualEffectView` material, `MacOsBackdrop` in `effects.rs`: an explicit one selects the native view with no blur needed, and wins over `glassEffect` and `backdropFilter`; `None` keeps the fallback), `transformOrigin` (keywords / percentages / lengths; iOS conjugates the matrix around it,
+  (CSS's, the one shadow of styles, classes and typed styles alike; `effects.rs`), `tintColor` (images), `glassTintColor` (Liquid Glass), `objectPosition` (images: where the fitted image sits, CSS's `object-position`; `images.md`), `android={{ elevation }}` (a prop, not a style: Android's material shadow), `macos={{ backdrop }}` (a prop, not a style: macOS's `NSVisualEffectView` material, `MacOsBackdrop` in `effects.rs`: an explicit one selects the native view with no blur needed, and wins over `glassEffect` and `backdropFilter`; `None` keeps the fallback), `windows={{ backdrop }}` (a prop, not a style: the system's blur of what is behind a transparent window on Windows 11, `WindowsBackdrop` in `effects.rs`; `docs/dev/windows.md`), `transformOrigin` (keywords / percentages / lengths; iOS conjugates the matrix around it,
   Android sets the pivot), `backfaceVisibility` (iOS `doubleSided`; Android hides the view while its rotations turn it away). `style` may be an array of styles merged left to right
   (falsy entries skipped), decoded in Rust. In one style object (an array is flattened into one, as React Native does) a
   longhand wins over its shorthand whatever the key order (`StylePatch::set`, `StyleKey::longhands`: border widths and

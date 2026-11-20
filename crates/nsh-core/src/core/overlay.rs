@@ -389,10 +389,17 @@ impl<M: TextEngine> Core<M> {
     /// The first overlay shown in root view `parent`: the native sibling
     /// its own children go below.
     pub(super) fn first_overlay_in(&self, parent: Key) -> Option<NodeId> {
+        // Only the root view and a modal show overlays (`overlay_host`):
+        // the views made in any other are not looked up among all the
+        // overlays, which are as many as a document's links (their hints).
+        if parent != self.root && self.nodes[parent as usize].kind != Kind::Modal {
+            return None;
+        }
         let id = self.nodes[parent as usize].id;
-        self.overlays
-            .iter()
-            .find_map(|&k| (self.overlay(k)?.host == Some(id)).then(|| self.nodes[k as usize].id))
+        self.overlays.iter().find_map(|&k| {
+            self.placing(1);
+            (self.overlay(k)?.host == Some(id)).then(|| self.nodes[k as usize].id)
+        })
     }
 
     /// The root view overlay `key` is shown in, or `None` while it is not
@@ -532,7 +539,6 @@ impl<M: TextEngine> Core<M> {
     /// ancestry must still hear keys. Runs when a key rule or an overlay
     /// changed, not per key; an ordinary app's overlays keep `None`.
     pub(super) fn sync_key_parents(&mut self) {
-        self.key_ancestry_dirty = false;
         for index in 0..self.overlays.len() {
             let key = self.overlays[index];
             let logical = self.nodes[key as usize].parent;
@@ -543,6 +549,36 @@ impl<M: TextEngine> Core<M> {
                 continue;
             }
             self.nodes[key as usize].key_parent = desired;
+            self.mark(key, super::dirty::VIEW_PROPS);
+        }
+    }
+
+    /// Publishes an unfocused key target only when its path has a listener or
+    /// capture rule. With neither, the backend can use the window root.
+    pub(super) fn sync_key_contents(&mut self) {
+        let changes: Vec<_> = std::iter::once(self.root)
+            .chain(
+                self.window_ids
+                    .values()
+                    .filter_map(|&(id, _)| self.key(id).ok()),
+            )
+            .filter_map(|key| {
+                let start = self.key_start(key);
+                let desired = (start != key)
+                    .then(|| self.nodes[start as usize].id)
+                    .filter(|&id| self.logical_key_interest(id));
+                let mounted = self.nodes[key as usize]
+                    .props
+                    .as_ref()
+                    .and_then(|props| props.key_content);
+                (mounted != desired).then_some((key, desired))
+            })
+            .collect();
+        for (key, desired) in changes {
+            self.nodes[key as usize]
+                .props
+                .get_or_insert_default()
+                .key_content = desired;
             self.mark(key, super::dirty::VIEW_PROPS);
         }
     }
@@ -1303,8 +1339,34 @@ impl<M: TextEngine> Core<M> {
             path.push(self.nodes[key as usize].id);
             key = self.nodes[key as usize].parent;
         }
+        self.presses_outside(event.page_position, &path)
+    }
+
+    /// A press beyond the root view, at `page` in its coordinates: on what
+    /// is around the surface, where the platform draws the root view's
+    /// anchored overlays too (the web page around the player's container,
+    /// `overlays: "viewport"`). It misses every view, so each shown
+    /// overlay watching presses hears `onPressOutside`, as a press in the
+    /// root view outside it.
+    ///
+    /// Returns those events (each overlay and its payload) for the caller
+    /// to hand out, as [`Core::context_menu_presses_outside`].
+    pub fn presses_beyond_root(&mut self, page: Point<Points>) -> Vec<(NodeId, EventPayload)> {
+        if self.overlay_state.watched.is_empty() {
+            return Vec::new();
+        }
+        self.presses_outside(page, &[])
+    }
+
+    /// The `onPressOutside` events of a press at `page` on the views of
+    /// `path`, taken from the queue for the caller to hand out.
+    fn presses_outside(
+        &mut self,
+        page: Point<Points>,
+        path: &[NodeId],
+    ) -> Vec<(NodeId, EventPayload)> {
         let from = self.events.len();
-        self.press_outside(event.page_position, &path);
+        self.press_outside(page, path);
         self.events
             .drain(from..)
             .filter_map(|event| match event {
@@ -1362,11 +1424,20 @@ impl<M: TextEngine> Core<M> {
     }
 
     /// The room overlay `key` shown in `host` keeps to beside its anchor:
-    /// the root view's safe area less the overlay's `margin`.
+    /// the root view's safe area less the overlay's `margin`, or the area
+    /// the platform shows the root view's overlays in
+    /// ([`Core::set_overlay_area`]).
     fn overlay_area(&self, key: Key, host: NodeId) -> Option<Bounds<Points>> {
         let config = self.overlay(key)?.config;
-        let (size, insets) = self.overlay_host_size(host)?;
         let m = config.margin.0;
+        // Shown beyond the root view (the web's `overlays: "viewport"`):
+        // the platform's area, its safe area already left out.
+        if host == ROOT_ID
+            && let Some(area) = self.overlay_bounds
+        {
+            return Some(inset(area, [m, m, m, m]));
+        }
+        let (size, insets) = self.overlay_host_size(host)?;
         Some(inset(
             rect(0.0, 0.0, size.width.0, size.height.0),
             [
@@ -2105,6 +2176,15 @@ impl<M: TextEngine> Core<M> {
                 origin: own.page,
                 size: own.frame.size,
             },
+        })
+    }
+
+    /// Whether an overlay with an anchor is shown in the root view (not in
+    /// a modal): one whose room [`Core::set_overlay_area`] changes.
+    pub(super) fn root_overlay_shown(&self) -> bool {
+        self.overlays.iter().any(|&key| {
+            self.overlay(key).is_some_and(|s| s.host == Some(ROOT_ID))
+                && self.resolved_anchor(key) != OverlayAnchor::None
         })
     }
 

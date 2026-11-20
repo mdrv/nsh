@@ -3,6 +3,7 @@
 // `id:case-<case>` (a one-point view over the corner, out of the layout);
 // the steps after it are that case's.
 import { type JSX, View, mount, signal } from "nsh";
+import { Window } from "nsh/desktop";
 import BaseStatusBar from "./base-status-bar";
 import BaseAccordion from "./base-accordion";
 import BaseAlertDialog from "./base-alert-dialog";
@@ -18,6 +19,9 @@ import BaseDialogBackdrop from "./base-dialog-backdrop";
 import BaseDataTable from "./base-data-table";
 import BaseDiff from "./base-diff";
 import BaseDock from "./base-dock";
+import BaseDockTabScroll from "./base-dock-tab-scroll";
+import BaseDockRenderHandle from "./base-dock-render-handle";
+import BaseDockToolbar from "./base-dock-toolbar";
 import BaseSplitView from "./base-split-view";
 import BaseEditor from "./base-editor";
 import BaseHoverCard from "./base-hover-card";
@@ -63,6 +67,7 @@ import BaseToast from "./base-toast";
 import BaseToggle from "./base-toggle";
 import BaseToolbar from "./base-toolbar";
 import BaseTree from "./base-tree";
+import BaseTreeSlots from "./base-tree-slots";
 import BaseToken from "./base-token";
 import BaseSetTheme from "./base-set-theme";
 import BaseTransitionShader from "./base-transition-shader";
@@ -79,6 +84,9 @@ const cases: Record<string, () => JSX.Element> = {
   "base-data-table": BaseDataTable,
   "base-diff": BaseDiff,
   "base-dock": BaseDock,
+  "base-dock-tab-scroll": BaseDockTabScroll,
+  "base-dock-render-handle": BaseDockRenderHandle,
+  "base-dock-toolbar": BaseDockToolbar,
   "base-split-view": BaseSplitView,
   "base-editor": BaseEditor,
   "base-hover-card": BaseHoverCard,
@@ -113,6 +121,7 @@ const cases: Record<string, () => JSX.Element> = {
   "base-toggle": BaseToggle,
   "base-toolbar": BaseToolbar,
   "base-tree": BaseTree,
+  "base-tree-slots": BaseTreeSlots,
   "base-collapsible": BaseCollapsible,
   "base-color-picker": BaseColorPicker,
   "base-collapsible-reveal": BaseCollapsibleReveal,
@@ -134,7 +143,7 @@ const cases: Record<string, () => JSX.Element> = {
 };
 const shown = signal("");
 
-mount(() => (
+mount(() => <Window id="main">{() => (
   <>
     {() => {
       const Case = cases[shown()];
@@ -146,4 +155,4 @@ mount(() => (
       ))}
     </View>
   </>
-));
+)}</Window>);

@@ -17,6 +17,7 @@ use anyhow::{Context as _, bail};
 use serde::Deserialize;
 
 use crate::{
+    android,
     apple::{
         ActivationPolicy, AppleConfig, ApplePlatform, IOS_MINIMUM, MACOS_MINIMUM, MacosConfig,
     },
@@ -194,6 +195,9 @@ pub(crate) struct AppConfig {
     /// The app's Rust crate: its builds are the app's own (`rust_app.rs`).
     #[serde(default, rename = "rust")]
     _rust: Option<serde_json::Value>,
+    /// The app's nshm, linked like its crates (`nshm.rs`).
+    #[serde(default, rename = "modules")]
+    _modules: Option<serde_json::Value>,
     /// A Rust app's root component in its crate (`rust_app::RootConfig`).
     #[serde(default, rename = "root")]
     _root: Option<serde_json::Value>,
@@ -218,6 +222,15 @@ pub(crate) struct AppConfig {
     /// release runner reads it; macOS runs one instance of an app already.
     #[serde(default)]
     pub(crate) single_instance: bool,
+    /// The packaged app's data directory (`"dataDir": "${homeDir}/.myapp"`),
+    /// in place of the one under its id in the system's directory for apps'
+    /// data: its storage (`nsh/storage`), logs, `process.dataDir` and
+    /// `${dataDir}`. An absolute path, or `${homeDir}` followed by one under
+    /// the user's home ([`nsh_engine::resolve_data_dir`]); it stays put when
+    /// the app's id changes. Written into `app.json`, where the desktop
+    /// release runners (macOS, Windows, Linux) read it; [`read_config`]
+    /// drops a value they would refuse.
+    pub(crate) data_dir: Option<String>,
     /// Gives the app's address (`UrlScheme.setUrl`) to the system on iOS
     /// and macOS (`"handoff": true`), so Handoff continues it on the user's
     /// other devices. iOS and macOS
@@ -241,6 +254,11 @@ pub(crate) struct AppConfig {
     /// [`read_config`]): written into `app.json` and the dev server's app
     /// info, where the runners read them before the app's code runs.
     pub(crate) window: Option<serde_json::Value>,
+    /// The app's lifecycle (`"application"`, checked by [`read_config`]):
+    /// `{ "quitMode": "platform" | "lastWindowClosed" | "explicit" }`.
+    /// Written into `app.json` and the dev server's app info, where the
+    /// engine sets the quit mode before the app's code runs.
+    pub(crate) application: Option<serde_json::Value>,
     /// What iOS packages add to their `Info.plist` and entitlements.
     #[serde(default)]
     pub(crate) ios: AppleConfig,
@@ -268,9 +286,36 @@ pub(crate) struct AndroidConfig {
     /// TLS. Off by default, as Android has it from API 28 on.
     #[serde(default)]
     pub(crate) uses_cleartext_traffic: bool,
+    /// Permissions the manifest declares besides the ones NSH declares
+    /// itself (`<uses-permission>`): a bare name (`ACCESS_NETWORK_STATE`)
+    /// is Android's, `android.permission.<name>`; a dotted one is written
+    /// as it is. Declaring a runtime permission does not grant it.
+    #[serde(default)]
+    pub(crate) permissions: Vec<String>,
+    /// What the app's window shows from the tap on its icon until its first
+    /// frame, the same keys as `ios.launchScreen`: the window's background
+    /// and, on Android 12+, the splash screen's color and image. Without it
+    /// the platform theme's background and the launcher icon.
+    pub(crate) launch_screen: Option<crate::apple::LaunchScreen>,
 }
 
 impl AndroidConfig {
+    /// `permissions`, checked and spelled out in full.
+    pub(crate) fn permissions(&self) -> anyhow::Result<Vec<String>> {
+        for name in &self.permissions {
+            if lower_case_android_name(name) {
+                ui::warn(format!(
+                    "nsh.json android.permissions: `{name}` is not upper case, as Android's own \
+                     permission names are (`ACCESS_NETWORK_STATE`): Android ignores a name it does not know"
+                ));
+            }
+        }
+        self.permissions
+            .iter()
+            .map(|name| android_permission(name))
+            .collect()
+    }
+
     /// `targetSdk`, checked: no lower than the runtime's minimum.
     pub(crate) fn target_sdk(&self) -> anyhow::Result<u32> {
         use crate::android::{DEFAULT_TARGET_SDK, MIN_SDK};
@@ -282,6 +327,36 @@ impl AndroidConfig {
         }
         Ok(level)
     }
+}
+
+/// Whether `name` is a bare name (one of Android's own) with a lower case
+/// letter, which no permission of Android's has: most likely a typo.
+fn lower_case_android_name(name: &str) -> bool {
+    !name.contains('.') && name.chars().any(|c| c.is_ascii_lowercase())
+}
+
+/// An `android.permissions` entry in full: a bare name is one of
+/// Android's own (`android.permission.<name>`). Each part of the name is a
+/// Java identifier, so nothing but the name reaches the manifest.
+fn android_permission(name: &str) -> anyhow::Result<String> {
+    let identifier = |part: &str| {
+        let mut chars = part.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if !name.split('.').all(identifier) {
+        bail!(
+            "nsh.json android.permissions: `{name}` is not a permission name \
+             (`ACCESS_NETWORK_STATE`, or `com.example.permission.NAME`)"
+        );
+    }
+    Ok(if name.contains('.') {
+        name.to_owned()
+    } else {
+        format!("android.permission.{name}")
+    })
 }
 
 /// `nsh.json` `"tui"`.
@@ -337,6 +412,14 @@ impl AppConfig {
     pub(crate) fn add_file_types_to_app_json(&self, info: &mut serde_json::Value) {
         if let Some(types) = self.file_types_json() {
             info["fileTypes"] = types;
+        }
+    }
+
+    /// Adds `"dataDir"` to a package's `app.json` `info`, where the desktop
+    /// release runners read it (their `setup`).
+    pub(crate) fn add_data_dir_to_app_json(&self, info: &mut serde_json::Value) {
+        if let Some(dir) = &self.data_dir {
+            info["dataDir"] = dir.as_str().into();
         }
     }
 
@@ -449,10 +532,14 @@ pub(crate) fn desktop_app_json(
     if let Some(window) = &config.window {
         info["window"] = window.clone();
     }
+    if let Some(application) = &config.application {
+        info["application"] = application.clone();
+    }
     if config.single_instance {
         info["singleInstance"] = true.into();
     }
     config.add_file_types_to_app_json(&mut info);
+    config.add_data_dir_to_app_json(&mut info);
     info
 }
 
@@ -463,10 +550,16 @@ pub(crate) fn window_json(entry: &Path) -> Option<String> {
     read_config(&entry).ok()?.window.map(|w| w.to_string())
 }
 
-/// Says, once per app, that the main window of the app at `entry` starts
-/// hidden (`nsh.json` `window.defaultVisible: false`): the desktop hosts of
-/// `nsh run` and `nsh test --target` open it so, as its package does, and
-/// only the app shows it.
+/// `nsh.json` `"application"` of the app at `entry` (checked), as JSON: the
+/// dev server's app info carries it.
+pub(crate) fn application_json(entry: &Path) -> Option<String> {
+    let entry = dunce::canonicalize(entry).ok()?;
+    read_config(&entry).ok()?.application.map(|a| a.to_string())
+}
+
+/// Says, once per app, that `nsh.json` `window.defaultVisible: false` has no
+/// effect in window model v2: the app host never shows, and the app opens the
+/// windows it declares with `<Window>`.
 pub(crate) fn note_hidden_main_window(entry: &Path) {
     static NOTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
     let Ok(entry) = dunce::canonicalize(entry) else {
@@ -475,13 +568,13 @@ pub(crate) fn note_hidden_main_window(entry: &Path) {
     let hidden = read_config(&entry)
         .ok()
         .and_then(|config| config.window)
-        .and_then(|window| nsh_core::desktop::MainWindowOptions::from_json(&window).ok())
-        .is_some_and(|window| !window.visible_at_launch());
+        .and_then(|window| window.get("defaultVisible").and_then(|v| v.as_bool()))
+        == Some(false);
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
     if hidden && !noted.contains(&entry) {
         noted.push(entry);
         crate::ui::note(
-            "the main window starts hidden (nsh.json window.defaultVisible: false) until the app shows it",
+            "nsh.json window.defaultVisible has no effect in window model v2: the app host never shows; the app opens its <Window> when ready",
         );
     }
 }
@@ -621,6 +714,7 @@ pub(crate) struct PackageOptions<'a> {
 /// (`{ "macos": "icon-mac.png", "windows": "icon-win.png" }`) since their
 /// conventions differ (macOS draws its artwork inset on a transparent
 /// canvas, Windows edge to edge). A platform left out gets no icon.
+/// Android's may also be an adaptive icon ([`PlatformIcon::Adaptive`]).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum AppIcon {
@@ -628,7 +722,43 @@ pub(crate) enum AppIcon {
     All(PathBuf),
     /// The icons by platform: `macos`, `windows`, `linux`, `ios`, `android`,
     /// `web` ([`AppIcon::PLATFORMS`]).
-    Platforms(std::collections::BTreeMap<String, PathBuf>),
+    Platforms(std::collections::BTreeMap<String, PlatformIcon>),
+}
+
+/// One platform's icon in [`AppIcon::Platforms`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "serde_json::Value")]
+pub(crate) enum PlatformIcon {
+    /// A PNG.
+    Image(PathBuf),
+    /// Android: the layers of an adaptive icon (`{ "foreground": ..,
+    /// "background": .., "monochrome": .. }`).
+    Adaptive(android::AdaptiveIcon),
+    /// A value that is neither, with why: [`read_config`] warns of it and
+    /// leaves the platform without an icon, as it does an adaptive icon
+    /// given for another platform than Android. Read here rather than
+    /// failing, which would drop the whole `icon`.
+    Invalid(String),
+}
+
+impl From<serde_json::Value> for PlatformIcon {
+    fn from(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::String(path) => PlatformIcon::Image(path.into()),
+            serde_json::Value::Object(_) => {
+                let mut unknown = Vec::new();
+                match serde_ignored::deserialize::<_, _, android::AdaptiveIcon>(&value, |key| {
+                    unknown.push(key.to_string())
+                }) {
+                    Ok(icon) => PlatformIcon::Adaptive(android::AdaptiveIcon { unknown, ..icon }),
+                    Err(e) => PlatformIcon::Invalid(e.to_string()),
+                }
+            }
+            _ => PlatformIcon::Invalid(
+                "expected the path of a PNG, or (Android) an adaptive icon's layers".into(),
+            ),
+        }
+    }
 }
 
 impl AppIcon {
@@ -636,7 +766,7 @@ impl AppIcon {
     const PLATFORMS: [&str; 6] = ["macos", "windows", "linux", "ios", "android", "web"];
 
     /// The icon of `target`'s platform.
-    pub(crate) fn of(&self, target: PackageTarget) -> Option<&Path> {
+    pub(crate) fn of(&self, target: PackageTarget) -> Option<android::Icon<'_>> {
         let platform = match target {
             PackageTarget::Ios | PackageTarget::IosSimulator => "ios",
             PackageTarget::Android => "android",
@@ -647,16 +777,29 @@ impl AppIcon {
             PackageTarget::Gpui => return None,
         };
         match self {
-            AppIcon::All(icon) => Some(icon),
-            AppIcon::Platforms(icons) => icons.get(platform).map(PathBuf::as_path),
+            AppIcon::All(icon) => Some(android::Icon::Image(icon)),
+            AppIcon::Platforms(icons) => match icons.get(platform)? {
+                PlatformIcon::Image(icon) => Some(android::Icon::Image(icon)),
+                PlatformIcon::Adaptive(icon) => Some(android::Icon::Adaptive(icon)),
+                PlatformIcon::Invalid(_) => None,
+            },
         }
     }
 }
 
 impl AppConfig {
-    /// The app's icon for `target` (`nsh.json` `"icon"`, or `--icon`).
+    /// The app's icon for `target` (`nsh.json` `"icon"`, or `--icon`): a
+    /// PNG. Android's may be adaptive instead ([`AppConfig::android_icon`]).
     pub(crate) fn icon(&self, target: PackageTarget) -> Option<&Path> {
-        self.icon.as_ref()?.of(target)
+        match self.icon.as_ref()?.of(target)? {
+            android::Icon::Image(icon) => Some(icon),
+            android::Icon::Adaptive(_) => None,
+        }
+    }
+
+    /// The app's Android launcher icon: a PNG or an adaptive icon.
+    pub(crate) fn android_icon(&self) -> Option<android::Icon<'_>> {
+        self.icon.as_ref()?.of(PackageTarget::Android)
     }
 
     /// The macOS development host's arguments for the app (`nsh run`,
@@ -752,24 +895,67 @@ pub(crate) fn read_config(entry: &Path) -> anyhow::Result<AppConfig> {
         ignored.push(format!("window: {e}"));
         config.window = None;
     }
+    if let Some(application) = &config.application
+        && let Err(e) = nsh_core::desktop::ApplicationOptions::from_json(application)
+    {
+        ignored.push(format!("application: {e}"));
+        config.application = None;
+    }
+    // The runner resolves it again on the user's machine, with their home.
+    if let Some(dir) = &config.data_dir
+        && nsh_engine::resolve_data_dir(dir).is_none()
+    {
+        ignored.push(format!(
+            "dataDir: `{dir}` is neither an absolute path nor `${{homeDir}}/...` (no `..`, no other `${{...}}`)"
+        ));
+        config.data_dir = None;
+    }
     config.icon = match config.icon {
         Some(AppIcon::All(icon)) => Some(AppIcon::All(dir.join(icon))),
         Some(AppIcon::Platforms(icons)) => Some(AppIcon::Platforms(
             icons
                 .into_iter()
-                .filter(|(platform, _)| {
-                    let known = AppIcon::PLATFORMS.contains(&platform.as_str());
-                    if !known {
+                .filter_map(|(platform, icon)| {
+                    if !AppIcon::PLATFORMS.contains(&platform.as_str()) {
                         ignored.push(format!("unknown key `icon.{platform}`"));
+                        return None;
                     }
-                    known
+                    let icon = match icon {
+                        PlatformIcon::Image(path) => PlatformIcon::Image(dir.join(path)),
+                        PlatformIcon::Adaptive(icon) if platform == "android" => {
+                            ignored.extend(
+                                icon.unknown
+                                    .iter()
+                                    .map(|key| format!("unknown key `icon.android.{key}`")),
+                            );
+                            PlatformIcon::Adaptive(icon.relative_to(dir))
+                        }
+                        PlatformIcon::Adaptive(_) => {
+                            ignored.push(format!(
+                                "icon.{platform}: an adaptive icon is Android's only; give the path of a PNG"
+                            ));
+                            return None;
+                        }
+                        PlatformIcon::Invalid(why) => {
+                            ignored.push(format!("icon.{platform}: {why}"));
+                            return None;
+                        }
+                    };
+                    Some((platform, icon))
                 })
-                .map(|(platform, icon)| (platform, dir.join(icon)))
                 .collect(),
         )),
         None => None,
     };
     warn_ignored(&path, &ignored);
+    config.ios.launch_screen = config
+        .ios
+        .launch_screen
+        .map(|screen| screen.relative_to(dir));
+    config.android.launch_screen = config
+        .android
+        .launch_screen
+        .map(|screen| screen.relative_to(dir));
     config.ios.check(ApplePlatform::Ios)?;
     config.macos.check()?;
     config.web.host = config.web.host.map(|host| dir.join(host));
@@ -1113,7 +1299,11 @@ pub(crate) fn package(options: PackageOptions<'_>) -> anyhow::Result<()> {
         && (has_crates || trimmed_runner(&entry, options.target))
     {
         own_runner = !has_crates;
-        let choices = crate::native_features::choose(built.native_use.as_ref(), &config.features);
+        let choices = crate::native_features::choose(
+            built.native_use.as_ref(),
+            &config.features,
+            crate::rust_app::current().is_some_and(|app| crate::rust_app::may_make_web_view(&app)),
+        );
         for c in &choices {
             let mark = if c.keep { "keep" } else { "leave out" };
             ui::note(format!("{mark} `{}`: {}", c.feature, c.why));
@@ -1208,6 +1398,10 @@ pub(crate) fn package(options: PackageOptions<'_>) -> anyhow::Result<()> {
             {
                 let mut info = serde_json::json!({ "id": id, "name": name });
                 config.add_file_types_to_app_json(&mut info);
+                config.add_data_dir_to_app_json(&mut info);
+                if let Some(application) = &config.application {
+                    info["application"] = application.clone();
+                }
                 info
             },
             &schemes,
@@ -1240,8 +1434,10 @@ pub(crate) fn package(options: PackageOptions<'_>) -> anyhow::Result<()> {
     url_types(&mut info, &id, &schemes);
     activity_types(&mut info, &id, config.handoff);
     document_types(&mut info, &config.file_types());
-    if let Some(icon) = config.icon(PackageTarget::Ios) {
-        let partial = compile_icon(icon, &app, sdk, minimum_os(&info))?;
+    let icon = config.icon(PackageTarget::Ios);
+    let launch_screen = config.ios.launch_screen.as_ref();
+    if icon.is_some() || launch_screen.is_some() {
+        let partial = compile_assets(icon, launch_screen, &app, sdk, minimum_os(&info))?;
         for (key, value) in partial {
             info.insert(key, value);
         }
@@ -1397,7 +1593,13 @@ fn package_android(
     assets.push((
         "nsh/app.json".to_owned(),
         app_json(
-            serde_json::json!({ "id": id }),
+            {
+                let mut info = serde_json::json!({ "id": id });
+                if let Some(application) = &config.application {
+                    info["application"] = application.clone();
+                }
+                info
+            },
             &config.schemes,
             config.window.as_ref(),
         )
@@ -1420,6 +1622,7 @@ fn package_android(
     };
     fs::create_dir_all(options.out)?;
     let target_sdk = config.android.target_sdk()?;
+    let permissions = config.android.permissions()?;
     let apk_path = options
         .out
         .join(format!("{name}.{}", options.format.extension()));
@@ -1439,12 +1642,15 @@ fn package_android(
             notifications: config.notifications(),
             microphone: config.web_media("microphone"),
             camera: config.web_media("camera"),
+            permissions: &permissions,
             schemes: &config.schemes,
             rust: built.rust_root,
             dark: config.appearance.as_deref() == Some("dark"),
+            fixed_appearance: matches!(config.appearance.as_deref(), Some("light" | "dark")),
             runtime: &runtime,
             abis: &abis,
-            icon: config.icon(PackageTarget::Android),
+            icon: config.android_icon(),
+            launch_screen: config.android.launch_screen.as_ref(),
             assets,
             sounds: android_sounds(config, built),
             signing,
@@ -1695,6 +1901,10 @@ fn package_macos(
     }
     config.macos.add_to_app_json(&mut info);
     config.add_file_types_to_app_json(&mut info);
+    config.add_data_dir_to_app_json(&mut info);
+    if let Some(application) = &config.application {
+        info["application"] = application.clone();
+    }
     let schemes = config.url_schemes();
     fs::write(
         nsh.join("app.json"),
@@ -2139,10 +2349,12 @@ fn info_plist(
     d.insert("LSRequiresIPhoneOS".into(), true.into());
     config.usage_descriptions(&mut d);
     bundle_localizations(&mut d, config);
-    // A launch screen entry opts into the full screen (no letterboxing).
+    // A launch screen entry opts into the full screen (no letterboxing);
+    // the app's color and image are in its asset catalog
+    // ([`launch_screen_sets`]).
     d.insert(
         "UILaunchScreen".into(),
-        Value::Dictionary(Default::default()),
+        Value::Dictionary(launch_screen_info(config.ios.launch_screen.as_ref())),
     );
     d.insert("UIApplicationSupportsMultipleScenes".into(), false.into());
     // ProMotion iPhones run display links above 60 Hz only with this:
@@ -2203,35 +2415,153 @@ fn minimum_os(info: &plist::Dictionary) -> &str {
         .unwrap_or(IOS_MINIMUM)
 }
 
-/// Compiles `icon` into the app's asset catalog (`Assets.car`) with
-/// `actool`, for `minimum`, the oldest iOS the app declares (as Xcode
-/// compiles it for the deployment target), returning the Info.plist keys
-/// it produces.
-fn compile_icon(
-    icon: &Path,
+/// The asset catalog's name of the launch screen's color.
+const LAUNCH_BACKGROUND: &str = "LaunchBackground";
+/// The asset catalog's name of the launch screen's image.
+const LAUNCH_IMAGE: &str = "LaunchImage";
+
+/// `UILaunchScreen`: the names of the app's launch screen color and image
+/// in its asset catalog, none for the system's background.
+fn launch_screen_info(screen: Option<&crate::apple::LaunchScreen>) -> plist::Dictionary {
+    let mut d = plist::Dictionary::new();
+    if let Some(screen) = screen {
+        if screen.background.is_some() {
+            d.insert("UIColorName".into(), LAUNCH_BACKGROUND.into());
+        }
+        if screen.image.is_some() {
+            d.insert("UIImageName".into(), LAUNCH_IMAGE.into());
+        }
+    }
+    d
+}
+
+/// A set of an asset catalog, as [`compile_assets`] writes it.
+#[derive(Debug)]
+struct CatalogSet {
+    /// Its directory in the catalog (`LaunchImage.imageset`).
+    dir: String,
+    /// Its `Contents.json`.
+    contents: serde_json::Value,
+    /// The images it copies in: the source and its file name in the set.
+    files: Vec<(PathBuf, String)>,
+}
+
+/// The asset catalog sets of a launch screen.
+fn launch_screen_sets(screen: &crate::apple::LaunchScreen) -> Vec<CatalogSet> {
+    use serde_json::json;
+    let info = json!({ "author": "nsh", "version": 1 });
+    let dark = json!([{ "appearance": "luminosity", "value": "dark" }]);
+    let mut sets = Vec::new();
+    if let Some(background) = &screen.background {
+        let color = |color: &crate::apple::Color| {
+            let [r, g, b, a] = color.0;
+            json!({
+                "color-space": "srgb",
+                "components": {
+                    "red": format!("0x{r:02X}"),
+                    "green": format!("0x{g:02X}"),
+                    "blue": format!("0x{b:02X}"),
+                    "alpha": format!("{:.3}", f32::from(a) / 255.0),
+                },
+            })
+        };
+        let (light, dark_color) = background.variants();
+        let mut colors = vec![json!({ "idiom": "universal", "color": color(light) })];
+        if let Some(dark_color) = dark_color {
+            colors.push(json!({
+                "idiom": "universal",
+                "appearances": dark,
+                "color": color(dark_color),
+            }));
+        }
+        sets.push(CatalogSet {
+            dir: format!("{LAUNCH_BACKGROUND}.colorset"),
+            contents: json!({ "colors": colors, "info": info }),
+            files: Vec::new(),
+        });
+    }
+    if let Some(image) = &screen.image {
+        let (light, dark_image) = image.variants();
+        let mut images =
+            vec![json!({ "idiom": "universal", "filename": "light.png", "scale": "3x" })];
+        let mut files = vec![(light.clone(), "light.png".to_owned())];
+        if let Some(dark_image) = dark_image {
+            images.push(json!({
+                "idiom": "universal",
+                "filename": "dark.png",
+                "scale": "3x",
+                "appearances": dark,
+            }));
+            files.push((dark_image.clone(), "dark.png".to_owned()));
+        }
+        sets.push(CatalogSet {
+            dir: format!("{LAUNCH_IMAGE}.imageset"),
+            contents: json!({ "images": images, "info": info }),
+            files,
+        });
+    }
+    sets
+}
+
+/// Compiles the app's asset catalog (`Assets.car`) with `actool`: its
+/// `icon` and its `launch_screen`'s color and image, for `minimum`, the
+/// oldest iOS the app declares (as Xcode compiles it for the deployment
+/// target), returning the Info.plist keys it produces.
+fn compile_assets(
+    icon: Option<&Path>,
+    launch_screen: Option<&crate::apple::LaunchScreen>,
     app: &Path,
     sdk: &str,
     minimum: &str,
 ) -> anyhow::Result<plist::Dictionary> {
     let work = app.with_extension("xcassets-work");
-    let set = work.join("Assets.xcassets/AppIcon.appiconset");
-    fs::create_dir_all(&set)?;
-    fs::copy(icon, set.join("icon.png")).with_context(|| format!("copy {}", icon.display()))?;
+    let catalog = work.join("Assets.xcassets");
+    fs::create_dir_all(&catalog)?;
     fs::write(
-        work.join("Assets.xcassets/Contents.json"),
+        catalog.join("Contents.json"),
         r#"{"info":{"author":"nsh","version":1}}"#,
     )?;
-    // One 1024 pt image; actool derives every size (Xcode 14+ catalogs).
-    fs::write(
-        set.join("Contents.json"),
-        r#"{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"nsh","version":1}}"#,
-    )?;
+    if let Some(icon) = icon {
+        let set = catalog.join("AppIcon.appiconset");
+        fs::create_dir_all(&set)?;
+        fs::copy(icon, set.join("icon.png")).with_context(|| format!("copy {}", icon.display()))?;
+        // One 1024 pt image; actool derives every size (Xcode 14+ catalogs).
+        fs::write(
+            set.join("Contents.json"),
+            r#"{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"nsh","version":1}}"#,
+        )?;
+    }
+    for CatalogSet {
+        dir,
+        contents,
+        files,
+    } in launch_screen.map(launch_screen_sets).unwrap_or_default()
+    {
+        let set = catalog.join(dir);
+        fs::create_dir_all(&set)?;
+        fs::write(set.join("Contents.json"), contents.to_string())?;
+        for (source, file) in files {
+            fs::copy(&source, set.join(file)).with_context(|| {
+                format!(
+                    "copy {} (nsh.json ios.launchScreen.image)",
+                    source.display()
+                )
+            })?;
+        }
+    }
     let partial = work.join("partial.plist");
-    let output = Command::new("xcrun")
-        .args(["actool", "--compile"])
-        .arg(app)
-        .args(["--platform", sdk, "--minimum-deployment-target", minimum])
-        .args(["--app-icon", "AppIcon", "--output-partial-info-plist"])
+    let mut command = Command::new("xcrun");
+    command.args(["actool", "--compile"]).arg(app).args([
+        "--platform",
+        sdk,
+        "--minimum-deployment-target",
+        minimum,
+    ]);
+    if icon.is_some() {
+        command.args(["--app-icon", "AppIcon"]);
+    }
+    let output = command
+        .arg("--output-partial-info-plist")
         .arg(&partial)
         .args([
             "--target-device",
@@ -2241,7 +2571,7 @@ fn compile_icon(
             "--output-format",
             "human-readable-text",
         ])
-        .arg(work.join("Assets.xcassets"))
+        .arg(&catalog)
         .output()
         .context("run xcrun actool (is Xcode installed?)")?;
     if !output.status.success() || !partial.exists() {
@@ -2380,6 +2710,70 @@ fn make_ipa(app: &Path, ipa: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without `ios.launchScreen` the launch screen is the system's
+    /// background; with it `UILaunchScreen` names the catalog's color and
+    /// image, which are sets for both appearances or one for each.
+    #[test]
+    fn launch_screens_become_named_colors_and_images() {
+        let info = info_plist("A", "com.a", "a", &AppConfig::default(), "iphoneos").unwrap();
+        assert_eq!(
+            info["UILaunchScreen"],
+            plist::Value::Dictionary(Default::default())
+        );
+
+        let (config, ignored) = parse_config(
+            r##"{ "ios": { "launchScreen": {
+                "background": { "light": "#ffffff", "dark": "#13131280" },
+                "image": "launch.png"
+            } } }"##,
+        )
+        .unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        let info = info_plist("A", "com.a", "a", &config, "iphoneos").unwrap();
+        let screen = info["UILaunchScreen"].as_dictionary().unwrap();
+        assert_eq!(
+            screen["UIColorName"],
+            plist::Value::String(LAUNCH_BACKGROUND.into())
+        );
+        assert_eq!(
+            screen["UIImageName"],
+            plist::Value::String(LAUNCH_IMAGE.into())
+        );
+
+        let sets = launch_screen_sets(config.ios.launch_screen.as_ref().unwrap());
+        let CatalogSet {
+            dir,
+            contents: color,
+            files,
+        } = &sets[0];
+        assert_eq!(dir, "LaunchBackground.colorset");
+        assert!(files.is_empty());
+        assert_eq!(color["colors"][0]["color"]["components"]["red"], "0xFF");
+        assert_eq!(color["colors"][0].get("appearances"), None);
+        assert_eq!(color["colors"][1]["appearances"][0]["value"], "dark");
+        assert_eq!(color["colors"][1]["color"]["components"]["blue"], "0x12");
+        assert_eq!(color["colors"][1]["color"]["components"]["alpha"], "0.502");
+        let CatalogSet {
+            dir,
+            contents: image,
+            files,
+        } = &sets[1];
+        assert_eq!(dir, "LaunchImage.imageset");
+        assert_eq!(image["images"].as_array().unwrap().len(), 1);
+        assert_eq!(image["images"][0]["scale"], "3x");
+        assert_eq!(
+            files,
+            &[(PathBuf::from("launch.png"), "light.png".to_owned())]
+        );
+
+        // A color that does not read is left out with a warning, as other
+        // values are.
+        let (config, ignored) =
+            parse_config(r#"{ "ios": { "launchScreen": { "background": "white" } } }"#).unwrap();
+        assert_eq!(config.ios.launch_screen.unwrap().background, None);
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+    }
 
     #[test]
     fn ios_device_capabilities_and_overrides() {
@@ -2624,6 +3018,46 @@ mod tests {
     }
 
     #[test]
+    fn android_permissions_are_spelled_out_and_checked() {
+        let permissions = |json: serde_json::Value| {
+            serde_json::from_value::<AppConfig>(json)
+                .unwrap()
+                .android
+                .permissions()
+        };
+        assert!(permissions(serde_json::json!({})).unwrap().is_empty());
+        assert_eq!(
+            permissions(serde_json::json!({ "android": { "permissions": [
+                "ACCESS_NETWORK_STATE",
+                "com.example.permission.READ_ORDERS"
+            ] } }))
+            .unwrap(),
+            [
+                "android.permission.ACCESS_NETWORK_STATE",
+                "com.example.permission.READ_ORDERS"
+            ]
+        );
+        // Only a name reaches the manifest: no markup, no empty part.
+        for bad in [
+            "",
+            "ACCESS NETWORK",
+            "A\" /><uses-permission android:name=\"B",
+            "com..example",
+            "com.example.",
+            "1PERMISSION",
+        ] {
+            let err = permissions(serde_json::json!({ "android": { "permissions": [bad] } }))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("android.permissions"), "{bad}: {err}");
+        }
+        // A bare name in lower case is warned of; a dotted one is the app's.
+        assert!(lower_case_android_name("access_network_state"));
+        assert!(!lower_case_android_name("ACCESS_NETWORK_STATE"));
+        assert!(!lower_case_android_name("com.example.permission.read"));
+    }
+
+    #[test]
     fn apps_that_may_recognize_speech_explain_it() {
         let usage = |capabilities: Option<serde_json::Value>| {
             let config = AppConfig {
@@ -2784,7 +3218,7 @@ mod tests {
     #[test]
     fn desktop_packages_carry_the_main_windows_options() {
         let config: AppConfig = serde_json::from_str(
-            r#"{ "appearance": "dark", "window": { "title": "Focus", "closeOnPress": false } }"#,
+            r#"{ "appearance": "dark", "window": { "title": "Focus", "closeOnPress": false }, "application": { "quitMode": "explicit" } }"#,
         )
         .unwrap();
         let info = desktop_app_json(&config, "Focus", "com.a", "1.0.0");
@@ -2796,6 +3230,7 @@ mod tests {
                 "version": "1.0.0",
                 "appearance": "dark",
                 "window": { "title": "Focus", "closeOnPress": false },
+                "application": { "quitMode": "explicit" },
             })
         );
         // The runner opens the main window with them (`Bundle::read_trusted`).
@@ -2804,6 +3239,38 @@ mod tests {
         // An app without them has none.
         let info = desktop_app_json(&AppConfig::default(), "A", "com.a", "1.0.0");
         assert!(info.get("window").is_none());
+    }
+
+    #[test]
+    fn an_apps_data_dir_goes_into_app_json() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{ "dataDir": "${homeDir}/.myapp" }"#).unwrap();
+        let info = desktop_app_json(&config, "A", "com.a", "1.0.0");
+        assert_eq!(info["dataDir"], serde_json::json!("${homeDir}/.myapp"));
+        let info = desktop_app_json(&AppConfig::default(), "A", "com.a", "1.0.0");
+        assert!(info.get("dataDir").is_none());
+    }
+
+    #[test]
+    fn a_data_dir_the_runner_would_refuse_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("nsh-data-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("App.tsx");
+        for (value, kept) in [
+            ("${homeDir}/.myapp", true),
+            (".myapp", false),
+            ("${homeDir}/../elsewhere", false),
+            ("${appId}/data", false),
+        ] {
+            std::fs::write(
+                dir.join("nsh.json"),
+                serde_json::json!({ "dataDir": value }).to_string(),
+            )
+            .unwrap();
+            let config = read_config(&entry).unwrap();
+            assert_eq!(config.data_dir.is_some(), kept, "{value}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2960,11 +3427,88 @@ mod tests {
             config.icon,
             Some(AppIcon::Platforms(
                 [
-                    ("macos".to_owned(), dir.join("mac.png")),
-                    ("windows".to_owned(), dir.join("win.png")),
+                    ("macos".to_owned(), PlatformIcon::Image(dir.join("mac.png"))),
+                    (
+                        "windows".to_owned(),
+                        PlatformIcon::Image(dir.join("win.png"))
+                    ),
                 ]
                 .into()
             ))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn nsh_json_android_icon_may_be_adaptive() {
+        let dir =
+            std::env::temp_dir().join(format!("nsh-adaptive-icon-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("app.tsx");
+        fs::write(
+            dir.join("nsh.json"),
+            r##"{ "icon": {
+                "ios": "ios.png",
+                "android": { "foreground": "fg.png", "background": "#ffffff", "monochrome": "mono.png", "inset": 1 },
+                "macos": { "foreground": "fg.png", "background": "#ffffff" }
+            } }"##,
+        )
+        .unwrap();
+        let config = read_config(&entry).unwrap();
+        let Some(android::Icon::Adaptive(icon)) = config.android_icon() else {
+            panic!("{:?}", config.icon);
+        };
+        assert_eq!(icon.foreground, dir.join("fg.png"));
+        assert_eq!(
+            icon.background,
+            android::IconBackground::Color(crate::apple::Color([255, 255, 255, 255]))
+        );
+        assert_eq!(icon.monochrome, Some(dir.join("mono.png")));
+        // No PNG for the targets that take one.
+        assert_eq!(config.icon(PackageTarget::Android), None);
+        // Android's only: macOS gets none, the other platforms keep theirs.
+        assert_eq!(config.icon(PackageTarget::Macos), None);
+        assert_eq!(
+            config.icon(PackageTarget::Ios),
+            Some(dir.join("ios.png").as_path())
+        );
+
+        // A background image is relative to `nsh.json`; a malformed color
+        // leaves Android without an icon, the other platforms with theirs.
+        fs::write(
+            dir.join("nsh.json"),
+            r##"{ "icon": { "android": { "foreground": "fg.png", "background": "bg.png" } } }"##,
+        )
+        .unwrap();
+        let config = read_config(&entry).unwrap();
+        let Some(android::Icon::Adaptive(icon)) = config.android_icon() else {
+            panic!("{:?}", config.icon);
+        };
+        assert_eq!(
+            icon.background,
+            android::IconBackground::Image(dir.join("bg.png"))
+        );
+        fs::write(
+            dir.join("nsh.json"),
+            r##"{ "icon": { "ios": "ios.png", "android": { "foreground": "fg.png", "background": "#fff" } } }"##,
+        )
+        .unwrap();
+        let config = read_config(&entry).unwrap();
+        assert!(config.android_icon().is_none());
+        assert_eq!(
+            config.icon(PackageTarget::Ios),
+            Some(dir.join("ios.png").as_path())
+        );
+
+        // One PNG for Android stays one.
+        fs::write(
+            dir.join("nsh.json"),
+            r#"{ "icon": { "android": "icon.png" } }"#,
+        )
+        .unwrap();
+        let config = read_config(&entry).unwrap();
+        assert!(
+            matches!(config.android_icon(), Some(android::Icon::Image(path)) if path == dir.join("icon.png"))
         );
         fs::remove_dir_all(&dir).unwrap();
     }

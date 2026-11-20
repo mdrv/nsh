@@ -136,7 +136,12 @@ fn window_root(surface: &Surface, view: &NshView) -> bool {
 /// parents; only this interest/capture walk follows the override.
 fn walk_keyboard(surface: &Surface, view: &NshView, mut f: impl FnMut(&NshView) -> bool) -> bool {
     let window = window_of(surface, view);
-    let mut current = Some(view.clone());
+    let content = view.state().props.key_content;
+    let mut current = Some(
+        content
+            .and_then(|id| surface.view(id))
+            .unwrap_or_else(|| view.clone()),
+    );
     // Bounded: a routing override is core's, but a broken one must not hang
     // the window.
     for _ in 0..1024 {
@@ -213,6 +218,25 @@ pub(crate) fn focused_any(surface: &Surface) -> Option<NshView> {
         }
     }
     None
+}
+
+/// The view the raw keys of window `window` go to: its focused custom
+/// view, else its root when nothing in it has the keyboard (no custom
+/// view, no text field), as a browser reports a key at `document.body`.
+/// The root is no stop: it is only notified, never pressed.
+pub(crate) fn key_target(surface: &Surface, window: NodeId) -> Option<NshView> {
+    if let Some(view) = focused_in(surface, window) {
+        return Some(view);
+    }
+    if crate::text_input::focused(surface).is_some_and(|field| window_of(surface, &field) == window)
+    {
+        return None;
+    }
+    if window == nsh_core::ROOT_ID {
+        Some(surface.root.clone())
+    } else {
+        crate::app_window::root_view(surface, window)
+    }
 }
 
 /// Whether the focus held for `view` is still valid: a stop, and not
@@ -472,6 +496,7 @@ fn key_name(event: &KeyEvent) -> SharedString {
         0xB5 => Some("LaunchMediaPlayer"),
         0xB6 => Some("LaunchApplication1"),
         0xB7 => Some("LaunchApplication2"),
+        0xFA => Some("MediaPlay"),
         _ => None,
     };
     if let Some(named) = named {
@@ -823,7 +848,7 @@ fn core_event(event: &KeyEvent, down: bool, default_prevented: bool) -> nsh_core
 /// capture consumed it (no native default follows).
 pub(crate) fn press(surface: &std::rc::Rc<Surface>, event: &KeyEvent) -> bool {
     let window = surface.input_root().id();
-    let Some(view) = focused_in(surface, window) else {
+    let Some(view) = key_target(surface, window) else {
         return false;
     };
     if !listens(surface, &view) {
@@ -879,11 +904,89 @@ pub(crate) fn activate(surface: &std::rc::Rc<Surface>, event: &KeyEvent) -> bool
     true
 }
 
+/// The Menu key or Shift+F10 ([`nsh_core::input::opens_context_menu`])
+/// opens the context menu of what has the keyboard focus, with no
+/// pointer, as a secondary click does: the focused view or the nearest
+/// around it that listens to `onContextMenu` ([`crate::input::show_context_menu`]);
+/// a focused text field shows its edit menu at its bottom-start corner
+/// unless it listens itself.
+/// True when handled.
+pub(crate) fn context_menu(surface: &std::rc::Rc<Surface>, event: &KeyEvent) -> bool {
+    if !opens_context_menu(event) {
+        return false;
+    }
+    if let Some(view) = focused_in(surface, surface.input_root().id()) {
+        return crate::input::show_context_menu(surface, &view);
+    }
+    let Some(field) = crate::text_input::focused(surface) else {
+        return false;
+    };
+    if !crate::input::show_context_menu(surface, &field) {
+        // At the field's bottom-start corner, where the app's menus open
+        // without a pointer.
+        let rtl = surface.mounter.try_borrow().is_ok_and(|m| m.rtl);
+        let size = field.state().frame.size;
+        let corner = nsh_core::input::context_menu_anchor(size, rtl);
+        let at = field
+            .to_root()
+            .and_then(|m| m.map(corner.x.0, corner.y.0))
+            .map(|at| in_main_window(surface, &field, at));
+        crate::text_input::context_menu(surface, &field, at);
+    }
+    true
+}
+
+/// `at`, a point in the window `view` shows in (the window's points), in
+/// the main window's points, where the platform's menus are placed from:
+/// the app's own windows are top-level windows of their own.
+fn in_main_window(surface: &Surface, view: &NshView, (x, y): (f32, f32)) -> (f32, f32) {
+    use windows::Win32::{
+        Foundation::POINT,
+        Graphics::Gdi::{ClientToScreen, ScreenToClient},
+    };
+    let window = crate::app_window::hwnd_showing(surface, view);
+    let main = surface.hwnd();
+    if window == main {
+        return (x, y);
+    }
+    let scale = surface.scale();
+    let mut p = POINT {
+        x: (x * scale).round() as i32,
+        y: (y * scale).round() as i32,
+    };
+    // SAFETY: plain coordinate queries on windows of this thread, with a
+    // local point.
+    unsafe {
+        let _ = ClientToScreen(window, &mut p);
+        let _ = ScreenToClient(main, &mut p);
+    }
+    (p.x as f32 / scale, p.y as f32 / scale)
+}
+
+/// Whether key down `event` asks for a context menu: the Menu key
+/// (`VK_APPS`) or Shift+F10.
+fn opens_context_menu(event: &KeyEvent) -> bool {
+    use nsh_core::keymap::{Key, Modifiers};
+    // Held down, the key opens the menu once.
+    if !event.down || event.repeat {
+        return false;
+    }
+    let m = event.modifiers;
+    let held = Modifiers {
+        ctrl: m.ctrl,
+        alt: m.alt,
+        shift: m.shift,
+        cmd: m.meta,
+    };
+    let function = (event.vk == 0x79).then_some(Key::F(10));
+    nsh_core::input::opens_context_menu(event.vk == crate::input::VK_APPS, function, held)
+}
+
 /// A key up: the focused custom view hears it (whichever view has the
 /// focus now), with the capture rule that matches the release.
 pub(crate) fn release(surface: &std::rc::Rc<Surface>, event: &KeyEvent) {
     let window = surface.input_root().id();
-    let Some(view) = focused_in(surface, window) else {
+    let Some(view) = key_target(surface, window) else {
         return;
     };
     if !listens(surface, &view) {
@@ -947,7 +1050,7 @@ pub(crate) fn suppress_translation(msg: &mut MSG) -> bool {
 /// consumed by a mounted capture rule: the decision [`press`] makes when
 /// the message is dispatched.
 fn captured_now(surface: &Surface, window: NodeId, event: &KeyEvent) -> bool {
-    let Some(view) = focused_in(surface, window) else {
+    let Some(view) = key_target(surface, window) else {
         return false;
     };
     if !listens(surface, &view) {
@@ -1030,6 +1133,38 @@ mod tests {
     }
 
     #[test]
+    fn the_menu_key_and_shift_f10_open_a_context_menu() {
+        let with = |vk: u16, modifiers: Modifiers| KeyEvent {
+            modifiers,
+            ..key(vk)
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert!(opens_context_menu(&key(0x5D)));
+        assert!(opens_context_menu(&with(0x5D, shift)));
+        assert!(opens_context_menu(&with(0x79, shift)));
+        // F10 alone is the menu bar's; Control or Alt make another shortcut.
+        assert!(!opens_context_menu(&key(0x79)));
+        let ctrl_shift = Modifiers {
+            ctrl: true,
+            ..shift
+        };
+        assert!(!opens_context_menu(&with(0x79, ctrl_shift)));
+        let up = KeyEvent {
+            down: false,
+            ..key(0x5D)
+        };
+        assert!(!opens_context_menu(&up));
+        let repeat = KeyEvent {
+            repeat: true,
+            ..key(0x5D)
+        };
+        assert!(!opens_context_menu(&repeat));
+    }
+
+    #[test]
     fn named_keys_follow_dom_spellings() {
         for (vk, name) in [
             (0x0D, "Enter"),
@@ -1050,6 +1185,8 @@ mod tests {
             (0x11, "Control"),
             (0x12, "Alt"),
             (0x5B, "Meta"),
+            (0xB3, "MediaPlayPause"),
+            (0xFA, "MediaPlay"),
             (0x70, "F1"),
             (0x74, "F5"),
             (0x87, "F24"),
@@ -1198,6 +1335,40 @@ mod tests {
         );
         assert!(listens(&surface, &view));
         assert!(!press(&surface, &key(0x41)));
+    }
+
+    /// The Menu key asks the focused view for its context menu when it
+    /// listens; the window then answers the key's own `WM_CONTEXTMENU`,
+    /// once, rather than handing it on.
+    #[test]
+    fn the_menu_key_opens_the_focused_views_context_menu() {
+        let surface = surface();
+        let view = focusable(&surface, 2);
+        assert!(focus_control(&surface, &view));
+        let menu = key(crate::input::VK_APPS);
+        // Nothing listens: the key goes on, and so does its request.
+        assert!(!context_menu(&surface, &menu));
+        assert!(!crate::input::key(&surface, menu));
+        assert!(!crate::input::keyboard_context_menu_opened(&surface));
+        let mut mask = EventMask::default();
+        mask.set(EventKind::ContextMenu, true);
+        apply(
+            &surface,
+            &[MountItem::Events {
+                id: 2,
+                events: mask,
+            }],
+        );
+        assert!(crate::input::key(&surface, menu));
+        assert!(crate::input::keyboard_context_menu_opened(&surface));
+        assert!(
+            !crate::input::keyboard_context_menu_opened(&surface),
+            "only the request of the key that opened it"
+        );
+        // Another key in between: a later request is not NSH's.
+        assert!(crate::input::key(&surface, menu));
+        crate::input::key(&surface, key(0x41));
+        assert!(!crate::input::keyboard_context_menu_opened(&surface));
     }
 
     #[test]

@@ -71,6 +71,12 @@ final class ScrollBox extends FrameLayout implements Node {
     private int keyboardTaps; // 0 never, 1 always, 2 handled
     /** `contentInset` (px) and the room kept for the keyboard below it. */
     private int insetTop, insetRight, insetBottom, insetLeft, keyboardPadding;
+    /**
+     * `scrollbarInset` (px): where the scroll bar keeps from the edges, the keyboard's room added below. Without
+     * one ({@code barSet} false) the bar keeps within the paddings, as the platform places it.
+     */
+    private int barTop, barRight, barBottom, barLeft;
+    private boolean barSet;
 
     // The current gesture.
     /** The user dragged the content. */
@@ -310,6 +316,77 @@ final class ScrollBox extends FrameLayout implements Node {
         scroller.setPadding(insetLeft, insetTop, insetRight, insetBottom + keyboardPadding);
     }
 
+    /** `scrollbarInset` (dp). */
+    void setBarInset(float top, float right, float bottom, float left) {
+        float d = mounter.density;
+        int t = Math.round(top * d), r = Math.round(right * d), b = Math.round(bottom * d), l = Math.round(left * d);
+        if (t == barTop && r == barRight && b == barBottom && l == barLeft) return;
+        barTop = t;
+        barRight = r;
+        barBottom = b;
+        barLeft = l;
+        barSet = t != 0 || r != 0 || b != 0 || l != 0;
+        scroller.invalidate();
+    }
+
+    /**
+     * Moves the platform's scroll bar of {@code v} from the track its paddings leave (`contentInset` and the
+     * keyboard's room) to the one `scrollbarInset` leaves, by mapping the canvas along the bar's axis and
+     * shifting it across, so that the bar keeps the platform's look and behavior. Returns the save count to
+     * restore after drawing the bars, or -1 when the tracks are the same.
+     *
+     * <p>The mapping scales the thumb along the axis too, its ends included; the inset is small next to the
+     * track, so the difference is too.
+     */
+    private int insetBars(View v, Canvas canvas, boolean horizontal) {
+        if (!barSet) return -1;
+        int padStart = horizontal ? v.getPaddingLeft() : v.getPaddingTop();
+        int padEnd = horizontal ? v.getPaddingRight() : v.getPaddingBottom();
+        int start = horizontal ? barLeft : barTop;
+        int end = horizontal ? barRight : barBottom + keyboardPadding;
+        // How far to move the bar across, towards the content: the horizontal bar sits at the bottom, the vertical
+        // one on the side the platform puts it (the left in a right-to-left layout).
+        int shift;
+        if (horizontal) {
+            shift = v.getPaddingBottom() - (barBottom + keyboardPadding);
+        } else if (barOnLeft(v)) {
+            shift = barLeft - v.getPaddingLeft();
+        } else {
+            shift = v.getPaddingRight() - barRight;
+        }
+        if (padStart == start && padEnd == end && shift == 0) return -1;
+        int length = horizontal ? v.getWidth() : v.getHeight();
+        float from = length - padStart - padEnd, to = length - start - end;
+        int save = canvas.save();
+        if (from <= 0 || to <= 0) {
+            // No room for it between the insets.
+            canvas.clipRect(0, 0, 0, 0);
+            return save;
+        }
+        float k = to / from;
+        if (horizontal) {
+            int x = v.getScrollX();
+            canvas.translate(x + start, shift);
+            canvas.scale(k, 1);
+            canvas.translate(-(x + padStart), 0);
+        } else {
+            int y = v.getScrollY();
+            canvas.translate(shift, y + start);
+            canvas.scale(1, k);
+            canvas.translate(0, -(y + padStart));
+        }
+        return save;
+    }
+
+    /** Whether the platform draws the vertical scroll bar of {@code v} on its left, as it does by default when RTL. */
+    private static boolean barOnLeft(View v) {
+        int position = v.getVerticalScrollbarPosition();
+        if (position == View.SCROLLBAR_POSITION_DEFAULT) {
+            return v.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
+        }
+        return position == View.SCROLLBAR_POSITION_LEFT;
+    }
+
     // --- Paging and snapping ---------------------------------------------
 
     private boolean snaps() {
@@ -443,6 +520,13 @@ final class ScrollBox extends FrameLayout implements Node {
             super.draw(canvas);
             frames++;
         }
+
+        @Override
+        public void onDrawForeground(Canvas canvas) {
+            int save = insetBars(this, canvas, false);
+            super.onDrawForeground(canvas);
+            if (save >= 0) canvas.restoreToCount(save);
+        }
     }
 
     private final class HScroll extends HorizontalScrollView {
@@ -493,6 +577,13 @@ final class ScrollBox extends FrameLayout implements Node {
             super.draw(canvas);
             frames++;
         }
+
+        @Override
+        public void onDrawForeground(Canvas canvas) {
+            int save = insetBars(this, canvas, true);
+            super.onDrawForeground(canvas);
+            if (save >= 0) canvas.restoreToCount(save);
+        }
     }
 
     /** Where the touch that {@link #claim} is deciding went down; deciding while true. */
@@ -539,7 +630,7 @@ final class ScrollBox extends FrameLayout implements Node {
                     float along = horizontal ? mx : my;
                     boolean more = horizontal ? scroller.canScrollHorizontally(along < 0 ? 1 : -1)
                             : scroller.canScrollVertically(along < 0 ? 1 : -1);
-                    if (along != 0 && !more) {
+                    if (along != 0 && !more && aroundTakes(mx, my)) {
                         owning = false;
                         parent.requestDisallowInterceptTouchEvent(false);
                         yielded = true;
@@ -552,7 +643,7 @@ final class ScrollBox extends FrameLayout implements Node {
                 int slop = ViewConfiguration.get(scroller.getContext()).getScaledTouchSlop();
                 if (Math.abs(dx) <= slop && Math.abs(dy) <= slop) break;
                 claiming = false;
-                if (!scrolls(dx, dy)) {
+                if (!scrolls(dx, dy) && aroundTakes(dx, dy)) {
                     parent.requestDisallowInterceptTouchEvent(false);
                     yielded = true;
                     return true;
@@ -568,6 +659,23 @@ final class ScrollBox extends FrameLayout implements Node {
                 break;
             default:
                 break;
+        }
+        return false;
+    }
+
+    /**
+     * Whether something around this view takes a drag by ({@code dx}, {@code dy}) px that this view has no content
+     * to move for: its own pull to refresh, a pan of a view around it, or a scroll view around it that moves that
+     * way (an outer list, a pager, the host's). With none, the drag stays with the platform scroll view, which pulls
+     * its edge (the stretch from Android 12, the glow before) as a scroll view at its end does.
+     */
+    private boolean aroundTakes(float dx, float dy) {
+        if (dy > 0 && Math.abs(dy) > Math.abs(dx) && canPull()) return true;
+        boolean across = Math.abs(dx) > Math.abs(dy);
+        for (ViewParent p = getParent(); p instanceof View; p = p.getParent()) {
+            View v = (View) p;
+            if (v instanceof Box && ((Box) v).takesPan(dx, dy)) return true;
+            if (across ? v.canScrollHorizontally(dx < 0 ? 1 : -1) : v.canScrollVertically(dy < 0 ? 1 : -1)) return true;
         }
         return false;
     }
@@ -646,6 +754,12 @@ final class ScrollBox extends FrameLayout implements Node {
         if (scroller instanceof ZScroll) ((ZScroll) scroller).stop();
         else if (scroller instanceof VScroll) ((VScroll) scroller).stop();
         else if (scroller instanceof HScroll) ((HScroll) scroller).stop();
+    }
+
+    @Override
+    protected void onSizeChanged(int w, int h, int oldW, int oldH) {
+        super.onSizeChanged(w, h, oldW, oldH);
+        if (h < oldH) mounter.scrollShrank(this);
     }
 
     @Override

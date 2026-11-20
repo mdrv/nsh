@@ -17,7 +17,10 @@
   (`nsh_core::js::animation`), which decodes them, declares their types (`animation::declarations`) and gives `nsh`'s `Easing` its curves (`animation::tables`). `Animated.timing` / `spring` / `decay` / `sequence` / `parallel` / `stagger` /
   `delay` / `loop` build a `Composite` tree that runs entirely natively (`AnimationOp::StartComposite`): each step starts at the exact end
   time of the previous one (no frame gaps), `stop()` / `reset()` (back to the values at start) / `start(cb)` report `{ finished }` once
-  for the whole tree; leaf animations get internal ids (`LEAF_IDS`) that never reach JS. Composites are released when JS
+  for the whole tree; leaf animations get internal ids (`LEAF_IDS`) that never reach JS. Stopping, setting, releasing, or
+  starting another animation on a value also cancels any composite waiting to animate it before its leaf starts (queued
+  before the first tick, in a delay, or in a trailing delay hold), while active leaves still end through `leaf_ends` so
+  replacement drivers keep velocity. Composites are released when JS
   lets go of them (their finalizers queue `ReleaseComposite`); a run goes on after that. A run does not keep its
   composite (or the values it animates) alive: `nsh-js` remembers live composites by key (`Animations::composites`),
   not in the run's promise, so an endless `Animated.loop` whose values its component released stops with them (a step on
@@ -64,7 +67,12 @@
   second clock beside the display's, and no work for a hidden window whose animations only draw. The one exception is
   a test's app (`nsh test --target macos|windows`): it runs as on screen whatever covers its window (the test windows
   do not come to the front, a test machine's screen may be locked), so while it wants frames and the display gives
-  none, it gets one a frame later, drawing included (JS frame requests, a list binding rows over frames). `scrollValue` writes the scroll offset into an animated value in the same frame; `pan` lets drags drive animated values
+  none, it gets one a frame later, drawing included (JS frame requests, a list binding rows over frames).
+- **First frame**: an animation counts from the first frame anyone sees. The change that starts it often mounts and
+  lays out what it shows, which can hold the UI thread right after its first step; display frames step the graph with
+  `Graph::tick_frame`, which then counts that animation (or composite) from about the next frame instead of skipping
+  its beginning, once. Deadline steps use `Graph::tick` and keep real time. Linux (frame clock and deadlines share one
+  path) and headless tests use the plain tick. `scrollValue` writes the scroll offset into an animated value in the same frame; `pan` lets drags drive animated values
   directly, and JS receives the velocity when the drag ends. Animated values referenced by a view's style (or `pan`, `scrollValue`, ...) are kept by its node
   (`nsh-js` `dom.rs`) and derived nodes hold their inputs, so bindings do not break when JS objects are collected. In
   Rust components `AnimatedValue` / `AnimatedNode` are `Copy` handles their owner keeps; the element's bindings, a
@@ -83,7 +91,11 @@
   StaggerFrom)` counts each item's intervals from the first, the last, the center (both middles of an even count at
   once) or an index; `Animated.stagger`'s `{ from }` and `Animation::stagger_from` use it. A `MotionSpec` is several
   `MotionChannel`s (opacity, then translations, rotations and scales, the order they bind in) through keyframes with
-  one timing, its `composite` a `Parallel` (stop together) over the channels' nodes; `start_values` is where an
+  one timing, its `composite` a `Parallel` (stop together) over the channels' nodes. With a `spring` (`MotionSpec::spring`,
+  JS `spring: { stiffness, damping, mass }`), each channel is one `Driver::Spring` to where its keyframes end (one
+  iteration, so `direction` still picks the end) with `velocity: None`, after a plain `Delay`: it starts from the
+  value and velocity the interrupted motion left (`Graph::start` replaces that run from its last frame), where
+  keyframes replay from their first; keyframes between, `duration`, easings and iterations are not used. `start_values` is where an
   entrance sets the values before its first frame (`createMotion`'s `initial` sets the others; `enter` wins on the
   channels it moves). `Motion::animation` / `motion.animation(..)` return the same tree as a composite, not started,
   so motions compose (`Animated.stagger(.., cards.map((m) => m.animation(..)))`); reduced motion is decided when it
@@ -123,8 +135,11 @@
   transition's `duration_ms` otherwise. The core's `transition.rs` (the desktops) and the web (a `linear()` easing of
   its samples) follow `progress`; Android draws its samples piecewise linear (curve 6 of `Mounter.Transition`); iOS
   gives the physics to `UISpringTimingParameters` in a `UIViewPropertyAnimator`, which settles by its own threshold,
-  a few milliseconds from `settle_ms`. No JS config names one: JS's `type: "spring"` is `LayoutCurve::FittedSpring
-  { damping_ratio }`, a spring fitted to the given duration (React Native's `springDamping`).
+  a few milliseconds from `settle_ms`. JS names one by its physics: a `type: "spring"` phase with `stiffness`,
+  `damping` (the coefficient) or `mass`, the others `Animated.spring`'s defaults (170, 26, 1), decodes to
+  `LayoutTransition::spring` (`duration` and `springDamping` unused), in `configureNext` and `ViewRef.animateLayout`
+  alike (`js/animation.rs`); without them `type: "spring"` is `LayoutCurve::FittedSpring { damping_ratio }`, a
+  spring fitted to the given duration (React Native's `springDamping`).
 - **A view that follows another** (`View::follow(target)`, `core/follow.rs`; `nsh/base`'s `Tabs` indicator): its frame
   along its parent's main axis is the target's, placed by the core after layout, with no layout of its own and no
   JS. Following another element runs its `follow_transition` as a layout animation of its own frame alone (a scope of
@@ -142,6 +157,15 @@
   draws the whole text in over its runs (`Live::text_color`, `transition::recolor`: when the text is one color before
   and after), the way it draws an animated `color`, so no frame typesets the text again; `nsh_core::animation::Animator` holds the graph with its bindings to views, gestures and scroll views
   and hands each bound view its `AnimValues`.
+- **Style transitions on a spring** (`Transition::spring`: `transitionTimingFunction: "spring(k, c, m)"`, the class
+  `ease-spring-[k,c,m]`, `Styled::ease_spring`): the same `Spring` a layout spring takes, released at rest, lasting
+  `Spring::settle_ms` (`Transition::run_ms`, which `transition::restyle` / `recolor`, the exit's
+  `ElementRef::transition_time` and the platforms time by; `transitionDuration` is not used). The desktops step
+  `Spring::progress` (`Curve::Physical`); iOS gives the physics to a `CASpringAnimation` per layer property (sublayer
+  paths through `animate_geometry` too; implicit sublayer animations take a curve, `SPRING_CURVE`, without the
+  overshoot); Android interpolates the closed form in `Effects.transitionInterpolator` over the settle time it is
+  sent; the web a CSS `linear()` of its samples. Keyframes take no spring. A `cubic-bezier()` whose `y` leaves 0..1
+  overshoots everywhere (nothing clamps `y`; colors and opacity clamp their values, as CSS does).
 - **Mobile backends**: style transitions are the platform's (Core Animation on iOS, `ValueAnimator`s in
   `Mounter.java` on Android), and a view's first style does not transition (the desktops' `transition::restyle` skips it,
   iOS waits for a view it has styled before, Android for one with a style to transition from). A text's color follows the same rules as on the desktops and is drawn the same way,
@@ -193,7 +217,7 @@ maps to what:
 | `Sequence` | `Animated.sequence` / `Animation::sequence` (each step starts at the exact end of the one before) |
 | `Stagger` / `StaggerOrigin` (first, last, center, index) | `Animated.stagger(ms, list, { from })` / `Animation::stagger_from`, `StaggerFrom` |
 | `Presence` / `PresencePhase` (keeps content mounted while it exits) | `createMotion({ enter })` / `motion().entering(..)` for entrances, `await play(exit)` then removing the view for exits. Gap: no presence component that keeps a removed view mounted through its exit |
-| `MotionReveal` (measured vertical reveal, clipped) | `nsh/base`'s `Collapsible` `reveal`: a clip view between zero and the content's height whose change is a layout animation of the frames it moves (`ElementRef::animate_layout`; a critically damped spring of `spring_control`'s time), the content kept until it has closed (`docs/dev/components.md` "Children, slots and rows"). Heights are not bindable to animated values, so a reveal is a layout animation, not a progress the app drives; no reveal element of its own yet |
+| `MotionReveal` (measured vertical reveal, clipped) | `nsh/base`'s `Collapsible` `reveal`: a clip view between zero and the content's height whose change is a layout animation of the frames it moves (`ElementRef::animate_layout`; a critically damped spring of `spring_control`'s time, or the app's `revealSpring`), the content kept until it has closed (`docs/dev/components.md` "Children, slots and rows"). Heights are not bindable to animated values, so a reveal is a layout animation, not a progress the app drives; no reveal element of its own yet |
 | Reduced motion (transitions and springs snap) | Motions land at their end; the low-level `Animated` / `timing` / `keyframes` play as written and apps choose with `reduce_motion()` |
 | `MotionTransform` (translation, scale, rotation, opacity bundle) | A `Motion`'s channels (opacity, translate X / Y, rotate, rotate X / Y, scale, scale X / Y), bound with `style={m.style}` / `bind_motion` |
 

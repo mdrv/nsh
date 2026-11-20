@@ -57,7 +57,8 @@ trusted: every limit and check is enforced in Rust, never in JS.
   user activation, so never granted without a declaration, `Capabilities::all` leaves it off), `statusBar`, `process` (`execute`: exact executable names or absolute paths; `exit`: host exit requests; `env`: additional
   visible environment names), `fs` (`read` / `write`: trusted path roots), `clipboard` (`nsh`'s `Clipboard`: reading and
   writing the system clipboard; the copy menu of selectable text is the user's own act and needs none), `picker`
-  (`nsh`'s `Picker`: showing the system's picker, whose picked files reach the app; denied, a pick rejects), `speech`
+  (`nsh`'s `Picker`: showing the system's picker, whose picked files reach the app; denied, a pick rejects), `share` (`nsh`'s `Share`:
+  showing the system's share sheet; denied, `Share.show` rejects; each shared file also needs `fs.read`), `speech`
   (`nsh`'s `Speech`: the microphone and the system's speech recognizer, whose transcript reaches the app; denied,
   `Speech.start` throws), `audio` (`nsh`'s `Sound` and `AudioPlayer`: making sound; denied, `Sound.load` rejects and
   `new AudioPlayer` throws; a remote source also needs `network`), `host`
@@ -68,7 +69,7 @@ trusted: every limit and check is enforced in Rust, never in JS.
   warns of an app importing `host` from `nsh` without it (`bundle.rs` `ungranted_host`); the host's events need none, the
   host sends them), `openUrl`
   (`openUrl` of `nsh`: `true`, or `{ "schemes": [...] }` for the schemes listed), `application` (what acts on the application as a whole:
-  the main window, the application menu, the tray, global shortcuts, quitting, restarting and launching at login,
+  the application menu, the tray, global shortcuts, quitting, restarting and launching at login,
   `nsh/desktop`'s; refused commands are dropped in the core with a warning, `setLaunchAtLogin` rejects with
   `ERR_ACCESS_DENIED`; context menus show in the app's own view and windows the app opens are `windows`', so they need
   none), `homeDir` (`os.homedir()`, which fails with
@@ -76,7 +77,7 @@ trusted: every limit and check is enforced in Rust, never in JS.
   is no capability: an app's storage holds only its own data, and the host decides where it is kept. Everything not listed is denied. `nsh.json`, bundles' `capabilities.json`, packages and embedders' grants are all
   read with `from_json_lenient` (the bundler warns of what it dropped, `nsh_engine::parse_capabilities` logs it), as a newer NSH may have written them: an unknown capability is not granted, an unknown key inside one drops that
   capability or `http` grant (it may be a restriction), so unknown keys never widen access; an app without the key
-  retains unrestricted network, webview, status bar, clipboard, picker, speech, audio, URL opening, window and home directory access. Process execution, filesystem access,
+  retains unrestricted network, webview, status bar, clipboard, picker, share, speech, audio, URL opening, window and home directory access. Process execution, filesystem access,
   trusted web view input and the host's functions always require explicit declarations, including standalone apps. The embedding app
   may grant less (`NshAppView.grantCapabilities` / `NshView.setGrantedCapabilities`, the same JSON): a request must be
   allowed by both (`Access`). The declaration travels with the bundle (`capabilities.json` next to it, written by
@@ -87,7 +88,7 @@ trusted: every limit and check is enforced in Rust, never in JS.
 - Enforced in Rust: `fetch` in the engine (`access.rs`; refused requests never reach the network, and redirects are
   followed by the engine with `follow_redirects` off for the platform, so every hop is checked — hops are issued on the
   engine thread when a hop's head arrives; a streamed request body is not sent again, so a 307 / 308 then fails); remote images, placeholders, canvas images, `Image.getSize` / `prefetch`, video sources, web view
-  sources and inline HTML's base URLs, trusted web view input (`Command::SendInput`), the status bar, the clipboard, the picker, the main window and the application menu (`Command::Desktop` but `PopupMenu`, `OpenWindow` and
+  sources and inline HTML's base URLs, trusted web view input (`Command::SendInput`), the status bar, the clipboard, the picker, the share sheet, the application menu and window opening (`Command::Desktop` but `PopupMenu`, `OpenWindow` and
   the app's own windows' commands), speech sessions, sounds and players (`AudioAction::Open`) and host calls in the core (`Core::check_prop`, the commit's commands and actions;
   each refusal is logged once, target `js`, saying which key to add); top-level web view navigations on the platforms
   (`WKNavigationDelegate decidePolicyForNavigationAction` / `WebViewClient.shouldOverrideUrlLoading` → `Native.allowsWebview`).
@@ -110,8 +111,8 @@ trusted: every limit and check is enforced in Rust, never in JS.
   web views', ends the host at and Foundation's `NSURL` keeps in the user info; an ASCII control character; a host
   with percent-encoding or a WHATWG forbidden host code point) names no one host, port or path: only a grant of every
   host with no port or path covers it (`*`, or no `capabilities`), and `parse_url` gives `None` for it.
-- **Desktop system APIs**: `process` and `fs/promises` (the only process and file APIs) check the intersection of the
-  declaration and the optional host grant in Rust. Process commands match exactly: a grant for `codex` grants that
+- **System APIs**: `process` (desktops only) and `fs/promises` (every native OS and the browser's OPFS: the only
+  process and file APIs) check the intersection of the declaration and the optional host grant in Rust. Process commands match exactly: a grant for `codex` grants that
   command, while `/usr/bin/codex` requires its own entry. The runtime launches the executable directly with an
   argument array, in the app data directory or a `cwd` within an `fs.write` root, with a cleared environment
   refilled from the host's `PATH`, `HOME`, `USERPROFILE`, `SystemRoot`, `TEMP`, `TMP`, `TMPDIR`, `LANG`, `LC_*`
@@ -186,7 +187,8 @@ eleven bare specifiers and nothing else: `node:` prefixes and other Node modules
 Opening URLs (`openUrl` of `nsh`, `TextView`'s `links="open"`; `nsh_core::open_url`) is checked in Rust
 twice before anything leaves the app: the URL (`check_url`: absolute, at most 16 KiB, no whitespace or control
 characters, never `javascript:`, `vbscript:`, `data:`, `blob:`, `file:`, `about:` or `asset:`, which run code or
-reach the app's own data rather than another app; a web address needs a host) and the `openUrl` capability
+reach the app's own data rather than another app, and no scheme of one letter, which is a Windows path (`C:/…`)
+that `ShellExecuteW` would run as the program or script it names; a web address needs a host) and the `openUrl` capability
 (`Capabilities::open_url`: `true`, every scheme, or `{ "schemes": [...] }`; `Access::allows_open_url`), in the
 module's call (its promise rejects: a `TypeError` for the URL, `ERR_ACCESS_DENIED` for the capability) and again in
 the core for Rust callers (`false`, logged once). The embedding app's URL

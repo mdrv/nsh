@@ -6,9 +6,10 @@ use crate::{
     animation::{AnimationOp, AnimationProp},
     geometry::{Bounds, Points, Size},
     ops::{
-        AutoCapitalize, Command, EventMask, ImageSource, KeyboardAppearance, KeyboardDismissMode,
-        KeyboardTaps, KeyboardType, ModalAnimation, ModalPresentation, NodeId, PasteBehavior,
-        ResizeMode, ReturnKeyType, ScreenAnimation, SnapAlignment, SubmitBehavior, WebSource,
+        AutoCapitalize, Command, EventMask, HeaderTitleAlign, ImageSource, KeyboardAppearance,
+        KeyboardDismissMode, KeyboardTaps, KeyboardType, ModalAnimation, ModalPresentation, NodeId,
+        PasteBehavior, ResizeMode, ReturnKeyType, ScreenAnimation, SnapAlignment, SubmitBehavior,
+        WebSource,
     },
     props::{EdgeInsets, GestureValues, LayoutAnimation, ViewProps},
     style::{Color, TextAlign, ViewStyle},
@@ -207,6 +208,12 @@ pub struct ScrollBehavior {
     pub scrolls_to_top: bool,
     /// Room around the content.
     pub content_inset: EdgeInsets,
+    /// How far the scroll indicator keeps from each edge of the view: its
+    /// track runs between the top and bottom insets (a horizontal view's:
+    /// left and right), and it moves in from the right (bottom) edge by
+    /// the right (bottom) one. Platforms add the room they keep for the
+    /// keyboard to the bottom.
+    pub scrollbar_inset: EdgeInsets,
     /// Whether taps dismiss the keyboard.
     pub keyboard_taps: KeyboardTaps,
     /// A fling moves one snap point at most (`disableIntervalMomentum`).
@@ -247,6 +254,7 @@ impl Default for ScrollBehavior {
             bounces: true,
             scrolls_to_top: true,
             content_inset: EdgeInsets::default(),
+            scrollbar_inset: EdgeInsets::default(),
             keyboard_taps: KeyboardTaps::Never,
             one_step: false,
             min_zoom: 1.0,
@@ -410,6 +418,14 @@ pub struct ScreenConfig {
     pub large_title: bool,
     /// The content extends under the header.
     pub header_transparent: bool,
+    /// The hairline under the header (iOS).
+    pub header_shadow_visible: bool,
+    /// Where the title sits (Android; iOS's system bar always centers it and
+    /// ignores this).
+    pub title_align: HeaderTitleAlign,
+    /// A transparent header shows its background once the content scrolls
+    /// under it (iOS).
+    pub header_background_on_scroll: bool,
     /// The system tab bar leaves while this page is on top.
     pub hides_bottom_bar_when_pushed: bool,
     /// Color of the back button and bar buttons.
@@ -471,6 +487,9 @@ impl Default for ScreenConfig {
             header_visible: true,
             large_title: false,
             header_transparent: false,
+            header_shadow_visible: true,
+            title_align: HeaderTitleAlign::Left,
+            header_background_on_scroll: false,
             hides_bottom_bar_when_pushed: false,
             tint_color: None,
             background_color: None,
@@ -500,7 +519,7 @@ impl Default for ScreenConfig {
 /// transparent layer over the whole window (no card, scrim, shadow or
 /// background; `presentation` is ignored), and what shows is the app's
 /// popup and backdrop, which the runtime renders inside it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModalConfig {
     /// How it appears.
     pub animation: ModalAnimation,
@@ -528,6 +547,20 @@ pub struct ModalConfig {
     /// window, not the main one). For a window's own root: the window
     /// holding its node. The core works it out from where the node is.
     pub window: NodeId,
+    /// iOS sheets: the heights it rests at (`detents`); empty for the
+    /// system's full height.
+    pub detents: Vec<crate::SheetDetent>,
+    /// iOS sheets: the detent the app keeps it at (`detent`); applied when
+    /// it changes.
+    pub detent: Option<crate::SheetDetent>,
+    /// iOS sheets: the detent it opens at without [`Self::detent`]
+    /// (`defaultDetent`); `None` for the smallest.
+    pub default_detent: Option<crate::SheetDetent>,
+    /// iOS sheets: the system's grabber shows (`grabber`).
+    pub grabber: bool,
+    /// iOS sheets: up to this detent what is behind is not dimmed and
+    /// takes touches (`largestUndimmedDetent`).
+    pub largest_undimmed_detent: Option<crate::SheetDetent>,
 }
 
 impl Default for ModalConfig {
@@ -541,6 +574,11 @@ impl Default for ModalConfig {
             close_on_backdrop_press: true,
             close_on_swipe: true,
             window: crate::ROOT_ID,
+            detents: Vec::new(),
+            detent: None,
+            default_detent: None,
+            grabber: false,
+            largest_undimmed_detent: None,
         }
     }
 }
@@ -582,7 +620,9 @@ pub struct InputConfig {
     pub auto_correct: bool,
     /// Several lines (return inserts a line break).
     pub multiline: bool,
-    /// Maximum length in UTF-16 units.
+    /// The most characters the user's edits leave (`maxLength`), counted
+    /// as Unicode scalar values ([`crate::text_edit::char_len`]); an
+    /// insertion is cut by [`crate::text_edit::clip_chars`].
     pub max_length: Option<u32>,
     /// The user can edit the text.
     pub editable: bool,
@@ -595,6 +635,9 @@ pub struct InputConfig {
     pub paste_behavior: PasteBehavior,
     /// Focus once on screen.
     pub auto_focus: bool,
+    /// Select the whole text when the input takes the focus
+    /// (`selectTextOnFocus`).
+    pub select_text_on_focus: bool,
     /// Selection highlight color (on iOS also the caret's, unless
     /// [`InputConfig::caret_color`] is set: UIKit tints both with one).
     pub selection_color: Option<Color>,
@@ -668,6 +711,7 @@ impl Default for InputConfig {
             submit_behavior: None,
             paste_behavior: PasteBehavior::Insert,
             auto_focus: false,
+            select_text_on_focus: false,
             selection_color: None,
             caret_color: None,
             auto_fill: crate::ops::AutoFill::Default,

@@ -45,8 +45,9 @@ use windows::{
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
             Input::{
                 KeyboardAndMouse::{
-                    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
-                    TrackMouseEvent, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+                    GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
+                    VIRTUAL_KEY, VK_CONTROL, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON,
+                    VK_RWIN, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
                 },
                 Pointer::{GetPointerInfo, POINTER_INFO},
             },
@@ -58,6 +59,7 @@ use windows::{
 };
 
 use crate::{
+    chrome::{Heard, Mouse},
     input::{KeyEvent, Modifiers, PointerEvent, PointerKind, WheelEvent},
     surface::Surface,
 };
@@ -110,8 +112,8 @@ struct WindowData {
     surface: Weak<Surface>,
     /// Closing it ends the message loop when it is the last one.
     top_level: bool,
-    /// The mouse is tracked for `WM_MOUSELEAVE`.
-    tracking: Cell<bool>,
+    /// Its mouse leave tracking.
+    tracking: Cell<crate::chrome::Tracking>,
     /// Buttons held (capture is released when none is).
     buttons: Cell<u8>,
     /// The last press, for double-click counting: time (ms), point, count.
@@ -122,10 +124,22 @@ struct WindowData {
     /// makes one) must not reach `DefWindowProc`, which beeps for a menu
     /// mnemonic it cannot find.
     sys_char: Cell<bool>,
+    /// What its frame took around its client area when last measured
+    /// ([`frame_extents`]): while it has no client area (minimized, or not
+    /// placed again yet) its rects say nothing about it, and the system
+    /// asks for its track sizes then.
+    extents: Cell<Option<(i32, i32, i32, i32)>>,
+    /// What its rectangle took beyond its visible edge the last time it was
+    /// in the normal mode, and at what DPI ([`normal_margins`]).
+    margins: Cell<Option<(crate::window_state::Margins, u32)>>,
     /// Where the window was before it went full screen.
     windowed: Cell<Option<WINDOWPLACEMENT>>,
     /// Its frame's style bits before it went full screen.
     windowed_style: Cell<isize>,
+    /// The mode a hidden window was asked for, which it takes when it shows
+    /// ([`crate::window_state::set_mode`]): Windows changes a window's mode
+    /// by showing it.
+    held_mode: Cell<Option<nsh_core::desktop::WindowMode>>,
     /// What it holds of the app's window API ([`crate::shell`]).
     shell: crate::shell::Shell,
     /// The embedding app's root window an embedded surface's window
@@ -232,13 +246,16 @@ pub(crate) fn create(
     let data = Box::new(WindowData {
         surface: Rc::downgrade(surface),
         top_level: parent.is_none(),
-        tracking: Cell::new(false),
+        tracking: Cell::new(crate::chrome::Tracking::default()),
         buttons: Cell::new(0),
         last_press: Cell::new((0, (0, 0), 0)),
         surrogate: Cell::new(0),
         sys_char: Cell::new(false),
+        extents: Cell::new(None),
+        margins: Cell::new(None),
         windowed: Cell::new(None),
         windowed_style: Cell::new(0),
+        held_mode: Cell::new(None),
         shell: crate::shell::Shell::new(nsh_core::desktop::WindowKind::Normal),
         root: Cell::new(None),
         window: None,
@@ -338,13 +355,16 @@ pub(crate) fn create_app_window(
     let data = Box::new(WindowData {
         surface: Rc::downgrade(surface),
         top_level: false,
-        tracking: Cell::new(false),
+        tracking: Cell::new(crate::chrome::Tracking::default()),
         buttons: Cell::new(0),
         last_press: Cell::new((0, (0, 0), 0)),
         surrogate: Cell::new(0),
         sys_char: Cell::new(false),
+        extents: Cell::new(None),
+        margins: Cell::new(None),
         windowed: Cell::new(None),
         windowed_style: Cell::new(0),
+        held_mode: Cell::new(None),
         shell,
         root: Cell::new(None),
         window: Some(id),
@@ -396,8 +416,13 @@ pub(crate) fn fit_content(hwnd: HWND, content: (i32, i32)) {
 }
 
 /// What `hwnd`'s frame takes around its client area, in pixels: left, top,
-/// right, bottom.
+/// right, bottom. A minimized window (an icon parked off screen) and one
+/// the system has not placed again yet have no client area: their rects
+/// say nothing about their frame, which the system asks for all the while
+/// (it restores them to the track sizes it gets). What the frame took the
+/// last time it could be measured is what it takes.
 pub(crate) fn frame_extents(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let data = data(hwnd);
     let (mut window, mut client) = (RECT::default(), RECT::default());
     let mut origin = POINT::default();
     // SAFETY: queries with local out values.
@@ -406,20 +431,57 @@ pub(crate) fn frame_extents(hwnd: HWND) -> (i32, i32, i32, i32) {
             || GetClientRect(hwnd, &mut client).is_err()
             || !windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut origin).as_bool()
         {
-            return (0, 0, 0, 0);
+            return data.and_then(|d| d.extents.get()).unwrap_or((0, 0, 0, 0));
         }
     }
-    (
+    let collapsed = client.right <= client.left || client.bottom <= client.top;
+    if collapsed && let Some(extents) = data.and_then(|d| d.extents.get()) {
+        return extents;
+    }
+    let extents = (
         origin.x - window.left,
         origin.y - window.top,
         window.right - (origin.x + client.right),
         window.bottom - (origin.y + client.bottom),
-    )
+    );
+    // A measurement of no client area is not one of the frame.
+    if let Some(data) = data
+        && !collapsed
+    {
+        data.extents.set(Some(extents));
+    }
+    extents
 }
 
 /// What `hwnd` holds of the app's window API.
 pub(crate) fn shell(hwnd: HWND) -> Option<&'static crate::shell::Shell> {
     data(hwnd).map(|d| &d.shell)
+}
+
+/// The mode hidden window `hwnd` takes when it shows, if another than the
+/// one it is in.
+pub(crate) fn held_mode(hwnd: HWND) -> Option<nsh_core::desktop::WindowMode> {
+    data(hwnd).and_then(|d| d.held_mode.get())
+}
+
+/// Sets (or forgets) the mode `hwnd` takes when it shows.
+pub(crate) fn hold_mode(hwnd: HWND, mode: Option<nsh_core::desktop::WindowMode>) {
+    if let Some(data) = data(hwnd) {
+        data.held_mode.set(mode);
+    }
+}
+
+/// Reports the state of top-level window `hwnd` to its app, after a change
+/// no message of the window tells of.
+pub(crate) fn report_state(hwnd: HWND) {
+    let Some(data) = data(hwnd) else { return };
+    let Some(surface) = data.surface.upgrade() else {
+        return;
+    };
+    match data.window {
+        None => crate::window_state::report_main(&surface),
+        Some(id) => crate::app_window::state_changed(&surface, id),
+    }
 }
 
 /// The dialog root a window of the app's own shows (`None` for a
@@ -434,6 +496,22 @@ pub(crate) fn app_window_root(hwnd: HWND) -> Option<NodeId> {
 pub(crate) fn set_windowed_style(hwnd: HWND, style: isize) {
     if let Some(data) = data(hwnd) {
         data.windowed_style.set(style);
+    }
+}
+
+/// What `hwnd`'s rectangle took beyond its visible edge the last time it
+/// was in the normal mode, at `dpi` (the frame scales with the window).
+pub(crate) fn normal_margins(hwnd: HWND, dpi: u32) -> Option<crate::window_state::Margins> {
+    let ((l, t, r, b), at) = data(hwnd)?.margins.get()?;
+    let scale = |v: i32| (v as f32 * dpi as f32 / at as f32).round() as i32;
+    Some((scale(l), scale(t), scale(r), scale(b)))
+}
+
+/// Keeps what `hwnd`'s rectangle takes beyond its visible edge in the
+/// normal mode, at `dpi` ([`normal_margins`]).
+pub(crate) fn set_normal_margins(hwnd: HWND, margins: crate::window_state::Margins, dpi: u32) {
+    if let Some(data) = data(hwnd) {
+        data.margins.set(Some((margins, dpi)));
     }
 }
 
@@ -557,9 +635,17 @@ fn toggle_full_screen_inner(hwnd: HWND) {
 }
 
 /// Shows a top-level window (without activating it when its attributes
-/// say so), and keeps it out of the taskbar if it is. A background app's
-/// shows without activating, the window that would have the keyboard.
+/// say so), in the mode it was asked for while hidden, and keeps it out of
+/// the taskbar if it is. A background app's shows without activating, the
+/// window that would have the keyboard.
 pub(crate) fn show(hwnd: HWND) {
+    show_as_it_is(hwnd);
+    crate::window_state::enter_held_mode(hwnd);
+}
+
+/// [`show`] without the mode held for it, which the caller enters
+/// ([`crate::window_state::enter_held_mode`]).
+pub(crate) fn show_as_it_is(hwnd: HWND) {
     let activate = shell(hwnd).is_none_or(|s| {
         let a = s.attrs();
         a.activate && a.focusable
@@ -1227,7 +1313,12 @@ fn handle(
     match msg {
         WM_NSH_WAKE => surface.drain(),
         WM_NSH_TICK => surface.tick(),
-        WM_NSH_MENU => crate::chrome::show_popup(surface),
+        // An app-level popup (the host is not a user window) belongs to the
+        // focused window of the app's own, where the app is working.
+        WM_NSH_MENU => crate::chrome::show_popup(
+            surface,
+            crate::app_window::focused_hwnd(surface).unwrap_or(hwnd),
+        ),
         crate::tray::WM_NSH_TRAY => {
             crate::tray::message(surface, hwnd, wparam, lparam);
             return Some(LRESULT(0));
@@ -1322,30 +1413,23 @@ fn handle(
             if crate::chrome::press_moved(surface, hwnd, lparam) {
                 return Some(LRESULT(0));
             }
-            if !data.tracking.replace(true) {
-                let mut track = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                // SAFETY: a valid structure for this window.
-                let _ = unsafe { TrackMouseEvent(&mut track) };
-            }
             crate::chrome::client_mouse_moved(surface, hwnd);
-            let (x, y) = point(lparam);
-            let held = held_buttons(wparam);
-            crate::input::pointer(
-                surface,
-                mouse_event(PointerKind::Move, x, y, 0, held, 1, surface),
-            );
+            let content = crate::chrome::client_point_is_content(hwnd, lparam);
+            let event = match crate::chrome::track(surface, hwnd, Mouse::ClientMove { content }) {
+                Heard::Here => {
+                    let (x, y) = point(lparam);
+                    mouse_event(PointerKind::Move, x, y, 0, held_buttons(wparam), 1, surface)
+                }
+                Heard::Left => mouse_event(PointerKind::Leave, -1.0, -1.0, 0, 0, 0, surface),
+                Heard::Nothing => return None,
+            };
+            crate::input::pointer(surface, event);
         }
         WM_MOUSELEAVE => {
-            data.tracking.set(false);
-            crate::input::pointer(
-                surface,
-                mouse_event(PointerKind::Leave, -1.0, -1.0, 0, 0, 0, surface),
-            );
+            crate::chrome::track(surface, hwnd, Mouse::ClientLeave);
+        }
+        WM_TIMER if crate::chrome::recheck_timer(surface, hwnd, wparam.0) => {
+            return Some(LRESULT(0));
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_LBUTTONDBLCLK
         | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK | WM_XBUTTONDBLCLK => {
@@ -1483,6 +1567,12 @@ fn handle(
         WM_SETCURSOR if lo(lparam.0) == HTCLIENT as i32 => {
             update_cursor(surface, hwnd, scale);
             return Some(LRESULT(1));
+        }
+        // The Menu key's or Shift+F10's own request (no pointer: -1) after
+        // the key opened NSH's menu: answered here, as `DefWindowProc` would
+        // pass it on to the parent window of an embedded surface.
+        WM_CONTEXTMENU if lparam.0 == -1 && crate::input::keyboard_context_menu_opened(surface) => {
+            return Some(LRESULT(0));
         }
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let event = key_event(msg, wparam, lparam);
@@ -1643,6 +1733,7 @@ fn window_api(
         }
         WM_EXITSIZEMOVE => {
             shell.sizing.set(false);
+            crate::chrome::hold_ended(hwnd);
             match data.window {
                 Some(id) => crate::app_window::state_changed(surface, id),
                 None => crate::window_state::report_main(surface),
@@ -1651,6 +1742,10 @@ fn window_api(
         }
         WM_ACTIVATE => {
             let active = (wparam.0 & 0xFFFF) != 0;
+            if !active {
+                // The press on a drag region it held will see no release.
+                crate::chrome::press_lost(surface, hwnd);
+            }
             match data.window {
                 Some(id) => {
                     crate::app_window::state_changed(surface, id);
@@ -1874,16 +1969,108 @@ pub(crate) fn click(surface: &Rc<Surface>, from: (f32, f32), to: (f32, f32)) {
     crate::input::pointer(surface, up);
 }
 
-/// The pointer moved over a view of the app's title bar that answers as
-/// the frame (`windowDrag`, `windowControl`) at `at` (client points), or
-/// left it (`None`): the views hear it as the client area's moves, for
-/// their hover styles.
+/// The pointer moved over a view of the app's that answers as the frame
+/// (`windowDrag`, `windowControl`, `windowResize`) at `at` (client
+/// points), or left the app's content (`None`): the views hear it as the
+/// client area's moves, for their hover styles. A leave message's look at
+/// where the pointer is ([`crate::chrome::track`]) reports the same way.
 pub(crate) fn nc_pointer(surface: &Rc<Surface>, at: Option<(f32, f32)>) {
-    let event = match at {
-        Some((x, y)) => mouse_event(PointerKind::Move, x, y, 0, 0, 1, surface),
-        None => mouse_event(PointerKind::Leave, -1.0, -1.0, 0, 0, 0, surface),
-    };
-    crate::input::pointer(surface, event);
+    let (kind, x, y, buttons, clicks) = region_pointer(at, buttons_down());
+    crate::input::pointer(
+        surface,
+        mouse_event(kind, x, y, 0, buttons, clicks, surface),
+    );
+}
+
+/// As [`nc_pointer`], for the first look after the system held window
+/// `hwnd`'s pointer ([`crate::chrome::hold_ended`]). The press that began
+/// the hold was never the views': its button, should it still be down
+/// (the move loop ended by Escape, a press let go as stale), would tell
+/// them of a drag they never saw start. Only the buttons the window heard
+/// go down count ([`WindowData::buttons`], a client drag the app follows);
+/// a drag begun in another window loses its button for this one move,
+/// and its next move carries it again.
+pub(crate) fn hold_pointer(surface: &Rc<Surface>, hwnd: HWND, at: Option<(f32, f32)>) {
+    let heard = data(hwnd).map_or(0, |d| d.buttons.get());
+    let (kind, x, y, buttons, clicks) = region_pointer(at, buttons_down() & heard);
+    crate::input::pointer(
+        surface,
+        mouse_event(kind, x, y, 0, buttons, clicks, surface),
+    );
+}
+
+/// The logical primary button is down now ([`buttons_down`]).
+pub(crate) fn primary_down() -> bool {
+    buttons_down() & 1 != 0
+}
+
+/// What [`nc_pointer`] reports: a move at `at` with the buttons held
+/// (`held`, as [`PointerEvent::buttons`] numbers them: a move without them
+/// would tell the views the drag's button went up), or a leave, which has
+/// neither a place nor buttons. Kind, x, y, buttons, clicks.
+fn region_pointer(at: Option<(f32, f32)>, held: u8) -> (PointerKind, f32, f32, u8, u32) {
+    match at {
+        Some((x, y)) => (PointerKind::Move, x, y, held, 1),
+        None => (PointerKind::Leave, -1.0, -1.0, 0, 0),
+    }
+}
+
+/// Window `hwnd`'s mouse leave tracking.
+pub(crate) fn tracking(hwnd: HWND) -> Option<&'static Cell<crate::chrome::Tracking>> {
+    data(hwnd).map(|d| &d.tracking)
+}
+
+/// The buttons held now, numbered as [`held_buttons`] numbers a client
+/// mouse message's. A non-client message and a leave carry none, and the
+/// window's own presses ([`WindowData::buttons`]) miss a drag that began
+/// outside it, so they come from `GetAsyncKeyState`, which is documented
+/// to report the physical buttons (swapped into the logical ones with
+/// `SM_SWAPBUTTON`, [`mouse_keys`]). The trade-off: it reads the buttons
+/// now, not as of the message being handled, so under a backlog a queued
+/// non-client move can disagree with a client move's `MK_*` keys. It is
+/// used because the thread's own key state (`GetKeyState`) never sees a
+/// drag begun in another thread's window.
+fn buttons_down() -> u8 {
+    // SAFETY: a plain query.
+    let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
+    // SAFETY: plain state queries.
+    let keys = mouse_keys(|vk| unsafe { GetAsyncKeyState(vk.0 as i32) } < 0, swapped);
+    held_buttons(WPARAM(keys))
+}
+
+/// The `MK_*` keys of the logical buttons held, from `is_down`, the state
+/// of each physical button's virtual key, and `swapped`, the system's
+/// `SM_SWAPBUTTON` ([`logical_keys`]).
+fn mouse_keys(is_down: impl Fn(VIRTUAL_KEY) -> bool, swapped: bool) -> usize {
+    const KEYS: [(VIRTUAL_KEY, usize); 5] = [
+        (VK_LBUTTON, 0x1),
+        (VK_RBUTTON, 0x2),
+        (VK_MBUTTON, 0x10),
+        (VK_XBUTTON1, 0x20),
+        (VK_XBUTTON2, 0x40),
+    ];
+    let physical = KEYS
+        .iter()
+        .filter(|(vk, _)| is_down(*vk))
+        .fold(0, |keys, (_, mk)| keys | mk);
+    logical_keys(physical, swapped)
+}
+
+/// The `MK_*` keys of the logical buttons, from those of the physical
+/// buttons held (`physical`, `VK_LBUTTON` being the physical left one):
+/// with the buttons swapped (`SM_SWAPBUTTON`, a left-handed mouse) the
+/// physical left button is the logical right one, as the mouse messages
+/// say, and the other way round. The middle and X buttons are never
+/// swapped.
+fn logical_keys(physical: usize, swapped: bool) -> usize {
+    const LEFT: usize = 0x1;
+    const RIGHT: usize = 0x2;
+    if !swapped {
+        return physical;
+    }
+    let left = if physical & LEFT != 0 { RIGHT } else { 0 };
+    let right = if physical & RIGHT != 0 { LEFT } else { 0 };
+    (physical & !(LEFT | RIGHT)) | left | right
 }
 
 /// Lines one wheel notch scrolls (the user's setting, 3 by default).
@@ -2619,6 +2806,76 @@ mod tests {
         // SAFETY: as above.
         unsafe { DestroyWindow(hwnd).unwrap() };
         assert!(after >= 2, "the frame asked for while drawing never came");
+    }
+
+    #[test]
+    fn a_rechecked_move_keeps_the_buttons_held() {
+        // Dragging with the left button across a drag region: the views
+        // hear the move with the button still down.
+        assert_eq!(
+            region_pointer(Some((12.0, 8.0)), 0b1),
+            (PointerKind::Move, 12.0, 8.0, 0b1, 1)
+        );
+        // The mask is the one presses build (`1 << button_of`), which is
+        // what a mouse message's own keys decode to.
+        let right = 1 << button_of(WM_RBUTTONDOWN, WPARAM(0));
+        assert_eq!(right, held_buttons(WPARAM(0x2)));
+        assert_eq!(region_pointer(Some((0.0, 0.0)), right).3, right);
+        // No button held, and a leave, as before.
+        assert_eq!(
+            region_pointer(Some((1.0, 2.0)), 0),
+            (PointerKind::Move, 1.0, 2.0, 0, 1)
+        );
+        assert_eq!(
+            region_pointer(None, 0b1),
+            (PointerKind::Leave, -1.0, -1.0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn swapped_buttons_are_held_as_the_messages_name_them() {
+        // The physical left button of a left-handed mouse is the logical
+        // right one: a drag with it holds the right button, as its
+        // `WM_RBUTTONDOWN` and `MK_RBUTTON` say.
+        let left = 1 << button_of(WM_LBUTTONDOWN, WPARAM(0));
+        let right = 1 << button_of(WM_RBUTTONDOWN, WPARAM(0));
+        assert_eq!(held_buttons(WPARAM(logical_keys(0x1, true))), right);
+        assert_eq!(held_buttons(WPARAM(logical_keys(0x2, true))), left);
+        assert_eq!(held_buttons(WPARAM(logical_keys(0x3, true))), left | right);
+        // Unswapped, the physical buttons are the logical ones.
+        assert_eq!(held_buttons(WPARAM(logical_keys(0x1, false))), left);
+        assert_eq!(held_buttons(WPARAM(logical_keys(0x2, false))), right);
+        // The middle and X buttons stay, swapped or not.
+        for swapped in [false, true] {
+            assert_eq!(logical_keys(0x70, swapped), 0x70);
+            assert_eq!(
+                logical_keys(0x11, swapped),
+                if swapped { 0x12 } else { 0x11 }
+            );
+        }
+        assert_eq!(logical_keys(0, true), 0);
+    }
+
+    #[test]
+    fn the_virtual_keys_down_are_the_logical_buttons_held() {
+        let only = |key: VIRTUAL_KEY| move |vk: VIRTUAL_KEY| vk == key;
+        let left = 1 << button_of(WM_LBUTTONDOWN, WPARAM(0));
+        let right = 1 << button_of(WM_RBUTTONDOWN, WPARAM(0));
+        let middle = 1 << button_of(WM_MBUTTONDOWN, WPARAM(0));
+        let held = |keys| held_buttons(WPARAM(keys));
+        assert_eq!(held(mouse_keys(only(VK_LBUTTON), false)), left);
+        assert_eq!(held(mouse_keys(only(VK_RBUTTON), false)), right);
+        // A left-handed mouse: the physical left button is the logical
+        // right one, as its messages say.
+        assert_eq!(held(mouse_keys(only(VK_LBUTTON), true)), right);
+        assert_eq!(held(mouse_keys(only(VK_RBUTTON), true)), left);
+        assert_eq!(held(mouse_keys(only(VK_MBUTTON), true)), middle);
+        assert_eq!(mouse_keys(only(VK_XBUTTON1), true), 0x20);
+        assert_eq!(mouse_keys(only(VK_XBUTTON2), false), 0x40);
+        assert_eq!(mouse_keys(|_| false, true), 0);
+        assert_eq!(mouse_keys(|_| true, true), 0x73);
+        // Keys that are no mouse buttons are never asked about.
+        assert_eq!(mouse_keys(only(VK_SHIFT), false), 0);
     }
 
     #[test]

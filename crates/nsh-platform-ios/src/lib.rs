@@ -60,6 +60,7 @@
 mod agent;
 mod animation;
 mod app;
+mod auth_session;
 mod blur;
 mod bottom_bar;
 mod canvas;
@@ -70,6 +71,7 @@ pub mod dev;
 #[cfg(feature = "embed")]
 pub mod embed;
 mod fps;
+mod haptics;
 mod image;
 mod input;
 mod interaction;
@@ -81,9 +83,11 @@ mod navigation;
 mod net;
 mod picker;
 mod press;
+mod scroll_edge;
 mod scroll_watch;
 mod selectable_view;
 mod shader;
+mod share;
 mod split;
 // Sound (`Sound`, `AudioPlayer`), the Speech framework's recognizer and the
 // notification center, shared with macOS.
@@ -92,8 +96,11 @@ mod surface;
 #[cfg(feature = "dev")]
 mod synth;
 mod system;
+mod system_context_menu;
+mod system_date_time_picker;
 mod system_menu_button;
 mod system_segmented_control;
+mod system_switch;
 mod system_tab_bar;
 mod target;
 mod text;

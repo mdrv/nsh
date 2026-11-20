@@ -32,6 +32,7 @@ fn table() -> impl IntoElement {
 ```tsx tabs
 import { mount } from "nsh";
 import { DataTable, type DataTableColumn } from "nsh/base";
+import { Window } from "nsh/desktop";
 
 const columns: DataTableColumn[] = [
   { key: "name", title: "Name", width: 160, sortable: true },
@@ -49,7 +50,11 @@ function App() {
   return <DataTable columns={columns} data={rows} class="flex-1" />;
 }
 
-mount(App);
+mount(() => (
+  <Window id="main">
+    <App />
+  </Window>
+));
 ```
 
 表格填满应用给它的盒子（`flex-1`、一个高度），在其中滚动：纵向滚动所有行，横向滚动所有列，带滚动条（`scrollbar={false}` 隐藏滚动条，`bounces={false}` 关闭有回弹的平台上的边缘回弹）。
@@ -229,7 +234,7 @@ const columns: DataTableColumn[] = [
 
 ## 绘制单元格和标题
 
-当某一列不只是文字时（徽标、按钮），用 `renderCell` 绘制应用自己的单元格。它只为视野中的单元格调用，参数是 `DataTableCell`：`row`、`column`、`key`、`text`（表格原本会显示的文字）和 `selected`。应用按 `row` 查找自己的数据。`renderHeaderCell` 绘制铺满单元格的标题，参数是 `DataTableHeaderCell`：`column`、`key`、`title`、`sort`（方向，或无）和 `selected`。
+当某一列不只是文字时（徽标、按钮），用 `renderCell` 绘制应用自己的单元格。它只为视野中的单元格调用，参数是 `DataTableCell`：`row`、`column`、`key`、`text`（表格原本会显示的文字）和 `selected`。应用按 `row` 查找自己的数据。它绘制的视图和表格外的视图一样响应按下和指针：`onPress`、`hover:` 类、`onMouseEnter` / `onMouseMove` / `onMouseLeave`；`classes.row` 设为 `"group"` 时，指针所在行的 `group-hover:` 类也会生效。`renderHeaderCell` 绘制铺满单元格的标题，参数是 `DataTableHeaderCell`：`column`、`key`、`title`、`sort`（方向，或无）和 `selected`。
 
 ```tsx
 <DataTable

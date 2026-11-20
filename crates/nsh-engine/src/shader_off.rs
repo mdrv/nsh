@@ -35,7 +35,33 @@ pub struct Renderer {
 impl Renderer {
     /// `None`: this build has no renderer.
     pub fn new(_format: PixelFormat) -> Option<Renderer> {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            log::warn!(
+                "a shader view draws nothing: this runtime was built without the NSH platform crate's feature `shader`"
+            )
+        });
         None
+    }
+
+    /// Calls `done(None)` at once: this build has no renderer.
+    pub fn open(_format: PixelFormat, done: impl FnOnce(Option<Renderer>) + Send + 'static) {
+        done(None);
+    }
+
+    /// Does nothing: no pipeline is ever compiled (`f` is dropped).
+    pub fn on_pipeline_ready(&self, f: impl Fn() + Send + Sync + 'static) {
+        drop(f);
+    }
+
+    /// `false`: no pipeline is ever compiled.
+    pub fn compiling(&self) -> bool {
+        false
+    }
+
+    /// `true` at once: no pipeline is ever compiled.
+    pub fn wait_for_pipelines(&self, _timeout: Duration) -> bool {
+        true
     }
 
     /// The format of the frames.
@@ -116,6 +142,11 @@ impl ShaderView {
 
     /// `false`: there are no frames.
     pub fn wants_frame(&self) -> bool {
+        false
+    }
+
+    /// `false`: nothing compiles.
+    pub fn compiling(&self) -> bool {
         false
     }
 

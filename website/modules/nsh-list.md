@@ -22,6 +22,7 @@ function List<T>(props: ListProps<T>): JSX.Element;
 
 ```tsx
 import { List, mount, Text, View } from "nsh";
+import { Window } from "nsh/desktop";
 
 const contacts = Array.from({ length: 1000 }, (_, i) => ({ id: String(i), name: `Contact ${i}` }));
 
@@ -37,7 +38,11 @@ function App() {
   );
 }
 
-mount(App);
+mount(() => (
+  <Window id="main">
+    <App />
+  </Window>
+));
 ```
 
 ### Rows are recycled
@@ -125,6 +130,7 @@ interface ViewabilityConfig {
 | `disableIntervalMomentum` | `boolean` | `false` | A fling moves one snap point at most. |
 | `decelerationRate` | `"normal" \| "fast" \| number` | platform | How fast a fling slows down (`0.998` / `0.99`, or the velocity kept per millisecond). |
 | `contentInset` | `Partial<Edges>` | | Room around the content. |
+| `scrollbarInset` | `Partial<Edges>` | | Keeps the scroll indicator this far from the view's edges. |
 | `contentOffset` | `{ x?, y? }` | | Where it starts. |
 | `keyboardShouldPersistTaps` | `"never" \| "always" \| "handled" \| boolean` | `"never"` | Whether a tap dismisses the keyboard (`"never"`: the tap only dismisses it). |
 | `keyboardDismissMode` | `"none" \| "on-drag" \| "interactive"` | `"none"` | Whether dragging dismisses the keyboard. |

@@ -170,6 +170,24 @@ fn add_component(name: &str, missing: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Whether the component `name` of this CLI's distribution was built with
+/// it; outside a distribution (a checkout's build, a runtime laid out by
+/// hand) whatever is there is used.
+fn distribution_current(name: &str) -> bool {
+    let Some(root) = crate::component::distribution() else {
+        return true;
+    };
+    // Laid out without the component machinery: no record to check.
+    if !root
+        .join("components")
+        .join(format!("{name}.json"))
+        .exists()
+    {
+        return true;
+    }
+    crate::component::current(&root, name)
+}
+
 /// This `nsh`, through symlinks: an installer links `~/.local/bin/nsh` (or
 /// `/opt/homebrew/bin/nsh`) to the distribution's `bin/nsh`, whose runtimes
 /// are next to the real file. macOS reports the path as it was run, Linux
@@ -213,7 +231,7 @@ fn prebuilt_android(dev: bool) -> anyhow::Result<PathBuf> {
     let exe = cli_exe()?;
     let bin = exe.parent().context("cli has no parent directory")?;
     let dist = bin.join("../runtime/android").join(variant);
-    if dist.join("classes.dex").exists() {
+    if dist.join("classes.dex").exists() && distribution_current("android") {
         return Ok(dist);
     }
     if add_component("android", &dist.join("classes.dex"))? {
@@ -429,7 +447,9 @@ pub(crate) fn web(kind: WebKind, build: bool) -> anyhow::Result<Option<WebRuntim
     }
     let exe = cli_exe()?;
     let bin = exe.parent().context("cli has no parent directory")?;
-    if let Some(runtime) = found(bin.join("../runtime/web")) {
+    if let Some(runtime) = found(bin.join("../runtime/web"))
+        && (!build || distribution_current("web"))
+    {
         return Ok(Some(runtime));
     }
     if build && add_component("web", &bin.join("../runtime/web").join(kind.file()))? {
@@ -532,7 +552,7 @@ pub(crate) fn file_for(
     let bin = exe.parent().context("cli has no parent directory")?;
     // Distribution: bin/nsh + runtime/.
     let dist = bin.join("../runtime").join(platform.dir()).join(&file_name);
-    if dist.exists() {
+    if dist.exists() && platform.component().is_none_or(distribution_current) {
         return Ok(dist);
     }
     if let Some(component) = platform.component()
@@ -545,6 +565,11 @@ pub(crate) fn file_for(
     let mut host_target = None;
     if let Some(root) = checkout(bin) {
         let mut args = vec!["build", "-p", name];
+        // Web views need WebKitGTK 6.0 to build: without it, the host shows
+        // a placeholder instead (#2377).
+        if matches!(platform, Platform::Linux) && !runner && !linux_web_views() {
+            args.push("--no-default-features");
+        }
         // GPUI has its own workspace. Run there so Cargo reads its config,
         // and ask Cargo where it builds rather than imposing the CLI's target.
         let workspace = if matches!(platform, Platform::Gpui) {
@@ -832,6 +857,28 @@ pub(crate) fn copy_browser_host(source: &Path, target: &Path) -> anyhow::Result<
     Ok(())
 }
 
+/// Whether this machine can build Linux web views: `pkg-config` finds
+/// WebKitGTK 6.0, or there is no `pkg-config` to ask (the build says
+/// then). A development host built without them shows a placeholder for
+/// each web view, which this says once (#2377). Release runners do not
+/// ask: an app that makes a web view must build with them.
+pub(crate) fn linux_web_views() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let found = std::process::Command::new("pkg-config")
+            .args(["--exists", "webkitgtk-6.0"])
+            .status()
+            .map_or(true, |s| s.success());
+        if !found {
+            crate::ui::warn(
+                "WebKitGTK 6.0 is not installed (webkitgtk-6.0 / libwebkitgtk-6.0-dev): \
+                 the development host builds without web views, which show a placeholder",
+            );
+        }
+        found
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::Platform;
@@ -973,3 +1020,4 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+

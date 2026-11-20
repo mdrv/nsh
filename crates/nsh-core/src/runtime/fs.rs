@@ -640,6 +640,54 @@ fn grant(sys: &System, path: &str, write: bool) -> Result<Grant, JsError> {
     ))
 }
 
+/// The real path of the file at `path` the app may share (`Share.show`'s
+/// `files`): granted to read as `fs/promises` reads it, resolved through
+/// its links and still inside the root that grants it, and a file that
+/// exists. Rejects as `fs/promises` would: `ERR_ACCESS_DENIED` for a path
+/// no grant covers (or a link leading out of its root), `ENOENT` for one
+/// that is no file.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn shared_file(sys: &System, path: &str) -> Result<PathBuf, JsError> {
+    let grant = grant(sys, path, false)?;
+    let mut escaped = false;
+    for (root, relative) in &grant.within {
+        let (Ok(real), Ok(real_root)) = (
+            crate::access::canonicalize(&root.join(relative)),
+            crate::access::canonicalize(root),
+        ) else {
+            continue;
+        };
+        if inside(&real, &real_root).is_none() {
+            escaped = true;
+            continue;
+        }
+        if real.is_file() {
+            return Ok(real);
+        }
+    }
+    if escaped {
+        return Err(JsError::access_denied(
+            format!("share: `{path}` leads out of the roots capabilities.fs.read grants"),
+            "fs",
+            path,
+        ));
+    }
+    Err(
+        JsError::from(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .with_code("ENOENT")
+            .with("path", path),
+    )
+}
+
+/// Browsers' pages share no local files: their files are the page's own.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn shared_file(_sys: &System, path: &str) -> Result<PathBuf, JsError> {
+    Err(JsError::Error(format!(
+        "share: this platform shares no local files (`{path}`)"
+    ))
+    .with_code(codes::UNAVAILABLE))
+}
+
 /// The path a call names, its placeholder (`${dataDir}`, ...) resolved. A
 /// `..` the placeholder's own resolution refuses is kept as written, so a
 /// path climbing out of every root is refused as any path outside them is
@@ -1309,58 +1357,54 @@ pub(crate) mod confined {
     /// cannot redirect the root.
     #[cfg(unix)]
     pub(crate) fn open_root(path: &Path) -> io::Result<Dir> {
-        use std::{
-            ffi::CString,
-            os::{
-                fd::{AsRawFd, FromRawFd},
-                unix::ffi::OsStrExt,
-            },
-            path::Component,
-        };
-        let mut current = std::fs::File::open("/")?;
-        let parts: Vec<_> = path.components().collect();
-        for (i, part) in parts.iter().enumerate() {
-            // An ancestor is only passed through: opened for search, it
-            // needs no read permission (a home directory may be 0711).
-            let through = i + 1 < parts.len();
-            match part {
-                Component::RootDir => (),
-                Component::Normal(name) => {
-                    let name = CString::new(name.as_bytes())
-                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-                    let open = |access: libc::c_int| {
-                        // SAFETY: current is a live directory and name is
-                        // NUL-terminated; the descriptor returned is owned
-                        // below.
-                        unsafe {
-                            libc::openat(
-                                current.as_raw_fd(),
-                                name.as_ptr(),
-                                access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                            )
-                        }
-                    };
-                    let mut fd = if through {
-                        open(SEARCH)
-                    } else {
-                        open(libc::O_RDONLY)
-                    };
-                    // A kernel without the search mode (macOS before 13)
-                    // refuses it: read the directory then.
-                    if fd < 0 && through && SEARCH != libc::O_RDONLY {
-                        fd = open(libc::O_RDONLY);
-                    }
-                    if fd < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // SAFETY: openat returned a new descriptor nothing else
-                    // owns.
-                    current = unsafe { std::fs::File::from_raw_fd(fd) };
-                }
-                _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
-            }
+        use std::{ffi::CString, os::fd::AsRawFd, os::unix::ffi::OsStrExt, path::Component};
+
+        let mut parts = path.components().peekable();
+        if parts.next() != Some(Component::RootDir) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // A sandbox may permit traversing / without permitting its contents to be listed.
+        let mut current = open_dir_at(libc::AT_FDCWD, c"/", parts.peek().is_some())?;
+        while let Some(part) = parts.next() {
+            let Component::Normal(name) = part else {
+                return Err(io::ErrorKind::InvalidInput.into());
+            };
+            let name = CString::new(name.as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            current = open_dir_at(current.as_raw_fd(), &name, parts.peek().is_some())?;
         }
         Ok(Dir::from_std_file(current))
+    }
+
+    #[cfg(unix)]
+    fn open_dir_at(
+        parent: std::os::fd::RawFd,
+        name: &std::ffi::CStr,
+        through: bool,
+    ) -> io::Result<std::fs::File> {
+        use std::os::fd::FromRawFd;
+
+        let open = |access| {
+            // SAFETY: parent is AT_FDCWD for / or a live directory descriptor.
+            // name is NUL-terminated. Each opened directory stays pinned for the next step.
+            unsafe {
+                libc::openat(
+                    parent,
+                    name.as_ptr(),
+                    access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            }
+        };
+        let mut fd = open(if through { SEARCH } else { libc::O_RDONLY });
+        if fd < 0 && through && SEARCH != libc::O_RDONLY {
+            // Some older kernels do not support the search-only mode.
+            fd = open(libc::O_RDONLY);
+        }
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned an owned descriptor.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
     }
 
     /// Opens a canonical root. cap-std confines every later operation to

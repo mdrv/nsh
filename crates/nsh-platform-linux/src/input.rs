@@ -236,6 +236,8 @@ struct Wheel {
     /// Accumulated deltas, for the velocity.
     total: (f32, f32),
     velocity: VelocityTracker,
+    /// When the fingers last moved (ms).
+    moved: f64,
     /// Began with a hold (fingers resting) and has not scrolled yet.
     held: bool,
 }
@@ -530,7 +532,10 @@ fn shows_ibeam(view: &NshView) -> bool {
 }
 
 fn shows_ibeam_state(view: &NshView, s: &crate::view::ViewState) -> bool {
-    s.text.is_some() && (crate::text::selectable(s) || crate::selectable_view::takes_part(view))
+    s.text.is_some()
+        && (crate::text::selectable(s)
+            || (crate::selectable_view::takes_part(view)
+                && !crate::selectable_view::cursor_above(view)))
 }
 
 fn set_cursor(view: &NshView, over_link: bool) {
@@ -1276,7 +1281,7 @@ pub(crate) fn simulate(surface: &Rc<Surface>, action: Simulated) {
 #[cfg(feature = "dev")]
 fn focus_native(widget: &gtk::Widget) {
     if let Some(text) = text_inside(widget)
-        && text.grab_focus_without_selecting()
+        && focus_text(&text)
     {
         return;
     }
@@ -1293,11 +1298,36 @@ fn focus_native(widget: &gtk::Widget) {
     }
 }
 
-/// `widget` if it is a `GtkText`, else the first inside it.
+/// Focuses a text field. A line takes the focus itself
+/// (`grab_focus_without_selecting`); an area (`GtkTextView`) is the
+/// window's focus widget (`GtkRoot::set_focus`): `grab_focus` refuses a
+/// widget whose own or an ancestor's `can-focus` is off
+/// (`get_effective_can_focus`), which NSH turns off on the views a modal
+/// keeps the keyboard from (`ScreenNav::scope_focus`), and a press focuses
+/// the field it lands in regardless.
 #[cfg(feature = "dev")]
-fn text_inside(widget: &gtk::Widget) -> Option<gtk::Text> {
-    if let Some(text) = widget.downcast_ref::<gtk::Text>() {
-        return Some(text.clone());
+fn focus_text(widget: &gtk::Widget) -> bool {
+    if let Some(line) = widget.downcast_ref::<gtk::Text>() {
+        return line.grab_focus_without_selecting();
+    }
+    if !widget.is_sensitive() {
+        return false;
+    }
+    match widget.root() {
+        Some(root) => {
+            root.set_focus(Some(widget));
+            true
+        }
+        None => false,
+    }
+}
+
+/// The text field in `widget`: a line's `GtkText`, an area's
+/// `GtkTextView`, or the first of either inside it.
+#[cfg(feature = "dev")]
+fn text_inside(widget: &gtk::Widget) -> Option<gtk::Widget> {
+    if widget.is::<gtk::Text>() || widget.is::<gtk::TextView>() {
+        return Some(widget.clone());
     }
     let mut child = widget.first_child();
     while let Some(c) = child {
@@ -2922,22 +2952,36 @@ fn wheel_input(
                 w.total.1 += dy;
                 w.velocity
                     .add(time, point(Points(w.total.0), Points(w.total.1)));
+                w.moved = time;
                 w.view.clone()
             };
             crate::scroll::wheel(surface, &view, dx, dy);
             true
         }
         WheelInput::Stop => {
-            let Some(mut w) = input.wheel.borrow_mut().take() else {
+            let Some(w) = input.wheel.borrow_mut().take() else {
                 return false;
             };
-            w.velocity
-                .add(time, point(Points(w.total.0), Points(w.total.1)));
-            let (vx, vy) = w.velocity.velocity();
+            let (vx, vy) = release_velocity(&w.velocity, w.moved, time);
             crate::scroll::wheel_end(surface, &w.view, vx, vy);
             true
         }
     }
+}
+
+/// Fingers resting this long (ms) before they lift end the scroll without
+/// a glide.
+const FLING_PAUSE: f64 = 50.0;
+
+/// The speed the fingers had when they lifted at `time`. The stop event
+/// marks the end of the gesture, not a sample of its motion: counting the
+/// few ms between the last move and the lift as part of the flick would
+/// underestimate it (#2326).
+fn release_velocity(velocity: &VelocityTracker, moved: f64, time: f64) -> (f32, f32) {
+    if time - moved > FLING_PAUSE {
+        return (0.0, 0.0);
+    }
+    velocity.velocity()
 }
 
 fn new_wheel(view: NshView, time: f64) -> Wheel {
@@ -2947,6 +2991,7 @@ fn new_wheel(view: NshView, time: f64) -> Wheel {
         view,
         total: (0.0, 0.0),
         velocity,
+        moved: time,
         held: false,
     }
 }
@@ -3000,6 +3045,37 @@ pub(crate) fn file_drop_target(surface: &Surface, x: f32, y: f32) -> Option<NshV
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_velocity_ignores_the_stop() {
+        use super::*;
+        // A flick from #2326: (time ms, dy points), lifted at 85 ms.
+        let moves = [
+            (0.0, 6.33),
+            (7.0, 8.96),
+            (15.0, 11.42),
+            (22.0, 13.88),
+            (29.0, 16.34),
+            (36.0, 17.57),
+            (50.0, 36.73),
+            (57.0, 18.10),
+            (64.0, 17.22),
+        ];
+        let mut v = VelocityTracker::default();
+        v.add(-7.0, point(Points(0.0), Points(0.0)));
+        let mut total = 0.0;
+        for (t, dy) in moves {
+            total += dy;
+            v.add(t, point(Points(0.0), Points(total)));
+        }
+        let (_, vy) = release_velocity(&v, 64.0, 85.0);
+        // Moves only: 146.55 points over 71 ms; the stop's sample made it 1.58.
+        assert!((vy / 1000.0 - 146.55 / 71.0).abs() < 0.01, "{vy}");
+        assert_eq!(
+            release_velocity(&v, 64.0, 64.0 + FLING_PAUSE + 1.0),
+            (0.0, 0.0)
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -3172,5 +3248,30 @@ mod tests {
     fn wheel_notches_scale_with_the_view() {
         assert!((notch(1000.0) - 100.0).abs() < 0.01);
         assert_eq!(notch(0.0), 1.0);
+    }
+
+    /// A press focuses a multiline field: `grab_focus` refuses a widget
+    /// whose `can-focus` is off through an ancestor (as the views a modal
+    /// scopes out have), so the text view is made the window's focus
+    /// widget instead (and the keys go to it).
+    #[cfg(feature = "dev")]
+    #[test]
+    fn a_press_focuses_a_text_view_under_a_can_focus_off_view() {
+        crate::gtk_test::run(|| {
+            let host = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            // What `ScreenNav::scope_focus` does to the views outside the
+            // newest modal: `can-focus` off holds for their descendants.
+            host.set_can_focus(false);
+            let text = gtk::TextView::new();
+            host.append(&text);
+            let window = gtk::Window::new();
+            window.set_child(Some(&host));
+            window.present();
+            assert!(!text.grab_focus(), "GTK refuses it under the view");
+            focus_native(text.upcast_ref::<gtk::Widget>());
+            let focused = RootExt::focus(&window);
+            window.destroy();
+            assert_eq!(focused, Some(text.upcast::<gtk::Widget>()));
+        });
     }
 }

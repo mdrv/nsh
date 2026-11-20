@@ -12,9 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use nsh_base::{accordion, accordion_header, accordion_item, accordion_panel, accordion_trigger};
 use nsh_core::{
-    AccessibilityRole, LayoutCurve, MountItem, NodeId, Size,
-    element::{Root, Spring},
-    platform::Os,
+    AccessibilityRole, LayoutCurve, MountItem, NodeId, Size, element::Spring, platform::Os,
     prelude::*,
 };
 use nsh_engine::EngineConfig;
@@ -26,6 +24,8 @@ struct HarnessProps {
     disabled: bool,
     reveal: bool,
     keep_mounted: bool,
+    /// The panels' reveal spring: the default's without one.
+    spring: Option<Spring>,
     /// The values open at first.
     open: Vec<String>,
 }
@@ -50,7 +50,7 @@ fn Harness(props: HarnessProps) -> impl IntoElement {
     );
     let changes = signal(0u32);
     let pressed = signal("none");
-    let (reveal, keep_mounted) = (props.reveal, props.keep_mounted);
+    let (reveal, keep_mounted, spring) = (props.reveal, props.keep_mounted, props.spring);
     let item = move |(id, title, disabled): (&'static str, &'static str, bool)| {
         accordion_item()
             .value(id)
@@ -63,6 +63,7 @@ fn Harness(props: HarnessProps) -> impl IntoElement {
             .child(
                 accordion_panel()
                     .reveal(reveal)
+                    .reveal_spring(spring)
                     .keep_mounted(keep_mounted)
                     .accessibility_label(title)
                     .child(view().h(px(30.0)).child(text(format!("{title} details")))),
@@ -138,7 +139,9 @@ fn start(props: HarnessProps, reduce_motion: bool) -> App {
     let mut config = EngineConfig {
         viewport: Size::new(px(390.0), px(844.0)),
         clock: nsh_engine::Clock::manual(std::time::SystemTime::now()),
-        ..EngineConfig::new(Root::new::<Harness>(move || props.clone()))
+        ..EngineConfig::new(nsh_testing::windowed_root_with::<Harness>(move || {
+            props.clone()
+        }))
     };
     config.environment.os = Os::MacOs;
     config.environment.reduce_motion = reduce_motion;
@@ -151,11 +154,17 @@ fn start(props: HarnessProps, reduce_motion: bool) -> App {
     App { app, seen }
 }
 
-/// Whether `items` animate the commit's frames with the reveal's spring.
+/// Whether `items` animate the commit's frames with the reveal's default
+/// spring.
 fn reveals(items: &[MountItem]) -> bool {
+    reveals_on(items, Spring::new(180.0))
+}
+
+/// Whether `items` animate the commit's frames with `spring`.
+fn reveals_on(items: &[MountItem], spring: Spring) -> bool {
     items.iter().any(|i| {
         matches!(i, MountItem::LayoutAnimation(a)
-            if a.update.is_some_and(|u| u.curve == LayoutCurve::Spring(Spring::new(180.0))))
+            if a.update.is_some_and(|u| u.curve == LayoutCurve::Spring(spring)))
     })
 }
 
@@ -401,6 +410,40 @@ fn a_reveal_springs_the_panel_and_keeps_the_content_until_it_has_closed() {
 }
 
 #[test]
+fn a_reveal_moves_on_the_apps_spring() {
+    // Settles in about 384 ms, where the default settles in about 265.
+    let spring = Spring {
+        stiffness: 620.0,
+        damping: 36.0,
+        ..Spring::default()
+    };
+    let mut app = start(
+        HarnessProps {
+            reveal: true,
+            spring: Some(spring),
+            ..HarnessProps::default()
+        },
+        false,
+    );
+    let opened = app.toggle("Shipping");
+    assert!(reveals_on(&opened, spring), "opens on it: {opened:#?}");
+    assert!(!reveals(&opened), "not on the default");
+    let closed = app.toggle("Shipping");
+    assert!(reveals_on(&closed, spring), "closes on it");
+    app.run_for(std::time::Duration::from_millis(300)).unwrap();
+    let removes = |items: &[MountItem]| {
+        items
+            .iter()
+            .any(|i| matches!(i, MountItem::Remove { .. } | MountItem::Delete { .. }))
+    };
+    let closing = app.take();
+    assert!(!removes(&closing), "kept while its spring has not settled");
+    app.run_for(std::time::Duration::from_millis(100)).unwrap();
+    let removed = app.take();
+    assert!(removes(&removed), "out once it has: {removed:#?}");
+}
+
+#[test]
 fn with_reduced_motion_a_reveal_opens_and_closes_at_once() {
     let mut app = start(
         HarnessProps {
@@ -468,5 +511,126 @@ fn a_kept_panel_closed_by_a_reveal_is_out_of_sight() {
             .iter()
             .any(|i| matches!(i, MountItem::Remove { .. } | MountItem::Delete { .. })),
         "kept: {closed:#?}"
+    );
+}
+
+#[test]
+fn closing_reveal_panel_disables_pointer_events_at_once() {
+    #[derive(Clone, PartialEq, Props)]
+    struct PanelProps {
+        block_parent: bool,
+    }
+
+    #[component]
+    fn PanelHarness(props: PanelProps) -> impl IntoElement {
+        let value = signal(vec![SharedString::from("shipping")]);
+        let item = accordion()
+            .value(value)
+            .on_change(move |next: &Vec<SharedString>| value.set(next.clone()))
+            .child(
+                accordion_item()
+                    .value("shipping")
+                    .child(
+                        accordion_header()
+                            .level(2)
+                            .child(accordion_trigger().h(px(20.0)).child(text("Shipping"))),
+                    )
+                    .child(
+                        accordion_panel()
+                            .reveal(true)
+                            .accessibility_label("Shipping")
+                            .child(
+                                view()
+                                    .test_id("shipping-action")
+                                    .h(px(30.0))
+                                    .on_press(|| {})
+                                    .child(text("Action")),
+                            ),
+                    ),
+            );
+        if props.block_parent {
+            view()
+                .relative()
+                .h(px(60.0))
+                .child(view().test_id("behind").absolute().inset_0())
+                .child(
+                    view()
+                        .test_id("blocked-outer")
+                        .pointer_events(PointerEvents::None)
+                        .child(item),
+                )
+                .into_element()
+        } else {
+            view().child(item).into_element()
+        }
+    }
+
+    let config = EngineConfig {
+        viewport: Size::new(px(390.0), px(844.0)),
+        clock: nsh_engine::Clock::manual(std::time::SystemTime::now()),
+        ..EngineConfig::new(nsh_testing::windowed_root_with::<PanelHarness>(|| {
+            PanelProps {
+                block_parent: false,
+            }
+        }))
+    };
+    let mut app = Headless::start(config).expect("engine starts");
+    let seen: Seen = Arc::default();
+    let into = seen.clone();
+    app.observe(move |_, batch| into.lock().unwrap().extend(batch.items.iter().cloned()));
+    app.first_render().unwrap();
+    app.wait_for("Action").unwrap();
+    let first = std::mem::take(&mut *seen.lock().unwrap());
+    let panel = first
+        .iter()
+        .find_map(|i| match i {
+            MountItem::ViewProps { id, props }
+                if props.accessibility.role == AccessibilityRole::Region =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("panel region");
+    assert!(
+        app.screen()
+            .press_target("id:shipping-action")
+            .unwrap()
+            .is_some()
+    );
+
+    // Close via trigger press; before the 180ms reveal finishes, the panel
+    // immediately disables pointer targeting and hides from accessibility.
+    app.press("role:button[Shipping]").unwrap();
+    let closing = std::mem::take(&mut *seen.lock().unwrap());
+    let closed_props = closing
+        .iter()
+        .rev()
+        .find_map(|i| match i {
+            MountItem::ViewProps { id, props } if *id == panel => {
+                Some((props.accessibility.hidden, props.pointer_events))
+            }
+            _ => None,
+        })
+        .expect("updated panel props");
+    assert_eq!(closed_props, (true, PointerEvents::None));
+    assert_eq!(
+        app.screen().press_target("id:shipping-action").unwrap(),
+        None
+    );
+
+    // An open panel inside a `PointerEvents::None` ancestor inherits `None`.
+    let blocked_config = EngineConfig {
+        viewport: Size::new(px(390.0), px(844.0)),
+        ..EngineConfig::new(nsh_testing::windowed_root_with::<PanelHarness>(|| {
+            PanelProps { block_parent: true }
+        }))
+    };
+    let mut blocked = Headless::start(blocked_config).expect("engine starts");
+    blocked.first_render().unwrap();
+    blocked.wait_for("Action").unwrap();
+    assert!(
+        blocked.press("id:shipping-action").is_err(),
+        "open panel must not receive pointer hits under a PointerEvents::None ancestor"
     );
 }

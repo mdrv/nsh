@@ -2,12 +2,17 @@
 // `MenuButton`, the system's menu on a trigger of the app's own, on the
 // headless runtime, which is iOS: the app's content (its children) shows
 // in the frame its style gives, covered by the system's button that holds
-// the menu, given as data (`items`: ids, labels, SF Symbols, checks,
-// disabled and destructive items, submenus and inline sections), its
+// the menu, given as data (`items`: ids, labels, SF Symbols, SVG icons
+// for Android, checks,
+// disabled and destructive items, submenus and inline sections, a
+// section's single choice), its
 // `title`, `disabled` and `accessibilityLabel`; `onSelect({ id })` reports
 // the chosen item (the platform's event, which the engine's tests send).
+// A `ContextMenu` given `items` is the system's context menu there: a held
+// finger is the system's to answer, and the children (the drawn menu of
+// the other platforms) never show.
 import { Text, View, signal } from "nsh";
-import { MenuButton } from "nsh/base";
+import { ContextMenu, MenuButton, MenuItem } from "nsh/base";
 
 function App() {
   const dark = signal(false);
@@ -19,13 +24,14 @@ function App() {
         accessibilityLabel="Account"
         title="me@example.com"
         items={[
-          { id: "settings", label: "Settings", icon: "gearshape" },
+          { id: "settings", label: "Settings", icon: "gearshape",
+            svg: "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='3'/></svg>" },
           { id: "read", label: "Mark all as read", disabled: true },
           { id: "", label: "Language", items: [
             { id: "en", label: "English", checked: true },
             { id: "zh", label: "中文", checked: false },
           ] },
-          { id: "", label: "Appearance", inline: true, items: [
+          { id: "", label: "Appearance", inline: true, singleSelection: true, items: [
             { id: "light", label: "Light", checked: !dark() },
             { id: "dark", label: "Dark", checked: dark() },
           ] },
@@ -38,6 +44,17 @@ function App() {
         <Text>Account trigger</Text>
       </MenuButton>
       <Text>{`Chosen: ${chosen()}`}</Text>
+      <ContextMenu
+        title="Notes.txt"
+        items={[
+          { id: "pin", label: "Pin", icon: "pin" },
+          { id: "", label: "", inline: true, items: [{ id: "delete", label: "Delete", destructive: true }] },
+        ]}
+        onSelect={({ id }) => chosen.set(id)}
+        trigger={<View style={{ height: 30 }}><Text>NoteRow</Text></View>}
+      >
+        <MenuItem><Text>DrawnPin</Text></MenuItem>
+      </ContextMenu>
     </View>
   );
 }

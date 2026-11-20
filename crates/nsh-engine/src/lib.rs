@@ -80,7 +80,7 @@ pub use nsh_js::BYTECODE_VERSION;
 pub use nsh_package as package;
 use rustc_hash::FxHashMap;
 #[cfg(not(target_arch = "wasm32"))]
-pub use storage::{FileStorage, data_dir};
+pub use storage::{FileStorage, resolve_data_dir, support_dir};
 
 use crate::script::{NetworkQueue, RequestId, Script};
 pub use crate::{
@@ -158,6 +158,16 @@ impl App {
         }
     }
 
+    /// The app's lifecycle options (`nsh.json` `"application"`): a Rust
+    /// app root's ([`nsh_core::element::Root::application`]), a bundle's
+    /// ([`Bundle::application`]).
+    pub fn application(&self) -> Option<&nsh_core::desktop::ApplicationOptions> {
+        match self {
+            App::Rust(root) => root.application_ref(),
+            App::Js(bundle) => bundle.application.as_ref(),
+        }
+    }
+
     /// The URL schemes the app claims (`nsh.json` `schemes`):
     /// the links the core lets through (`nsh_core::url_scheme`).
     pub fn url_schemes(&self) -> &[String] {
@@ -219,8 +229,12 @@ pub struct Bundle {
     /// The main window's launch-time options (`nsh.json` `"window"`, an
     /// app's `app.json`, the dev server's app info): runners read them
     /// before they make the window; the engine sends their attributes to
-    /// the main window with the first frame.
+    /// the first window.
     pub main_window: Option<nsh_core::desktop::MainWindowOptions>,
+    /// The app's lifecycle options (`nsh.json` `"application"`, an app's
+    /// `app.json`, the dev server's app info): the engine sets the quit
+    /// policy before the app's code runs.
+    pub application: Option<nsh_core::desktop::ApplicationOptions>,
 }
 
 /// How long an app on [`Bundle::trial`] runs past its first frame without
@@ -364,6 +378,7 @@ impl Bundle {
             updater_config: None,
             trial: None,
             main_window: None,
+            application: None,
         }
     }
 
@@ -382,6 +397,7 @@ impl Bundle {
             updater_config: None,
             trial: None,
             main_window: None,
+            application: None,
         }
     }
 
@@ -412,6 +428,21 @@ impl Bundle {
                 .map_err(|e| e.to_string())
                 .and_then(|v| nsh_core::desktop::MainWindowOptions::from_json(&v));
             parsed.map_err(|e| log::warn!("nsh.json window: {e}")).ok()
+        });
+        self
+    }
+
+    /// The app's lifecycle options from their JSON (`nsh.json`
+    /// `"application"`, as the dev server's app info carries it); a wrong
+    /// one is logged and left out.
+    pub fn with_application(mut self, json: Option<&str>) -> Self {
+        self.application = json.and_then(|json| {
+            let parsed = serde_json::from_str(json)
+                .map_err(|e| e.to_string())
+                .and_then(|v| nsh_core::desktop::ApplicationOptions::from_json(&v));
+            parsed
+                .map_err(|e| log::warn!("nsh.json application: {e}"))
+                .ok()
         });
         self
     }
@@ -497,6 +528,12 @@ impl Bundle {
         if let Some(window) = info.as_ref().and_then(|info| info.get("window")) {
             bundle.main_window = Some(
                 nsh_core::desktop::MainWindowOptions::from_json(window)
+                    .map_err(|e| io::Error::other(format!("app.json: {e}")))?,
+            );
+        }
+        if let Some(application) = info.as_ref().and_then(|info| info.get("application")) {
+            bundle.application = Some(
+                nsh_core::desktop::ApplicationOptions::from_json(application)
                     .map_err(|e| io::Error::other(format!("app.json: {e}")))?,
             );
         }
@@ -794,10 +831,6 @@ struct UpdaterOverNetwork {
 impl UpdaterOverNetwork {
     /// `None` without a network, or without both assets and the bundle's
     /// configuration (nothing to update from).
-    #[cfg_attr(
-        not(any(feature = "js-core", all(feature = "browser", target_arch = "wasm32"))),
-        allow(dead_code)
-    )]
     fn host(
         network: Option<Arc<dyn Network>>,
         assets: Option<Arc<dyn Assets>>,
@@ -811,6 +844,21 @@ impl UpdaterOverNetwork {
             assets,
             config: bundle.updater_config.clone(),
             running: bundle.package.clone(),
+        }))
+    }
+}
+
+impl UpdaterOverNetwork {
+    /// A Rust app's: the configuration among its assets, no packages.
+    fn of(
+        network: Option<Arc<dyn Network>>,
+        assets: Option<Arc<dyn Assets>>,
+    ) -> Option<Arc<dyn nsh_core::runtime::UpdaterHost>> {
+        Some(Arc::new(UpdaterOverNetwork {
+            network: network?,
+            assets: Some(assets?),
+            config: None,
+            running: None,
         }))
     }
 }
@@ -852,39 +900,181 @@ impl nsh_core::runtime::UpdaterHost for UpdaterOverNetwork {
         Ok(version)
     }
 
-    fn get(&self, url: &str, sink: nsh_core::runtime::UpdaterSink<'_>) -> Result<(), String> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let events: FetchEvents = Box::new(move |event| {
-            let _ = tx.send(event);
-        });
-        let task = self.network.fetch(HttpRequest::new("GET", url), events);
-        let mut total = None;
-        let result = loop {
-            match rx.recv() {
-                Ok(FetchEvent::Head(head)) => {
-                    if !(200..300).contains(&head.status) {
-                        break Err(format!("HTTP {}", head.status));
-                    }
-                    total = head
-                        .headers
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                        .and_then(|(_, value)| value.parse().ok());
-                }
-                Ok(FetchEvent::Data(chunk)) => {
-                    if let Err(e) = sink(&chunk, total) {
-                        break Err(e);
-                    }
-                }
-                Ok(FetchEvent::End) => return Ok(()),
-                Ok(FetchEvent::Failed(e)) => break Err(e),
-                Ok(FetchEvent::BodyWanted) => {}
-                Err(_) => break Err("the network stack went away".to_owned()),
+    fn get(
+        &self,
+        url: &str,
+        from: u64,
+        sink: nsh_core::runtime::UpdaterSink<'_>,
+    ) -> Result<(), String> {
+        const MAX_REDIRECTS: usize = 20;
+        let mut current = url.to_owned();
+        for hops in 0..=MAX_REDIRECTS {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let events: FetchEvents = Box::new(move |event| {
+                let _ = tx.send(event);
+            });
+            // Disable transparent compression so byte offsets match the raw
+            // asset bytes hashed by the manifest on every platform HTTP stack.
+            let mut request =
+                HttpRequest::new("GET", &current).header("Accept-Encoding", "identity");
+            if from > 0 {
+                request = request.header("Range", format!("bytes={from}-"));
             }
-        };
-        task.cancel();
-        result
+            // Follow redirects here so `Range` and `Accept-Encoding` survive
+            // cross-origin redirects (e.g. GitHub Releases -> asset CDN) on
+            // every platform stack and every hop stays HTTPS (or loopback).
+            request.follow_redirects = false;
+            let task = self.network.fetch(request, events);
+
+            let mut expected_body: Option<u64> = None;
+            let mut received_body: u64 = 0;
+            let mut redirect_to: Option<String> = None;
+            // Where the next piece starts in the resource, and its size.
+            let mut at = 0u64;
+            let mut total: Option<u64> = None;
+
+            let outcome = loop {
+                match rx.recv() {
+                    Ok(FetchEvent::Head(head)) => {
+                        if matches!(head.status, 301 | 302 | 303 | 307 | 308)
+                            && let Some(location) = updater_header(&head.headers, "location")
+                        {
+                            if hops == MAX_REDIRECTS {
+                                break Err("too many redirects".to_owned());
+                            }
+                            let base = if head.url.is_empty() {
+                                current.as_str()
+                            } else {
+                                head.url.as_str()
+                            };
+                            let next = nsh_core::access::resolve_reference(base, location.trim());
+                            if !is_updater_url(&next) {
+                                break Err(format!("redirect to non-HTTPS URL {next:?}"));
+                            }
+                            redirect_to = Some(next);
+                            break Ok(());
+                        }
+                        let content_length = updater_header(&head.headers, "content-length")
+                            .and_then(|value| value.trim().parse::<u64>().ok());
+                        if from > 0 && head.status == 206 {
+                            let valid = updater_header(&head.headers, "content-range")
+                                .and_then(parse_content_range)
+                                .filter(|range| {
+                                    range.start == from
+                                        && content_length.is_none_or(|cl| cl == range.len)
+                                });
+                            match valid {
+                                Some(range) => {
+                                    expected_body = Some(range.len);
+                                    at = range.start;
+                                    total = range.total;
+                                }
+                                // Not the range asked for: no pieces.
+                                None => break Ok(()),
+                            }
+                        } else if from > 0 && head.status == 416 {
+                            break Ok(());
+                        } else if head.status == 200 {
+                            expected_body = content_length;
+                            total = content_length;
+                        } else {
+                            break Err(format!("HTTP {}", head.status));
+                        }
+                    }
+                    Ok(FetchEvent::Data(chunk)) => {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        received_body = received_body.saturating_add(chunk.len() as u64);
+                        if let Err(e) = sink(at, &chunk, total) {
+                            break Err(e);
+                        }
+                        at = at.saturating_add(chunk.len() as u64);
+                    }
+                    Ok(FetchEvent::End) => {
+                        if let Some(expected) = expected_body
+                            && received_body < expected
+                        {
+                            break Err(format!(
+                                "truncated response ({received_body} of {expected} bytes)"
+                            ));
+                        }
+                        break Ok(());
+                    }
+                    Ok(FetchEvent::Failed(e)) => break Err(e),
+                    Ok(FetchEvent::BodyWanted) => {}
+                    Err(_) => break Err("the network stack went away".to_owned()),
+                }
+            };
+            task.cancel();
+            outcome?;
+            if let Some(next) = redirect_to {
+                current = next;
+                continue;
+            }
+            return Ok(());
+        }
+        Err("too many redirects".to_owned())
     }
+}
+
+/// First value of header `target` (ASCII case-insensitive).
+fn updater_header<'a>(headers: &'a [(String, String)], target: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(target))
+        .map(|(_, value)| value.as_str())
+}
+
+/// A parsed RFC 9110 `Content-Range: bytes <start>-<end>/<total|*>` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentRange {
+    start: u64,
+    len: u64,
+    total: Option<u64>,
+}
+
+fn parse_content_range(value: &str) -> Option<ContentRange> {
+    let parse_digits = |s: &str| -> Option<u64> {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    let (unit, rest) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = rest.trim_start().split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = parse_digits(start)?;
+    let end = parse_digits(end)?;
+    if start > end {
+        return None;
+    }
+    let len = end.checked_sub(start)?.checked_add(1)?;
+    let total = if total == "*" {
+        None
+    } else {
+        let total = parse_digits(total)?;
+        if end >= total {
+            return None;
+        }
+        Some(total)
+    };
+    Some(ContentRange { start, len, total })
+}
+
+/// HTTPS only, or plain HTTP to loopback (local tests), matching `nsh-updater`.
+fn is_updater_url(url: &str) -> bool {
+    let Some(parts) = nsh_core::access::parse_url(url) else {
+        return false;
+    };
+    parts.scheme == "https"
+        || (parts.scheme == "http"
+            && matches!(
+                parts.host.as_str(),
+                "127.0.0.1" | "localhost" | "::1" | "[::1]"
+            ))
 }
 
 /// The platform's HTTP stack, used by JS `fetch`.
@@ -965,19 +1155,31 @@ pub struct EngineConfig {
     /// The tokio runtime the components' async tasks use (timers, IO,
     /// background work); `None`: one shared by the engines of the process.
     pub runtime: Option<tokio::runtime::Handle>,
-    /// Where apps keep their data: each app in `<data_dir>/<app id>`
-    /// ([`App::app_id`]; `default` without one), its storage
-    /// (`nsh/storage`) in `storage.json` there. The platform's: the
-    /// system's data directory ([`data_dir`]) for apps of their own,
-    /// `…/nsh` in an embedding app's. `None`: nothing is kept.
+    /// Where apps keep their data when [`EngineConfig::data_dir`] names
+    /// none: each app in `<support_dir>/<app id>` ([`App::app_id`];
+    /// `default` without one). The platforms give the system's directory
+    /// for apps' data ([`support_dir`]) unless told otherwise; an app that
+    /// embeds nsh gives its own (`…/nsh` in its data directory), as do
+    /// development hosts that keep a run's data apart; it is known before
+    /// the app's id is. `None` with no `data_dir` either: nothing is kept
+    /// on disk (an engine made for a test). The platforms' to set, not
+    /// apps': an app names its own directory with
+    /// [`data_dir`](Self::data_dir).
+    #[doc(hidden)]
+    pub support_dir: Option<std::path::PathBuf>,
+    /// The app's own data directory, used as it is (no app id appended):
+    /// its storage (`nsh/storage`, `storage.json` there), `process.dataDir`
+    /// and the `${dataDir}` of its file grants. The desktop runners set it
+    /// from `nsh.json` `"dataDir"`. `None`: `<support_dir>/<app id>`.
     pub data_dir: Option<std::path::PathBuf>,
     /// Where the app's caches are kept and how much each keeps: the engine
     /// opens them in `<root>/<app id>/<kind>` ([`Engine::image_cache`]).
     /// [`EngineConfig::new`]: none.
     pub cache: CacheOptions,
-    /// The app's storage, overriding the one [`EngineConfig::data_dir`]
-    /// names (the browser's `localStorage`, an embedder's own); `None`
-    /// with no data directory either: in memory, for the engine's life.
+    /// The app's storage, overriding the `storage.json` in its data
+    /// directory (the browser's `localStorage`, an embedder's own, a
+    /// test's stand-in); `None` where the system has no data directory
+    /// either: in memory, for the engine's life.
     pub storage: Option<Arc<dyn nsh_core::storage::StorageBackend>>,
     /// The time the app runs on: the system's, or a manual clock a test
     /// moves (`nsh_core::time::Clock::manual`), which its timers, frames
@@ -1149,6 +1351,7 @@ impl EngineConfig {
             limits: Limits::default(),
             ui_sets: Vec::new(),
             runtime: None,
+            support_dir: None,
             data_dir: None,
             cache: CacheOptions::off(),
             storage: None,
@@ -1167,8 +1370,8 @@ impl EngineConfig {
 
     /// Where a runner opens the main window of an app with nsh.json
     /// `window.restoreBounds`: the placement its last run kept in its
-    /// storage ([`EngineConfig::storage`], or the file in its directory of
-    /// [`EngineConfig::data_dir`]), fitted on `displays`, the ones there
+    /// storage ([`EngineConfig::storage`], or the file in its data
+    /// directory), fitted on `displays`, the ones there
     /// are now. Read before making the window; `None` without
     /// `restoreBounds` or a kept placement. The engine keeps it as the
     /// window changes (the environment's window state).
@@ -1182,15 +1385,25 @@ impl EngineConfig {
     }
 }
 
+/// The data directory of the app `config` runs: [`EngineConfig::data_dir`],
+/// or `<support_dir>/<app id>`; `None` with neither.
+fn data_dir(config: &EngineConfig) -> Option<std::path::PathBuf> {
+    config.data_dir.clone().or_else(|| {
+        config
+            .support_dir
+            .as_ref()
+            .map(|root| root.join(app_dir_name(config.app.app_id())))
+    })
+}
+
 /// The storage of the app `config` runs: [`EngineConfig::storage`], or a
-/// file in its directory of [`EngineConfig::data_dir`].
+/// file in its data directory.
 fn app_storage(config: &EngineConfig) -> Option<Arc<dyn nsh_core::storage::StorageBackend>> {
     if let Some(storage) = &config.storage {
         return Some(storage.clone());
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(root) = &config.data_dir {
-        let dir = root.join(app_dir_name(config.app.app_id()));
+    if let Some(dir) = data_dir(config) {
         return Some(FileStorage::open(dir));
     }
     None
@@ -1276,9 +1489,15 @@ enum Message {
     /// The displays (desktops).
     Displays(Arc<[nsh_core::desktop::Display]>),
     RootSize(NodeId, Size<Points>, EdgeInsets),
+    /// Where the root view's anchored overlays may go
+    /// ([`EngineControl::set_overlay_area`]).
+    OverlayArea(Option<nsh_core::Bounds<Points>>),
+    /// A press beyond the root view ([`EngineControl::press_beyond_root`]).
+    PressBeyondRoot(nsh_core::Point<Points>),
     ScreenHeader(NodeId, Option<Points>),
     Frame,
     States(NodeId, u16),
+    ReleaseStates(NodeId, u16, std::time::Duration),
     Modality(nsh_core::platform::InputModality),
     FontsChanged,
     Remount,
@@ -1479,6 +1698,22 @@ impl EngineControl {
         let _ = self.tx.send(Message::RootSize(id, size, insets));
     }
 
+    /// Where the root view's anchored overlays may be placed, in its
+    /// coordinates, when the platform shows them beyond it (the web's
+    /// `overlays: "viewport"`: the window); `None` keeps them to the root
+    /// view ([`nsh_core::Core::set_overlay_area`]).
+    pub fn set_overlay_area(&self, area: Option<nsh_core::Bounds<Points>>) {
+        let _ = self.tx.send(Message::OverlayArea(area));
+    }
+
+    /// A press at `page` (in the root view's coordinates) beyond the root
+    /// view, where the platform shows its anchored overlays too (the web
+    /// page around the player): the overlays watching presses hear
+    /// `onPressOutside` ([`nsh_core::Core::presses_beyond_root`]).
+    pub fn press_beyond_root(&self, page: nsh_core::Point<Points>) {
+        let _ = self.tx.send(Message::PressBeyondRoot(page));
+    }
+
     /// The platform measured where the content of screen `id` starts below
     /// its header (`None`: let the core estimate it).
     pub fn set_screen_header(&self, id: NodeId, height: Option<Points>) {
@@ -1555,6 +1790,14 @@ impl EngineControl {
     /// (`active:`, `hover:`, `focus:`) update without JS.
     pub fn set_states(&self, id: NodeId, states: u16) {
         let _ = self.tx.send(Message::States(id, states));
+    }
+
+    /// Reports the interaction states of view `id` after a short completed
+    /// press, holding `PRESSED` for `hold` in the core so same-turn
+    /// tap-to-click gestures still render `:active` feedback
+    /// ([`nsh_core::Core::release_states_after`]).
+    pub fn release_states_after(&self, id: NodeId, states: u16, hold: std::time::Duration) {
+        let _ = self.tx.send(Message::ReleaseStates(id, states, hold));
     }
 
     /// Fonts the platform loads asynchronously became usable (on the web,
@@ -2122,6 +2365,16 @@ impl<M: TextEngine + 'static> Driver<M> {
         let text_engine = Rc::new(text_engine);
         let access = Arc::new(app_access(&config.app));
         let mut core = Core::new(text_engine.clone(), config.viewport);
+        // nsh.json's `application.quitMode`, else the default
+        // `"platform"`: Windows and Linux quit when the last window
+        // closes; macOS stays in the Dock. The app can change it at run
+        // time with `Application.setQuitMode`.
+        let mode = config
+            .app
+            .application()
+            .map(|options| options.quit_mode)
+            .unwrap_or_default();
+        core.set_quit_mode(mode);
         core.set_content_culling(config.content_culling);
         core.set_tree_order_tracking(sink.needs_tree_order());
         core.set_projected_state_mounting(sink.needs_projected_states());
@@ -2165,12 +2418,15 @@ impl<M: TextEngine + 'static> Driver<M> {
             transport: None,
         });
         core.set_storage(app_storage(&config));
-        core.set_data_dir(
-            config
-                .data_dir
-                .as_ref()
-                .map(|root| root.join(app_dir_name(config.app.app_id()))),
-        );
+        core.set_data_dir(data_dir(&config));
+        // What a Rust app's `prompt_for_update` checks with; a JS app's VM
+        // gets its own below.
+        core.set_updater(match &config.app {
+            App::Js(bundle) => {
+                UpdaterOverNetwork::host(config.network.clone(), config.assets.clone(), bundle)
+            }
+            App::Rust(_) => UpdaterOverNetwork::of(config.network.clone(), config.assets.clone()),
+        });
         core.set_clipboard(config.clipboard.clone());
         core.set_picker(config.picker.clone());
         core.set_speech(config.speech.clone());
@@ -2282,6 +2538,8 @@ impl<M: TextEngine + 'static> Driver<M> {
             core,
             js_tokens,
             frame_requested: false,
+            frame_turn: false,
+            frames_seen: false,
             ops: Vec::new(),
             binds: Vec::new(),
             events: Vec::new(),
@@ -2362,10 +2620,7 @@ impl<M: TextEngine + 'static> Driver<M> {
                             bundle,
                         ),
                         app_url: app_url.clone(),
-                        data_dir: config
-                            .data_dir
-                            .as_ref()
-                            .map(|root| root.join(app_dir_name(config.app.app_id()))),
+                        data_dir: data_dir(&config),
                         paths: bundle_system_paths(bundle),
                         wake: Arc::new(move || {
                             let _ = system_tx.send(Message::Wake);
@@ -2428,6 +2683,11 @@ impl<M: TextEngine + 'static> Driver<M> {
             script.run_system();
         }
         state.load_fonts(script, assets.as_deref(), &**sink);
+        // A TSX app's windows of its own (the update prompt) render beside
+        // its root, after it, as a Rust app's do (`Core::mount_root`).
+        if script.is_some() {
+            state.core.mount_opened_windows();
+        }
         if let Some(batch) = state.commit(script) {
             if state.trace {
                 log::info!(
@@ -2510,6 +2770,7 @@ impl<M: TextEngine + 'static> Driver<M> {
             self.state.next_scroll_event(),
             self.state.next_mouse_move(),
             self.state.core.next_task_timer(),
+            self.state.core.next_state_timer(),
             self.state.core.download_deadline(),
             self.state.resize_burst_ends,
             self.state.window_state.settles,
@@ -2671,6 +2932,7 @@ impl<M: TextEngine + 'static> Driver<M> {
         {
             self.last_active = Instant::now();
         }
+        state.core.expire_state_timers(nsh_core::time::now());
         if state
             .resize_burst_ends
             .is_some_and(|ends| ends <= nsh_core::time::now())
@@ -2864,6 +3126,13 @@ struct State<M: TextEngine> {
     app_locale: Option<nsh_core::platform::Locale>,
     /// A display frame was requested and has not begun yet.
     frame_requested: bool,
+    /// This turn handled a display frame: it makes a slice of the paced
+    /// remainder (views and overscan binds waiting), other turns leave it.
+    frame_turn: bool,
+    /// The platform has sent a display frame: one that never does (a sink
+    /// without [`MountSink::request_frame`]) makes the paced remainder in
+    /// every turn, or it would wait for good.
+    frames_seen: bool,
     ops: Vec<Op>,
     /// List render requests not yet sent to JS.
     binds: Vec<ListBind>,
@@ -3498,8 +3767,15 @@ impl<M: TextEngine> State<M> {
         let mut js = std::time::Duration::ZERO;
         // The overscan bound this turn ([`PACED_BIND_OPS`]).
         let mut paced = PacedBinds::default();
-        // The views made this turn share one budget (`nsh_core`'s `pace.rs`).
+        // The views made this turn share one budget (`nsh_core`'s `pace.rs`),
+        // and what waits from earlier turns comes once a display frame: the
+        // turns between two frames (timers, the main thread's messages)
+        // commit only what they change.
+        let frame = std::mem::take(&mut self.frame_turn) || !self.frames_seen;
         self.core.begin_mount_turn();
+        if !frame {
+            self.core.hold_paced_mounts();
+        }
         for _ in 0..MAX_LIST_ROUNDS {
             // Requests from the previous round (or frame) first.
             let js_start = Instant::now();
@@ -3519,7 +3795,7 @@ impl<M: TextEngine> State<M> {
                 }
                 script.take_ops(&mut self.ops);
                 let mut binds = Vec::new();
-                while !unapplied && paced.left() && self.core.has_paced_list_binds() {
+                while frame && !unapplied && paced.left() && self.core.has_paced_list_binds() {
                     let start = Instant::now();
                     let ops = self.ops.len();
                     self.core.take_paced_list_binds(1, &mut binds);
@@ -3716,6 +3992,8 @@ fn ui_environment(env: &Environment, window: Size<Points>) -> nsh_core::element:
         wake_count: env.wake_count,
         screen_color: env.screen_color,
         canvas_render: env.canvas_render,
+        share: env.share,
+        auth_session: env.auth_session,
         file_requests: env.file_requests,
         speech: env.speech,
         notifications: env.notifications,
@@ -3867,11 +4145,35 @@ fn dispatch_key<M: TextEngine>(
     path.clear();
 }
 
+/// Hands out the `onPressOutside` events of a press the core worked out
+/// (`context_menu_presses_outside`, `presses_beyond_root`): to the
+/// overlay's Rust component, else to JS.
+fn press_outside<M: TextEngine>(
+    script: Option<&Script>,
+    core: &mut nsh_core::Core<M>,
+    pressed: Vec<(NodeId, EventPayload)>,
+) {
+    for (overlay, payload) in pressed {
+        if !core.component_event(overlay, EventKind::PressOutside, &payload)
+            && let Some(script) = script
+        {
+            script.dispatch_event(overlay, EventKind::PressOutside, &payload);
+        }
+    }
+}
+
 /// Returns false on shutdown.
 fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message: Message) -> bool {
     match message {
         Message::Event(id, event, mut payload) => {
             state.events_handled += 1;
+            // The OS asked the app to show itself: the app root's listeners
+            // hear it (the app decides which window to open or focus).
+            if let EventPayload::Window(window) = &payload
+                && matches!(**window, nsh_core::desktop::WindowEvent::Reopen)
+            {
+                state.core.reopened();
+            }
             if state.trace {
                 log::info!(target: "nsh::perf", "event {event:?} on view {id}");
             }
@@ -3912,15 +4214,8 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
             // `onContextMenu`, so a context menu open on the view closes
             // before the view asks for one again where the pointer is.
             if let EventPayload::ContextMenu(menu) = &payload {
-                for (overlay, pressed) in state.core.context_menu_presses_outside(id, menu) {
-                    if !state
-                        .core
-                        .component_event(overlay, EventKind::PressOutside, &pressed)
-                        && let Some(script) = script
-                    {
-                        script.dispatch_event(overlay, EventKind::PressOutside, &pressed);
-                    }
-                }
+                let pressed = state.core.context_menu_presses_outside(id, menu);
+                press_outside(script, &mut state.core, pressed);
             }
             // Key transitions bubble to the focused view's enabled
             // ancestors within its window, for Rust and JS listeners
@@ -4042,15 +4337,25 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
             }
         }
         Message::RootSize(id, size, insets) => state.core.set_root_size(id, size, insets),
+        Message::OverlayArea(area) => state.core.set_overlay_area(area),
+        Message::PressBeyondRoot(page) => {
+            let pressed = state.core.presses_beyond_root(page);
+            press_outside(script, &mut state.core, pressed);
+        }
         Message::ScreenHeader(id, height) => state.core.set_screen_header(id, height),
         Message::Frame => {
             state.frame_requested = false;
+            state.frame_turn = true;
+            state.frames_seen = true;
             state.core.run_frame(nsh_core::time::now());
             if let Some(script) = script {
                 script.run_frame();
             }
         }
         Message::States(id, states) => state.core.set_states(id, states),
+        Message::ReleaseStates(id, states, hold) => {
+            state.core.release_states_after(id, states, hold);
+        }
         Message::Modality(modality) => state.core.set_input_modality(modality),
         Message::FontsChanged => state.core.fonts_changed(),
         Message::Remount => state.core.remount(),
@@ -4256,26 +4561,18 @@ fn app_access(app: &App) -> Access {
 }
 
 /// The roots local media files are read under, as `fs/promises` reads
-/// files (where it has a file system: the desktops).
+/// files (where the platform has a file system for apps: the native OSes).
 fn media_files(config: &EngineConfig, access: &Access) -> nsh_core::access::MediaFiles {
     match &config.app {
         App::Js(bundle) => nsh_core::access::MediaFiles::new(
             access,
-            config
-                .data_dir
-                .as_ref()
-                .map(|root| root.join(app_dir_name(config.app.app_id())))
-                .as_deref(),
+            data_dir(config).as_deref(),
             &bundle_system_paths(bundle),
             nsh_core::access::native_files(config.environment.os),
         ),
         App::Rust(root) if root.capabilities_ref().is_some() => nsh_core::access::MediaFiles::new(
             access,
-            config
-                .data_dir
-                .as_ref()
-                .map(|root| root.join(app_dir_name(config.app.app_id())))
-                .as_deref(),
+            data_dir(config).as_deref(),
             &system_paths(nsh_core::access::TrustedPaths::default(), false),
             nsh_core::access::native_files(config.environment.os),
         ),
@@ -4285,6 +4582,32 @@ fn media_files(config: &EngineConfig, access: &Access) -> nsh_core::access::Medi
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "js-core")]
+    #[test]
+    fn an_apps_directory_is_its_own_or_the_one_named_by_its_id() {
+        let app = || super::Bundle::source(String::new()).with_app_id(Some("com.a"));
+        let mut config = super::EngineConfig::new(app());
+        assert_eq!(super::data_dir(&config), None);
+        config.support_dir = Some("/data".into());
+        assert_eq!(
+            super::data_dir(&config),
+            Some(std::path::Path::new("/data").join("com.a"))
+        );
+        // `"dataDir"`: storage, `${dataDir}` and its files all live there,
+        // whatever the app's id.
+        config.data_dir = Some("/home/a/.myapp".into());
+        assert_eq!(super::data_dir(&config), Some("/home/a/.myapp".into()));
+        config.app = app().with_app_id(Some("com.b")).into();
+        assert_eq!(super::data_dir(&config), Some("/home/a/.myapp".into()));
+        config.data_dir = None;
+        assert_eq!(
+            super::data_dir(&config),
+            Some(std::path::Path::new("/data").join("com.b"))
+        );
+        config.support_dir = None;
+        assert_eq!(super::data_dir(&config), None);
+    }
+
     #[test]
     fn an_emptied_op_buffer_gives_back_what_a_large_commit_grew() {
         let mut ops: Vec<super::Op> = Vec::with_capacity(super::RETAINED_OPS * 8);
@@ -4549,5 +4872,404 @@ mod download_cleanup_tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+    }
+}
+
+#[cfg(test)]
+mod updater_range_tests {
+    use std::sync::Mutex;
+
+    use nsh_core::runtime::UpdaterHost as _;
+
+    use super::*;
+
+    #[test]
+    fn parses_content_range_headers() {
+        assert_eq!(
+            parse_content_range("bytes 0-9/10"),
+            Some(ContentRange {
+                start: 0,
+                len: 10,
+                total: Some(10),
+            })
+        );
+        assert_eq!(
+            parse_content_range("BYTES 100-199/500"),
+            Some(ContentRange {
+                start: 100,
+                len: 100,
+                total: Some(500),
+            })
+        );
+        assert_eq!(
+            parse_content_range("  bytes 5-9/*  "),
+            Some(ContentRange {
+                start: 5,
+                len: 5,
+                total: None,
+            })
+        );
+        for bad in [
+            "",
+            "bytes */10",
+            "items 0-9/10",
+            "bytes 10-5/20",
+            "bytes 0-10/10",
+            "bytes +0-9/10",
+            "bytes 0-9/10, 12-15/10",
+            "bytes 0-18446744073709551615/*",
+        ] {
+            assert_eq!(parse_content_range(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn updater_urls_allow_https_and_loopback_only() {
+        assert!(is_updater_url(
+            "https://objects.githubusercontent.com/a.tar.gz"
+        ));
+        assert!(is_updater_url("http://127.0.0.1:8080/a.tar.gz"));
+        assert!(is_updater_url("http://localhost/a.tar.gz"));
+        assert!(is_updater_url("http://[::1]:8080/a.tar.gz"));
+        assert!(!is_updater_url("http://example.com/a.tar.gz"));
+        assert!(!is_updater_url("http://localhost.evil.dev/a.tar.gz"));
+        assert!(!is_updater_url("file:///etc/passwd"));
+    }
+
+    struct NoopTask;
+    impl FetchTask for NoopTask {
+        fn send(&mut self, _: Vec<u8>) {}
+        fn finish(&mut self) {}
+        fn pause(&mut self, _: bool) {}
+        fn cancel(self: Box<Self>) {}
+    }
+
+    type MockHandler = Box<dyn Fn(&HttpRequest) -> Vec<FetchEvent> + Send + Sync>;
+
+    struct MockNetwork {
+        seen: Mutex<Vec<HttpRequest>>,
+        handler: MockHandler,
+    }
+
+    impl Network for MockNetwork {
+        fn fetch(&self, request: HttpRequest, mut events: FetchEvents) -> Box<dyn FetchTask> {
+            self.seen.lock().unwrap().push(request.clone());
+            for event in (self.handler)(&request) {
+                events(event);
+            }
+            Box::new(NoopTask)
+        }
+    }
+
+    fn host_with(
+        handler: impl Fn(&HttpRequest) -> Vec<FetchEvent> + Send + Sync + 'static,
+    ) -> (Arc<MockNetwork>, UpdaterOverNetwork) {
+        let net = Arc::new(MockNetwork {
+            seen: Mutex::new(Vec::new()),
+            handler: Box::new(handler),
+        });
+        let host = UpdaterOverNetwork {
+            network: net.clone(),
+            assets: None,
+            config: None,
+            running: None,
+        };
+        (net, host)
+    }
+
+    fn collect(
+        host: &UpdaterOverNetwork,
+        url: &str,
+        from: u64,
+    ) -> Result<(Vec<String>, Vec<u8>), String> {
+        let mut events = Vec::new();
+        let mut body = Vec::new();
+        let mut next_at: Option<u64> = None;
+        host.get(url, from, &mut |at, bytes, total| {
+            assert!(!bytes.is_empty());
+            if let Some(expected) = next_at {
+                assert_eq!(at, expected);
+            } else {
+                let kind = if at == 0 { "full" } else { "partial" };
+                events.push(format!("{kind}:{total:?}"));
+            }
+            next_at = Some(at + bytes.len() as u64);
+            body.extend_from_slice(bytes);
+            Ok(())
+        })?;
+        if body.is_empty() && from > 0 {
+            events.push("unsatisfiable".into());
+        }
+        Ok((events, body))
+    }
+
+    #[test]
+    fn updater_over_network_follows_redirects_and_validates_ranges() {
+        let (net, host) = host_with(|req| match req.url.as_str() {
+            "https://github.com/o/r/releases/latest/download/a.tar.gz" => vec![
+                FetchEvent::Head(HttpHead {
+                    status: 302,
+                    url: req.url.clone(),
+                    headers: vec![(
+                        "Location".into(),
+                        "https://cdn.example.com/assets/a.tar.gz".into(),
+                    )],
+                    ..Default::default()
+                }),
+                FetchEvent::End,
+            ],
+            "https://cdn.example.com/assets/a.tar.gz" => {
+                let range = updater_header(&req.headers, "range");
+                if range == Some("bytes=4-") {
+                    vec![
+                        FetchEvent::Head(HttpHead {
+                            status: 206,
+                            url: req.url.clone(),
+                            headers: vec![
+                                ("Content-Range".into(), "bytes 4-9/10".into()),
+                                ("Content-Length".into(), "6".into()),
+                            ],
+                            ..Default::default()
+                        }),
+                        FetchEvent::Data(Vec::new()),
+                        FetchEvent::Data(b"45".to_vec()),
+                        FetchEvent::Data(b"6789".to_vec()),
+                        FetchEvent::End,
+                    ]
+                } else {
+                    vec![
+                        FetchEvent::Head(HttpHead {
+                            status: 200,
+                            url: req.url.clone(),
+                            headers: vec![("Content-Length".into(), "10".into())],
+                            ..Default::default()
+                        }),
+                        FetchEvent::Data(b"0123456789".to_vec()),
+                        FetchEvent::End,
+                    ]
+                }
+            }
+            "https://downgrade.example.com/a" => vec![
+                FetchEvent::Head(HttpHead {
+                    status: 302,
+                    url: req.url.clone(),
+                    headers: vec![("Location".into(), "http://insecure.example.com/a".into())],
+                    ..Default::default()
+                }),
+                FetchEvent::End,
+            ],
+            "https://bad-range.example.com/wrong-start" => vec![
+                FetchEvent::Head(HttpHead {
+                    status: 206,
+                    url: req.url.clone(),
+                    headers: vec![
+                        ("Content-Range".into(), "bytes 0-9/10".into()),
+                        ("Content-Length".into(), "10".into()),
+                    ],
+                    ..Default::default()
+                }),
+                FetchEvent::Data(b"0123456789".to_vec()),
+                FetchEvent::End,
+            ],
+            "https://bad-range.example.com/416" => vec![
+                FetchEvent::Head(HttpHead {
+                    status: 416,
+                    url: req.url.clone(),
+                    headers: vec![("Content-Range".into(), "bytes */10".into())],
+                    ..Default::default()
+                }),
+                FetchEvent::End,
+            ],
+            "https://bad-range.example.com/truncated" => vec![
+                FetchEvent::Head(HttpHead {
+                    status: 206,
+                    url: req.url.clone(),
+                    headers: vec![
+                        ("Content-Range".into(), "bytes 4-9/10".into()),
+                        ("Content-Length".into(), "6".into()),
+                    ],
+                    ..Default::default()
+                }),
+                FetchEvent::Data(b"45".to_vec()),
+                FetchEvent::End,
+            ],
+            "https://bad-range.example.com/204" => vec![
+                FetchEvent::Head(HttpHead {
+                    status: 204,
+                    url: req.url.clone(),
+                    ..Default::default()
+                }),
+                FetchEvent::End,
+            ],
+            _ => vec![FetchEvent::Failed("unexpected url".into())],
+        });
+
+        // Cross-origin redirect preserves `Range` and `Accept-Encoding: identity`.
+        let (events, body) = collect(
+            &host,
+            "https://github.com/o/r/releases/latest/download/a.tar.gz",
+            4,
+        )
+        .unwrap();
+        assert_eq!(events, ["partial:Some(10)"]);
+        assert_eq!(body, b"456789");
+        let seen = net.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        for req in &seen {
+            assert!(!req.follow_redirects);
+            assert_eq!(
+                updater_header(&req.headers, "accept-encoding"),
+                Some("identity")
+            );
+            assert_eq!(updater_header(&req.headers, "range"), Some("bytes=4-"));
+        }
+
+        // `from == 0` omits `Range` and sends `Accept-Encoding: identity`.
+        net.seen.lock().unwrap().clear();
+        let (events, body) = collect(&host, "https://cdn.example.com/assets/a.tar.gz", 0).unwrap();
+        assert_eq!(events, ["full:Some(10)"]);
+        assert_eq!(body, b"0123456789");
+        let seen = net.seen.lock().unwrap();
+        assert_eq!(updater_header(&seen[0].headers, "range"), None);
+        assert_eq!(
+            updater_header(&seen[0].headers, "accept-encoding"),
+            Some("identity")
+        );
+        drop(seen);
+
+        // Redirect downgrade from HTTPS to plain HTTP is refused.
+        let err = collect(&host, "https://downgrade.example.com/a", 4).unwrap_err();
+        assert!(err.contains("non-HTTPS"), "{err}");
+
+        // `206` with wrong starting offset reports `Unsatisfiable` and delivers no bytes.
+        let (events, body) =
+            collect(&host, "https://bad-range.example.com/wrong-start", 4).unwrap();
+        assert_eq!(events, ["unsatisfiable"]);
+        assert!(body.is_empty());
+
+        // `416` reports `Unsatisfiable`.
+        let (events, body) = collect(&host, "https://bad-range.example.com/416", 10).unwrap();
+        assert_eq!(events, ["unsatisfiable"]);
+        assert!(body.is_empty());
+
+        // Premature EOF with fewer bytes than `Content-Range` returns an error (preserving `.part`).
+        let err = collect(&host, "https://bad-range.example.com/truncated", 4).unwrap_err();
+        assert!(err.contains("truncated"), "{err}");
+
+        // `204` is rejected as an HTTP error rather than wiping a kept `.part`.
+        let err = collect(&host, "https://bad-range.example.com/204", 4).unwrap_err();
+        assert_eq!(err, "HTTP 204");
+    }
+
+    #[cfg(all(feature = "net", not(target_arch = "wasm32")))]
+    #[test]
+    fn updater_over_network_resumes_over_ureq_across_redirect() {
+        use std::{
+            io::{BufRead as _, BufReader, Write as _},
+            net::TcpListener,
+        };
+
+        let payload = b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec();
+        let asset_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let asset_port = asset_listener.local_addr().unwrap().port();
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_port = redirect_listener.local_addr().unwrap().port();
+
+        let served = payload.clone();
+        std::thread::spawn(move || {
+            for stream in asset_listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut range_header = None;
+                let mut accept_encoding = None;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("range") {
+                            range_header = Some(v.trim().to_owned());
+                        } else if k.trim().eq_ignore_ascii_case("accept-encoding") {
+                            accept_encoding = Some(v.trim().to_owned());
+                        }
+                    }
+                }
+                assert_eq!(accept_encoding.as_deref(), Some("identity"));
+                let s = reader.get_mut();
+                if let Some(start) = range_header
+                    .as_deref()
+                    .and_then(|r| r.strip_prefix("bytes="))
+                    .and_then(|r| r.strip_suffix('-'))
+                    .and_then(|r| r.parse::<usize>().ok())
+                {
+                    if start >= served.len() {
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            served.len()
+                        );
+                    } else {
+                        let slice = &served[start..];
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            served.len() - 1,
+                            served.len(),
+                            slice.len()
+                        );
+                        let _ = s.write_all(slice);
+                    }
+                } else {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        served.len()
+                    );
+                    let _ = s.write_all(&served);
+                }
+            }
+        });
+
+        std::thread::spawn(move || {
+            for stream in redirect_listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                        break;
+                    }
+                }
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{asset_port}/app.tar.gz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+
+        let host = UpdaterOverNetwork {
+            network: crate::net::network(),
+            assets: None,
+            config: None,
+            running: None,
+        };
+        let url = format!("http://127.0.0.1:{redirect_port}/latest/app.tar.gz");
+
+        let (events, body) = collect(&host, &url, 10).unwrap();
+        assert_eq!(events, [format!("partial:Some({})", payload.len())]);
+        assert_eq!(body, &payload[10..]);
+
+        let (events, body) = collect(&host, &url, payload.len() as u64).unwrap();
+        assert_eq!(events, ["unsatisfiable"]);
+        assert!(body.is_empty());
     }
 }

@@ -99,7 +99,7 @@ fn headless_preserves_environment_and_data_and_stops_on_process_exit() {
         .unwrap();
     let mut config = EngineConfig::new(bundle);
     config.environment.os = Os::MacOs;
-    config.data_dir = Some(root.clone());
+    config.support_dir = Some(root.clone());
     let started = Instant::now();
     let mut app = Headless::start(config).unwrap();
     let result = app.wait(Duration::from_secs(10));
@@ -427,6 +427,20 @@ fn a_view_removed_under_the_pointer_or_with_the_focus_hears_no_more() {
 }
 
 #[test]
+fn a_mouse_drag_selects_in_a_selectable_view() {
+    let run = TestRun {
+        ui_sets: vec![nsh_base::registry()],
+        compile: compiler(vec![nsh_base::registry()]),
+        ..test_run(None)
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testing/text-selection");
+    let results = run_file(&run, &dir.join("App.test.tsx"), &mut |_| {}).unwrap();
+    let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
+    assert!(failed.is_empty(), "{failed:#?}");
+    assert_eq!(results.len(), 4);
+}
+
+#[test]
 fn an_input_that_asks_for_the_focus_has_it_once_it_mounts() {
     let run = TestRun {
         compile: compiler(vec![nsh_base::registry()]),
@@ -437,6 +451,33 @@ fn an_input_that_asks_for_the_focus_has_it_once_it_mounts() {
     let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
     assert!(failed.is_empty(), "{failed:#?}");
     assert_eq!(results.len(), 3);
+}
+
+#[test]
+fn an_input_that_selects_on_focus_selects_its_text_as_it_takes_the_focus() {
+    let run = TestRun {
+        compile: compiler(vec![nsh_base::registry()]),
+        ..test_run(None)
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testing/select-on-focus");
+    let results = run_file(&run, &dir.join("App.test.tsx"), &mut |_| {}).unwrap();
+    let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
+    assert!(failed.is_empty(), "{failed:#?}");
+    assert_eq!(results.len(), 2);
+}
+
+#[test]
+fn escape_reaches_a_dialog_over_a_focused_field() {
+    let run = TestRun {
+        ui_sets: vec![nsh_base::registry()],
+        compile: compiler(vec![nsh_base::registry()]),
+        ..test_run(None)
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testing/dialog-escape");
+    let results = run_file(&run, &dir.join("App.test.tsx"), &mut |_| {}).unwrap();
+    let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
+    assert!(failed.is_empty(), "{failed:#?}");
+    assert_eq!(results.len(), 12);
 }
 
 #[test]
@@ -481,7 +522,25 @@ fn headless_desktops_play_the_platform_s_windows() {
     let results = run_file(&test_run(None), &dir.join("App.test.tsx"), &mut |_| {}).unwrap();
     let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
     assert!(failed.is_empty(), "{failed:#?}");
-    assert_eq!(results.len(), 7);
+    assert_eq!(results.len(), 10);
+}
+
+#[test]
+fn a_desktop_app_root_renders_in_the_implicit_first_window() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testing/app-root");
+    let results = run_file(&test_run(None), &dir.join("App.test.tsx"), &mut |_| {}).unwrap();
+    let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
+    assert!(failed.is_empty(), "{failed:#?}");
+    assert_eq!(results.len(), 3);
+}
+
+#[test]
+fn the_app_hears_reopens_and_its_last_window_closing() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testing/lifecycle");
+    let results = run_file(&test_run(None), &dir.join("App.test.tsx"), &mut |_| {}).unwrap();
+    let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
+    assert!(failed.is_empty(), "{failed:#?}");
+    assert_eq!(results.len(), 2);
 }
 
 #[test]
@@ -499,7 +558,7 @@ fn an_app_inserts_the_pastes_it_allows_as_the_user_s_edits() {
     let results = run_file(&test_run(None), &dir.join("App.test.tsx"), &mut |_| {}).unwrap();
     let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
     assert!(failed.is_empty(), "{failed:#?}");
-    assert_eq!(results.len(), 3);
+    assert_eq!(results.len(), 4);
 }
 
 #[test]
@@ -513,7 +572,7 @@ fn a_paste_goes_in_clipped_to_max_length() {
     .unwrap();
     let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
     assert!(failed.is_empty(), "{failed:#?}");
-    assert_eq!(results.len(), 4);
+    assert_eq!(results.len(), 7);
 }
 
 #[test]
@@ -589,4 +648,18 @@ fn forward_goes_forward_on_the_web_only() {
     let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
     assert!(failed.is_empty(), "{failed:#?}");
     assert_eq!(results.len(), 1);
+}
+
+#[test]
+fn input_targets_report_document_values_and_do_not_edit_covering_fields() {
+    let run = TestRun {
+        ui_sets: vec![nsh_base::registry()],
+        compile: compiler(vec![nsh_base::registry()]),
+        ..test_run(None)
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testing/input-target");
+    let results = run_file(&run, &dir.join("App.test.tsx"), &mut |_| {}).unwrap();
+    assert_eq!(results.len(), 3);
+    let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
+    assert!(failed.is_empty(), "{failed:#?}");
 }

@@ -126,7 +126,8 @@ fn readline_moves_kills_yanks_and_transposes_through_the_core_editor() {
 
 #[test]
 fn paste_is_one_edit_and_selection_uses_utf16_while_cells_use_display_width() {
-    let (mut view, mut terminal, rx) = field("maxLength={7}");
+    // `maxLength` counts characters: 界, 🙂, e, its accent, a and b.
+    let (mut view, mut terminal, rx) = field("maxLength={6}");
     view.handle(Input::Paste("界🙂e\u{301}abc".into()));
     draw_until(&mut view, &mut terminal, &rx, "changes:1 sel:7-7");
     terminal.backend_mut().assert_cursor_position((7, 0));
@@ -213,6 +214,61 @@ fn dragging_selects_text_and_replacing_it_is_one_edit() {
     view.handle(Input::Paste("X".into()));
     draw_until(&mut view, &mut terminal, &rx, "\"aXef\"");
     draw_until(&mut view, &mut terminal, &rx, "changes:1 sel:2-2");
+}
+
+#[test]
+fn select_text_on_focus_selects_all_unless_the_press_selects() {
+    use nsh_platform_tui::{MouseButton::Left, MouseKind};
+    let (mut view, mut terminal, rx) = field("defaultValue=\"abcdef\" selectTextOnFocus");
+    // Tab's focus selects all.
+    draw_until(&mut view, &mut terminal, &rx, "sel:0-6");
+    view.handle(key("Right"));
+    draw_until(&mut view, &mut terminal, &rx, "sel:6-6");
+    let press = |view: &mut nsh_platform_tui::AppView, steps: &[(MouseKind, u16)], shift| {
+        for &(kind, column) in steps {
+            let mut input = super::app::mouse(kind, column, 0);
+            if let nsh_platform_tui::Input::Mouse(mouse) = &mut input {
+                mouse.modifiers.shift = shift;
+            }
+            view.handle(input);
+        }
+    };
+    // A click that focuses selects all; one on the focused field places the caret.
+    view.handle(key("Escape"));
+    press(
+        &mut view,
+        &[(MouseKind::Down(Left), 2), (MouseKind::Up(Left), 2)],
+        false,
+    );
+    draw_until(&mut view, &mut terminal, &rx, "sel:0-6");
+    press(
+        &mut view,
+        &[(MouseKind::Down(Left), 3), (MouseKind::Up(Left), 3)],
+        false,
+    );
+    draw_until(&mut view, &mut terminal, &rx, "sel:3-3");
+    // A drag that focuses selects its own range.
+    view.handle(key("Escape"));
+    press(
+        &mut view,
+        &[
+            (MouseKind::Down(Left), 1),
+            (MouseKind::Move, 4),
+            (MouseKind::Up(Left), 4),
+        ],
+        false,
+    );
+    draw_until(&mut view, &mut terminal, &rx, "sel:1-4");
+    // A Shift-click that focuses extends the field's selection.
+    view.handle(key("End"));
+    draw_until(&mut view, &mut terminal, &rx, "sel:6-6");
+    view.handle(key("Escape"));
+    press(
+        &mut view,
+        &[(MouseKind::Down(Left), 2), (MouseKind::Up(Left), 2)],
+        true,
+    );
+    draw_until(&mut view, &mut terminal, &rx, "sel:2-6");
 }
 
 #[test]
@@ -640,4 +696,20 @@ fn a_field_that_grows_with_its_wrapped_text_shows_its_first_row_again() {
     draw_until(&mut view, &mut terminal, &rx, "changes:1 height:32");
     draw_until(&mut view, &mut terminal, &rx, "abcdefghijklmnopqrs");
     terminal.backend_mut().assert_cursor_position((4, 1));
+}
+
+#[test]
+fn escape_and_c_g_report_their_key_press_before_leaving_the_field() {
+    let (mut view, mut terminal, rx) = field("");
+    view.handle(key("A"));
+    draw_until(&mut view, &mut terminal, &rx, "key:A");
+    view.handle(key("Escape"));
+    draw_until(&mut view, &mut terminal, &rx, "key:Escape");
+    assert!(!terminal.backend().cursor_visible(), "Escape still leaves");
+    view.handle(key("Tab"));
+    view.handle(key("B"));
+    draw_until(&mut view, &mut terminal, &rx, "key:B");
+    view.handle(modified("g", true, false, false));
+    draw_until(&mut view, &mut terminal, &rx, "key:Escape");
+    assert!(!terminal.backend().cursor_visible(), "C-g still leaves");
 }

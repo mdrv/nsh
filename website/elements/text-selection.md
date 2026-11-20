@@ -181,6 +181,11 @@ An [`Input`](./input.md)'s `onSelectionChange` is its own: the caret and selecti
 | iOS, Android | A long press selects a word; the platform's handles extend it, and its edit menu has Copy and Select All. |
 | Web | The browser's own selection, with its gestures, menu and shortcuts. |
 
+Outside the web, a word is a run of letters, digits and `_`, and a double click selects the word alone. A long press on
+iOS and Android keeps a hostname, URL, path or id whole (`demo-app.pages.dev`, `https://x.y/a-b?c=1`, `~/a/b-c.md`,
+`v0.5.1`), as the phones' own text views keep a link whole: the punctuation between its words joins them, while
+punctuation after it (a sentence's `foo.`) stays out, and so do operators (`a=b`, `x+y`).
+
 ## What it selects
 
 - **Texts that stay out**: a text with `userSelect: "none"` (`.select_none()` in Rust, the class `select-none`; a
@@ -190,7 +195,10 @@ An [`Input`](./input.md)'s `onSelectionChange` is its own: the caret and selecti
   items, cells and code blocks select together. Inside a selectable view it joins the outer selection.
 - **Single texts**: a text with `userSelect: "text"` in no selectable view selects on its own, as
   [Text](./text.md#props) describes.
-- **The look** is the platform's highlight in each text's `selectionColor` (`selection:text-*`).
+- **The look** is the platform's highlight in each text's `selectionColor` (`selection:bg-*`). A text that sets none
+  takes the nearest color set on a view around it: the view's `selection:bg-*` class, or `.selection_color(..)` in
+  Rust, which wins over the class. Set it once on the selectable view to color the whole selection; on Android the
+  selection handles take it too.
 - **A line in several texts**: a Rust component that lays one line out as several texts (a soft-wrapped line of
   code) marks the later parts with `.continues_text(true)`; a copy then gives the line whole, with no line break where
   it was cut, and a triple click selects all of its parts. [`DiffView`](./diff-view.md) does this for its wrapped lines.

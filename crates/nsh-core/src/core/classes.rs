@@ -39,6 +39,11 @@ const REPORTED: u16 = state::PRESSED | state::HOVERED | state::FOCUSED;
 /// changes.
 const ALWAYS_REPORTED: u16 = state::FOCUSED;
 
+/// The states a view is in for a moment, by the user's hand: a terminal
+/// lays a view out as it rests, without them (`Node::resting_fill`).
+const INTERACTION: u16 =
+    state::PRESSED | state::HOVERED | state::FOCUSED | state::FOCUS_VISIBLE | state::FOCUS_WITHIN;
+
 /// The `class` and `classList` props as set.
 #[derive(Debug, Default)]
 pub(super) struct ClassNames {
@@ -115,6 +120,17 @@ pub(super) struct NodeParts {
     /// `contentClass`; a typed list has none): they are parsed again when
     /// the theme or the design tokens they read change.
     class_names: Vec<(Part, Box<str>)>,
+    /// The group whose press it shows as a part (`Prop::ProjectedActive`).
+    active_group: Option<&'static str>,
+    /// It was last styled with that group's press.
+    group_pressed: bool,
+}
+
+impl NodeParts {
+    /// The group whose press it shows as a part.
+    pub(super) fn active_group(&self) -> Option<&'static str> {
+        self.active_group
+    }
 }
 
 /// The [`state`] bits an element is in by its accessibility state `s`:
@@ -215,6 +231,9 @@ impl<M: TextEngine> Core<M> {
             // platform must reach classes resolved before it was known.
             | (if env.platform != self.class_env.platform { u16::MAX } else { 0 });
         self.class_env = env;
+        if env.reduce_motion {
+            self.clear_pressed_impulses();
+        }
         self.restyle_where(changed);
         self.parts_restyled();
     }
@@ -229,9 +248,95 @@ impl<M: TextEngine> Core<M> {
         self.set_node_states(key, states);
     }
 
+    /// Reports the interaction states of view `id` after a short completed
+    /// press, holding `state::PRESSED` for `hold` so same-turn tap-to-click
+    /// releases still render `:active` feedback before settling to `states`.
+    /// Any subsequent state report for `id` (including a new press or
+    /// cancellation) supersedes the pending release.
+    pub fn release_states_after(&mut self, id: NodeId, states: u16, hold: std::time::Duration) {
+        let Ok(key) = self.key(id) else { return };
+        self.pressed_impulses.retain(|&(k, _, _)| k != key);
+        if self.class_env.reduce_motion
+            || hold.is_zero()
+            || crate::time::manual()
+            || states & state::PRESSED != 0
+            || self.press_cancelled(key)
+        {
+            self.set_node_states(key, states);
+            return;
+        }
+        self.set_node_states(key, states | state::PRESSED);
+        if self.nodes[key as usize].states & state::PRESSED != 0 {
+            self.pressed_impulses
+                .push((key, id, crate::time::now() + hold));
+        }
+    }
+
+    /// Earliest deadline at which a short press's held `PRESSED` state ends.
+    pub fn next_state_timer(&self) -> Option<crate::time::Instant> {
+        self.pressed_impulses.iter().map(|&(_, _, due)| due).min()
+    }
+
+    /// Releases any short-press `PRESSED` impulses due by `now`; returns
+    /// whether any state changed.
+    pub fn expire_state_timers(&mut self, now: crate::time::Instant) -> bool {
+        if self.pressed_impulses.iter().all(|&(_, _, due)| due > now) {
+            return false;
+        }
+        let mut due = Vec::new();
+        self.pressed_impulses.retain(|&(k, id, at)| {
+            if at <= now {
+                due.push((k, id));
+                false
+            } else {
+                true
+            }
+        });
+        let mut changed = false;
+        for (key, id) in due {
+            let Some(current) = self
+                .nodes
+                .get(key as usize)
+                .filter(|n| n.id == id)
+                .map(|n| n.states & REPORTED)
+            else {
+                continue;
+            };
+            if current & state::PRESSED != 0 {
+                let before = self.nodes[key as usize].states;
+                self.set_node_states(key, current & !state::PRESSED);
+                changed |= self.nodes[key as usize].states != before;
+            }
+        }
+        changed
+    }
+
+    fn clear_pressed_impulses(&mut self) {
+        let pending = std::mem::take(&mut self.pressed_impulses);
+        for (key, id, _) in pending {
+            if let Some(current) = self
+                .nodes
+                .get(key as usize)
+                .filter(|n| n.id == id)
+                .map(|n| n.states & REPORTED)
+                && current & state::PRESSED != 0
+            {
+                self.set_node_states(key, current & !state::PRESSED);
+            }
+        }
+    }
+
     /// [`Self::set_states`] by key.
     fn set_node_states(&mut self, key: Key, states: u16) {
-        let held = self.held_pressed() == Some(key);
+        if states & state::PRESSED != 0 || self.press_cancelled(key) {
+            self.pressed_impulses.retain(|&(k, _, _)| k != key);
+        }
+        let id = self.nodes[key as usize].id;
+        let impulse_held = self
+            .pressed_impulses
+            .iter()
+            .any(|&(k, imp_id, _)| k == key && imp_id == id);
+        let held = self.held_pressed() == Some(key) || impulse_held;
         let node = &mut self.nodes[key as usize];
         let mut new = node.states & !REPORTED | states & REPORTED;
         if held {
@@ -389,14 +494,19 @@ impl<M: TextEngine> Core<M> {
         }
     }
 
-    /// The states `key` is styled by: its own and those it shows as a
-    /// part of a control, with `FOCUS_VISIBLE` on a part projected focused
-    /// while the focus shows. Virtual focus is projected while its control
-    /// has the focus, so on its rows `focus:` is the cursor and
-    /// `focus-visible:` the cursor the keyboard is on.
+    /// The states `key` is styled by: its own, those it shows as a part
+    /// of a control and a hover a component passes on to it, with
+    /// `FOCUS_VISIBLE` on a part projected focused while the focus shows.
+    /// Virtual focus is projected while its control has the focus, so on
+    /// its rows `focus:` is the cursor and `focus-visible:` the cursor the
+    /// keyboard is on.
     pub(super) fn styled_states(&self, key: Key) -> u16 {
         let node = &self.nodes[key as usize];
-        let states = node.states | node.projected;
+        let passed = if node.passed_hover { state::HOVERED } else { 0 };
+        let mut states = node.states | node.projected | passed;
+        if let Some(group) = node.parts.as_ref().and_then(|p| p.active_group) {
+            states |= self.group_states(key, group) & state::PRESSED;
+        }
         if node.projected & state::FOCUSED != 0 && self.focus_visible_on.is_some() {
             states | state::FOCUS_VISIBLE
         } else {
@@ -498,10 +608,17 @@ impl<M: TextEngine> Core<M> {
         let before = self.held_pressed();
         self.components.touch.pressed = id;
         if let Some(key) = before {
-            let node = &mut self.nodes[key as usize];
-            if node.states & state::PRESSED != 0 {
-                node.states &= !state::PRESSED;
-                self.states_changed(key);
+            let prev_id = self.nodes[key as usize].id;
+            let impulse_held = self
+                .pressed_impulses
+                .iter()
+                .any(|&(k, imp_id, _)| k == key && imp_id == prev_id);
+            if !impulse_held {
+                let node = &mut self.nodes[key as usize];
+                if node.states & state::PRESSED != 0 {
+                    node.states &= !state::PRESSED;
+                    self.states_changed(key);
+                }
             }
         }
         if let Some(key) = self.held_pressed() {
@@ -580,6 +697,52 @@ impl<M: TextEngine> Core<M> {
             }
             self.states_changed(key);
         }
+    }
+
+    /// The group whose press `key` shows as a part of a control
+    /// (`Prop::ProjectedActive`).
+    pub(super) fn set_projected_active(&mut self, key: Key, group: Option<&'static str>) {
+        let node = &mut self.nodes[key as usize];
+        if node.parts.as_ref().and_then(|p| p.active_group) == group {
+            return;
+        }
+        let base = node.classes.clone();
+        let parts = node.parts.get_or_insert_with(|| {
+            Box::new(NodeParts {
+                base,
+                ..NodeParts::default()
+            })
+        });
+        parts.active_group = group;
+        parts.group_pressed = false;
+        self.states_changed(key);
+    }
+
+    /// A group around part `key` that shows its press changed its states:
+    /// restyled when the press it shows came or went.
+    fn group_press_changed(&mut self, key: Key) {
+        let Some(group) = self.nodes[key as usize]
+            .parts
+            .as_ref()
+            .and_then(|p| p.active_group)
+        else {
+            return;
+        };
+        let pressed = self.group_states(key, group) & state::PRESSED != 0;
+        let node = &mut self.nodes[key as usize];
+        let parts = node.parts.as_mut().expect("a part with its group");
+        if parts.group_pressed == pressed {
+            return;
+        }
+        parts.group_pressed = pressed;
+        if !node
+            .classes
+            .as_ref()
+            .is_some_and(|c| c.deps() & deps::STATE != 0)
+        {
+            return;
+        }
+        self.restyle(key);
     }
 
     /// The `data-*` attributes `key` shows as a part of a component
@@ -794,8 +957,10 @@ impl<M: TextEngine> Core<M> {
             }
             Part::Content => {
                 let content = self.list_content(key);
-                if let Some(list) = self.nodes[key as usize].list.as_mut() {
-                    list.set_class_content(content);
+                if let Some(list) = self.nodes[key as usize].list.as_mut()
+                    && list.set_class_content(content)
+                {
+                    self.needs_layout = true;
                 }
             }
             _ => {}
@@ -964,9 +1129,7 @@ impl<M: TextEngine> Core<M> {
             .transition
             .filter(|t| t.properties.0 != 0)
             .map_or(std::time::Duration::ZERO, |t| {
-                std::time::Duration::from_secs_f32(
-                    (t.duration.max(0.0) + t.delay.max(0.0)) / 1000.0,
-                )
+                std::time::Duration::from_secs_f32((t.run_ms() + t.delay.max(0.0)) / 1000.0)
             })
     }
 
@@ -1080,6 +1243,9 @@ impl<M: TextEngine> Core<M> {
                 });
             }
             if stale != 0 {
+                if stale & state::PRESSED != 0 {
+                    self.pressed_impulses.retain(|&(k, _, _)| k != key);
+                }
                 self.set_node_states(key, states);
             }
         }
@@ -1116,12 +1282,20 @@ impl<M: TextEngine> Core<M> {
         while let Some(k) = stack.pop() {
             let node = &self.nodes[k as usize];
             stack.extend_from_slice(&node.children);
+            let follows = changed & deps::GROUP != 0
+                && node
+                    .parts
+                    .as_ref()
+                    .is_some_and(|p| p.active_group.is_some());
             if node
                 .classes
                 .as_ref()
                 .is_some_and(|c| c.deps() & changed != 0)
             {
                 self.restyle(k);
+            }
+            if follows {
+                self.group_press_changed(k);
             }
         }
     }
@@ -1146,7 +1320,7 @@ impl<M: TextEngine> Core<M> {
                 return;
             }
             let n = &self.nodes[k as usize];
-            if (n.states | n.projected != 0 || !n.data.is_empty())
+            if (n.states | n.projected != 0 || n.passed_hover || !n.data.is_empty())
                 && n.classes.as_ref().is_some_and(|c| !c.groups().is_empty())
             {
                 break;
@@ -1367,6 +1541,7 @@ impl<M: TextEngine> Core<M> {
             Some(font) => self.zero_advance(font),
             None => crate::tailwind::DEFAULT_CH,
         };
+        let base_for_rest = base.clone();
         let mut style;
         let mut props;
         match inherited_font {
@@ -1393,6 +1568,23 @@ impl<M: TextEngine> Core<M> {
             let id = node.id;
             self.ch_styled.push((key, id));
         }
+        // In a terminal, a box's fill decides its layout (a band or a
+        // line, [`terminal_layout::Surface`]): the fill it rests with does,
+        // never one a hover or a press gives it for a moment.
+        let resting = (self.layout.grid().is_some()
+            && self.styled_states(key) & INTERACTION != 0
+            && self.nodes[key as usize]
+                .classes
+                .as_ref()
+                .is_some_and(|c| c.deps() & deps::STATE != 0))
+        .then(|| {
+            let mut rest = base_for_rest;
+            let mut rest_props = ClassProps::default();
+            self.resolve_classes_in(key, ch, position, INTERACTION, &mut rest, &mut rest_props);
+            rest.view.background_color
+        })
+        .filter(|&fill| fill != style.view.background_color);
+        self.nodes[key as usize].resting_fill = resting;
         style.node_props(&mut props);
         self.set_class_props(key, props);
         let id = self.nodes[key as usize].id;
@@ -1493,6 +1685,20 @@ impl<M: TextEngine> Core<M> {
         style: &mut Style,
         props: &mut ClassProps,
     ) {
+        self.resolve_classes_in(key, ch, position, 0, style, props);
+    }
+
+    /// [`Self::resolve_classes`] as if `key` were not in the states
+    /// `without`.
+    fn resolve_classes_in(
+        &mut self,
+        key: Key,
+        ch: f32,
+        position: Option<u8>,
+        without: u16,
+        style: &mut Style,
+        props: &mut ClassProps,
+    ) {
         let node = &self.nodes[key as usize];
         if let Some(classes) = node.classes.clone() {
             let group = |name: &str| self.group_states(key, name);
@@ -1514,7 +1720,7 @@ impl<M: TextEngine> Core<M> {
                 // detached takes the root's), so its sided classes land
                 // right the first time.
                 rtl: self.resolved_rtl(key),
-                states: self.styled_states(key),
+                states: self.styled_states(key) & !without,
                 position: pos,
                 group: &group,
             };

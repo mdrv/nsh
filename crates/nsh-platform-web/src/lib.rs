@@ -63,7 +63,7 @@ use crate::{animation::UiAnimation, encode::Out, text::WebTextEngine};
 pub use crate::{
     filesystem::nsh_filesystem_reply,
     net::{nsh_fetch_body_wanted, nsh_fetch_data, nsh_fetch_end, nsh_fetch_failed, nsh_fetch_head},
-    storage::nsh_storage_reply,
+    storage::{nsh_storage_changed, nsh_storage_reply},
     websocket::{nsh_websocket_event, nsh_websocket_reply},
 };
 
@@ -491,8 +491,8 @@ fn page() -> Environment {
 /// bottom, left]`), `keyboard` (the height the on-screen keyboard
 /// covers), `appleKeyboard` (the browser runs on an Apple platform: its
 /// shortcuts are Apple's), `host` (the page answers `nsh/host` calls:
-/// `createPlayer`'s `host`) and `screenColor` (the browser has an
-/// `EyeDropper`) and `shaders` (`false` once a shader view found no
+/// `createPlayer`'s `host`), `screenColor` (the browser has an
+/// `EyeDropper`), `share` (the browser has `navigator.share`) and `shaders` (`false` once a shader view found no
 /// WebGL 2); missing keys keep their value. Called before the app starts
 /// and on every change; the idiom and `host` are the ones at start, as on every
 /// platform. Returns the pump delay.
@@ -599,6 +599,7 @@ pub unsafe extern "C" fn nsh_environment(ptr: *const u8, len: usize) -> f64 {
         None => env.lifecycle,
     };
     env.screen_color = flag("screenColor").unwrap_or(env.screen_color);
+    env.share = flag("share").unwrap_or(env.share);
     env.notifications = flag("notifications").unwrap_or(env.notifications);
     env.audio = flag("audio").unwrap_or(env.audio);
     env.shaders = flag("shaders").unwrap_or(env.shaders);
@@ -617,6 +618,7 @@ pub unsafe extern "C" fn nsh_environment(ptr: *const u8, len: usize) -> f64 {
         e.keyboard_height = env.keyboard_height;
         e.lifecycle = env.lifecycle;
         e.screen_color = env.screen_color;
+        e.share = env.share;
         e.notifications = env.notifications;
         e.audio = env.audio;
         e.shaders = env.shaders;
@@ -689,7 +691,7 @@ pub unsafe extern "C" fn nsh_data(
 /// Starts `app` in the page's surface.
 fn run(app: App, width: f32, height: f32, environment: Environment, limits: Limits) -> f64 {
     let storage =
-        BASE_URL.with(|b| storage::LocalStorage::new(app.app_id(), b.borrow().as_deref()));
+        BASE_URL.with(|b| storage::LocalStorage::open(app.app_id(), b.borrow().as_deref()));
     let namespace = BASE_URL.with(|b| {
         nsh_engine::local_storage_prefix(app.app_id(), b.borrow().as_deref().unwrap_or(""))
     });
@@ -709,13 +711,14 @@ fn run(app: App, width: f32, height: f32, environment: Environment, limits: Limi
         limits,
         ui_sets: ui_sets(),
         runtime: None,
-        data_dir: Some("/app-data".into()),
+        support_dir: Some("/app-data".into()),
+        data_dir: None,
         // The browser keeps what it downloads in its HTTP cache.
         cache: nsh_engine::CacheOptions::off(),
         filesystem: Some(std::sync::Arc::new(filesystem::BrowserFileSystem {
             namespace,
         })),
-        storage: Some(std::sync::Arc::new(storage)),
+        storage: Some(storage),
         clock: Default::default(),
         context: Default::default(),
         pinned: Default::default(),
@@ -1082,8 +1085,9 @@ fn flush() {
         for uri in app.inline_images.prune() {
             ffi::release_image(&uri);
         }
-        // Bound properties follow the styles just applied.
-        app.animation.outputs(&mut out);
+        // Bound properties follow the styles just applied: all of them, so
+        // what the batch inserted gets its values.
+        app.animation.outputs(&mut out, true);
         if !out.is_empty() {
             ffi::submit(&out.finish());
         }
@@ -1146,20 +1150,21 @@ fn send(f: impl FnOnce(&mut Running)) -> f64 {
     pump()
 }
 
-/// A display frame (`requestAnimationFrame`, `now` in ms), or one the page
-/// runs at a deadline while frames stop ([`nsh_deadline`]): ticks the
-/// native animations and runs JS's frame callbacks. Returns the pump
-/// delay.
+/// A display frame (`requestAnimationFrame`, `now` in ms; `drawn` 1), or
+/// one the page runs at a deadline while frames stop ([`nsh_deadline`];
+/// `drawn` 0, which keeps the real time:
+/// [`nsh_core::animation::Graph::tick_frame`]): ticks the native animations
+/// and runs JS's frame callbacks. Returns the pump delay.
 #[unsafe(no_mangle)]
-pub extern "C" fn nsh_frame(now: f64) -> f64 {
+pub extern "C" fn nsh_frame(now: f64, drawn: u32) -> f64 {
     APP.with(|a| {
         let mut app = a.borrow_mut();
         let Some(app) = app.as_mut() else { return };
         if app.animation.animating() {
             // The animation graph's clock is in seconds.
-            app.animation.tick(now / 1000.0);
+            app.animation.tick(now / 1000.0, drawn != 0);
             let mut out = Out::new();
-            app.animation.outputs(&mut out);
+            app.animation.outputs(&mut out, false);
             if !out.is_empty() {
                 ffi::submit(&out.finish());
             }
@@ -1707,7 +1712,7 @@ pub extern "C" fn nsh_scroll(id: u32, x: f32, y: f32, applied: u32) -> f64 {
     send(|app| {
         if app.animation.scrolled(id, x, y) {
             let mut out = Out::new();
-            app.animation.outputs(&mut out);
+            app.animation.outputs(&mut out, false);
             if !out.is_empty() {
                 ffi::submit(&out.finish());
             }
@@ -1763,7 +1768,7 @@ pub extern "C" fn nsh_pull(id: u32, distance: f32) -> f64 {
     send(|app| {
         if app.animation.pulled(id, distance) {
             let mut out = Out::new();
-            app.animation.outputs(&mut out);
+            app.animation.outputs(&mut out, false);
             if !out.is_empty() {
                 ffi::submit(&out.finish());
             }
@@ -1796,7 +1801,7 @@ pub extern "C" fn nsh_pan(id: u32, phase: u32, tx: f32, ty: f32, vx: f32, vy: f3
             _ => app.animation.pan_moved(id, tx, ty),
         }
         let mut out = Out::new();
-        app.animation.outputs(&mut out);
+        app.animation.outputs(&mut out, false);
         if !out.is_empty() {
             ffi::submit(&out.finish());
         }
@@ -1838,7 +1843,7 @@ pub extern "C" fn nsh_transform_gesture(id: u32, rotation: u32, phase: u32, amou
             _ => app.animation.transform_moved(id, rotation, amount),
         }
         let mut out = Out::new();
-        app.animation.outputs(&mut out);
+        app.animation.outputs(&mut out, false);
         if !out.is_empty() {
             ffi::submit(&out.finish());
         }
@@ -1857,6 +1862,34 @@ pub extern "C" fn nsh_transform_gesture(id: u32, rotation: u32, phase: u32, amou
         if let Some(kind) = kind {
             app.control.dispatch_event(id, kind, payload);
         }
+    })
+}
+
+/// `overlays: "viewport"`: the root view's anchored overlays are drawn
+/// over the window, which is at `x`, `y` (the root's top left at 0, 0) and
+/// `width` × `height` less its safe area; they are placed within it. A
+/// negative `width` keeps them to the root view.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsh_overlay_area(x: f32, y: f32, width: f32, height: f32) -> f64 {
+    send(|app| {
+        let area = (width >= 0.0).then(|| {
+            nsh_core::geometry::bounds(
+                nsh_core::geometry::point(Points(x), Points(y)),
+                Size::new(Points(width), Points(height.max(0.0))),
+            )
+        });
+        app.control.set_overlay_area(area);
+    })
+}
+
+/// `overlays: "viewport"`: a press on the page around the player, at
+/// `x`, `y` in the root view's coordinates, while anchored overlays are
+/// drawn over it: the ones watching presses hear `onPressOutside`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsh_press_outside(x: f32, y: f32) -> f64 {
+    send(|app| {
+        app.control
+            .press_beyond_root(nsh_core::geometry::point(Points(x), Points(y)))
     })
 }
 

@@ -38,6 +38,7 @@ fn table() -> impl IntoElement {
 ```tsx tabs
 import { mount } from "nsh";
 import { DataTable, type DataTableColumn } from "nsh/base";
+import { Window } from "nsh/desktop";
 
 const columns: DataTableColumn[] = [
   { key: "name", title: "Name", width: 160, sortable: true },
@@ -55,7 +56,11 @@ function App() {
   return <DataTable columns={columns} data={rows} class="flex-1" />;
 }
 
-mount(App);
+mount(() => (
+  <Window id="main">
+    <App />
+  </Window>
+));
 ```
 
 The table fills the box the app gives it (`flex-1`, a height) and scrolls inside: vertically through the rows and
@@ -264,7 +269,9 @@ scroll, however long, changes texts and places only.
 
 `renderCell` draws the cells of the app's own where a column is not just text (a badge, a button). It is called for the
 cells in view only, with a `DataTableCell`: `row`, `column`, `key`, `text` (what the table would show) and `selected`.
-The app looks up its own data by `row`. `renderHeaderCell` draws a title across its cell, told a `DataTableHeaderCell`:
+The app looks up its own data by `row`. The views it draws take presses and the pointer as views outside the table do:
+`onPress`, `hover:` classes, `onMouseEnter` / `onMouseMove` / `onMouseLeave`, and with `classes.row` set to `"group"`
+the `group-hover:` classes of the row under the pointer. `renderHeaderCell` draws a title across its cell, told a `DataTableHeaderCell`:
 `column`, `key`, `title`, `sort` (the direction, or none) and `selected`.
 
 ```tsx

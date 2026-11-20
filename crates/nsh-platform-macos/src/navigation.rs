@@ -511,7 +511,12 @@ fn restore_focus(surface: &Surface, scope: &NSView, view: Option<objc2::rc::Weak
         return;
     }
     if view.kind() == ViewKind::Input {
-        if view.can_target() && !view.ns().isHiddenOrHasHiddenAncestor() {
+        // Editor caret sinks reject pointer targeting but still take
+        // keyboard focus. Visibility and exit state decide restoration.
+        if view.seen_by_keys()
+            && !view.state().live.as_ref().is_some_and(|l| l.dying())
+            && !view.ns().isHiddenOrHasHiddenAncestor()
+        {
             crate::text_input::focus(&view);
         }
     } else if crate::input::is_key_stop(&view) {
@@ -994,8 +999,8 @@ impl Nav {
 
     /// The `transitionShader` page or dialog `id` comes and goes through
     /// (none when motion is reduced, or where there is no GPU device to
-    /// draw it: the page or dialog then comes and goes with its own
-    /// `animation`).
+    /// draw it, or it is still opening: the page or dialog then comes and
+    /// goes with its own `animation`).
     fn shader(&self, surface: &Surface, id: NodeId) -> Option<nsh_core::NavShader> {
         let reduce = surface.environment.get().reduce_motion;
         self.shaders
@@ -1586,7 +1591,7 @@ pub(crate) fn modal_config(surface: &Rc<Surface>, view: &NshView, config: &Modal
     }
     let mut nav = surface.nav.borrow_mut();
     let id = view.id();
-    nav.modals.entry(id).or_default().config = *config;
+    nav.modals.entry(id).or_default().config = config.clone();
     nav.size_modal(surface, id);
 }
 
@@ -1597,6 +1602,10 @@ pub(crate) fn set_shader(
     view: &NshView,
     shader: Option<nsh_core::NavShader>,
 ) {
+    if shader.is_some() {
+        // Open by the time the page or dialog comes or goes.
+        surface.shaders.open(surface);
+    }
     let mut nav = surface.nav.borrow_mut();
     match shader {
         Some(shader) => nav.shaders.insert(view.id(), shader),

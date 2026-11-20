@@ -41,10 +41,25 @@
 //! `"rust"`) builds the development host with them: its `main` calls
 //! `nsh_platform_macos::set_ui_sets` and then [`main`].
 
+/// The host's Info.plist, embedded in the executable as AppKit reads it for
+/// one outside an app bundle: the host runs any app, which may recognize
+/// speech or let its web pages capture media (`webview.media`). WebKit
+/// exposes `navigator.mediaDevices` only to an app that describes why it
+/// uses the microphone or the camera; what a page may capture is still the
+/// app's declaration.
+#[cfg(target_os = "macos")]
+#[used]
+#[unsafe(link_section = "__TEXT,__info_plist")]
+static INFO_PLIST: [u8; include_bytes!("../Info.plist").len()] = *include_bytes!("../Info.plist");
+
 /// Runs the development host (until its window closes).
 #[cfg(target_os = "macos")]
 pub fn main() -> std::process::ExitCode {
     use std::{env, path::PathBuf};
+
+    // A host built around this library (an app's own Rust components) links
+    // the section only when something refers to it.
+    std::hint::black_box(&INFO_PLIST);
 
     use nsh_platform_macos::{
         ActivationPolicy, AppOptions, AppSource, AssetBase, Bundle, Limits, WindowDisplay, dev,
@@ -97,8 +112,8 @@ pub fn main() -> std::process::ExitCode {
             "--icon" => options.icon = args.next().map(PathBuf::from),
             // The performance monitor over the app.
             "--fps" => options.fps = true,
-            // Where apps keep their data (`nsh test --target` gives each app
-            // a fresh one); the system's data directory otherwise.
+            // The app's data directory (`nsh test --target` gives each app a
+            // fresh one); the one under its id in the system's otherwise.
             "--data-dir" => {
                 options.data_dir = args.next().map(std::path::PathBuf::from);
                 // Its caches too (downloaded images): a test's app starts with none.

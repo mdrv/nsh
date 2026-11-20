@@ -40,6 +40,7 @@ fn app() -> impl IntoElement {
 
 ```tsx tabs
 import { mount, signal, Text, View } from "nsh";
+import { Window } from "nsh/desktop";
 
 function App() {
   const count = signal(0);
@@ -53,7 +54,11 @@ function App() {
   );
 }
 
-mount(App);
+mount(() => (
+  <Window id="main">
+    <App />
+  </Window>
+));
 ```
 
 In Rust, the primitives are functions of `nsh_core::prelude` (`view()`, `text(..)`, `image(..)`) and the base
@@ -466,7 +471,10 @@ that take presses, and every `focusable` view. Focus styles (`focus:`, `.focus(.
 Return or Space presses it when it takes presses. A click presses a view without focusing it, so focus styles show
 for keyboard focus only. On Android a pressable view is a hardware-keyboard stop, while a touch-mode tap focuses
 only an explicit `focusable` view (or one a ref focused), so tapping a button leaves a field editing; at the first
-and last stop Tab and Shift+Tab go to the embedding Android host instead of wrapping.
+and last stop Tab and Shift+Tab go to the embedding Android host instead of wrapping. On Android, while no view of the
+app has the focus, as at launch and after a tap, the first arrow key moves it to the first stop on screen, and from
+there the arrow keys move it in their direction; an embedding Android host keeps an arrow that moves its own focus or
+scrolls it.
 
 The view the focus reaches scrolls into view in the scroll views and lists around it. Tab walks every row of a list,
 the rows not rendered yet included: the list renders the next row as the focus reaches it, and the focus leaves the
@@ -705,7 +713,7 @@ of its own.
 | `measure()` | `measure()` | `ViewRef` | [Where the view is](../docs/touch-and-gestures.md#where-a-view-is-measure). |
 | `reveal({ vertical?, horizontal?, animated? })` | `reveal(options)` | `ViewRef` | [Scrolls the scroll views around the view](../docs/scrolling.md#revealing-a-view) so it shows. |
 | `setSelection(start, end?)` | `set_selection(start, end)` | `InputRef` | Selects `start..end` in UTF-16 units; a caret without `end`. |
-| `insertText(text)` | `insert_text(text)` | `InputRef` | Inserts `text` in place of the selection as the user's edit, one step of the undo history (Linux, the web, headless tests). |
+| `insertText(text)` | `insert_text(text)` | `InputRef` | Inserts `text` in place of the selection as the user's edit, one step of the undo history (iOS, macOS, Linux, the web, headless tests). |
 | `scrollTo({ x?, y?, animated? })` | `scroll_to(point, animated)` | `ScrollRef`, `ListRef` | Scrolls to an offset. |
 | `zoomTo({ scale, x?, y?, animated? })` | `zoom_to(scale, center, animated)` | `ScrollRef` (a zoomable `<Scroll>`) | Zooms to `scale` around a content point. |
 | `scrollToOffset({ offset, animated? })` | `scroll_to_offset(offset, animated)` | `ListRef` | Scrolls to an offset along the list's axis. |

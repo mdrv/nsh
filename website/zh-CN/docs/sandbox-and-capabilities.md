@@ -117,6 +117,7 @@ release 构建（所有并非从开发服务器加载的代码）在加载时会
     "statusBar": true,
     "clipboard": true,
     "picker": true,
+    "share": true,
     "speech": true,
     "notifications": true,
     "audio": true,
@@ -180,7 +181,7 @@ Web 上它沿用页面的协议，按补全后的 URL 检查；原生应用没�
 并按原样加载（在原生应用中，这样以 `//` 开头的源不会加载任何内容）。
 
 媒体源中的本地文件（`file:` URL，或原生应用中的绝对路径，例如 `/Users/a/x.png`、`C:\pictures\x.png`）和
-`fs/promises` 读文件一样，按 [`fs`](../modules/standard-modules.md) 能力的 `read` 根目录检查，因此只在桌面上可用。设置源时
+`fs/promises` 读文件一样，按 [`fs`](../modules/standard-modules.md) 能力的 `read` 根目录检查，在每个原生平台上都可用。设置源时
 会先解析其中的符号链接，平台加载的也是解析后的路径，所以这时授权根目录里的链接不会把加载引到根目录之外；之后在那里新建的
 链接，在该源保持设置期间会被跟随。在 Web 上，
 `/x.png` 是页面自己的路径。没有声明 `capabilities` 的应用照旧加载本地文件。
@@ -210,7 +211,7 @@ blob（`blob:null/…`），都不允许。所有平台的检查方式相同。
 系统第一次仍会询问用户，所以安装包要声明系统需要的内容：`nsh package` 会写入 `NSMicrophoneUsageDescription` /
 `NSCameraUsageDescription`（可以用 `ios.infoPlist` / `macos.infoPlist` 改成自己的措辞）、macOS 的
 `com.apple.security.device.audio-input` / `com.apple.security.device.camera` 权利（entitlements），以及 Android 的
-`RECORD_AUDIO` / `CAMERA` 权限，应用会在页面第一次需要时请求它们。页面需要处于安全上下文（`https:` 或 `localhost`）才能使用 `getUserMedia`。
+`RECORD_AUDIO` / `CAMERA` 权限，应用会在页面第一次需要时请求它们。开发宿主（`nsh run`）为任何应用都带有这些用途说明。页面需要处于安全上下文（`https:` 或 `localhost`）才能使用 `getUserMedia`。
 
 ```json
 { "capabilities": { "webview": { "hosts": ["phone.example.com"], "media": ["microphone"] } } }
@@ -228,6 +229,10 @@ blob（`blob:null/…`），都不允许。所有平台的检查方式相同。
 
 `"picker": true` 允许应用显示系统的照片选择器（[`Picker`](../modules/nsh.md#picker)）：由用户决定哪些内容交给应用。
 
+### `share`
+
+`"share": true` 允许应用显示系统的分享面板（[`Share`](../modules/nsh.md#share)）：由用户决定内容发往哪里。分享的文件还需要能在 `fs.read` 下读取。
+
 ### `speech`
 
 `"speech": true` 允许应用识别用户说的话（[`Speech`](../modules/nsh.md#speech)）：使用麦克风和系统的语音识别器，转写文本交给应用。系统仍会向用户请求一次权限。
@@ -242,7 +247,7 @@ blob（`blob:null/…`），都不允许。所有平台的检查方式相同。
 
 ### `application`
 
-`"application": true` 允许应用在桌面上作用于整个应用（[`nsh/desktop`](../modules/nsh-desktop.md)）：主窗口（任何 `<Window>` 之外的 `currentWindow()`、`Window.get("main")`：它的标题、标题栏、模式、位置与大小、层级、置于最前、关闭）、应用菜单（`Menu.setApplicationMenu`）、托盘、全局快捷键、`Application.quit()`、`Application.restart()` 和 `Application.setLaunchAtLogin()`。没有这项能力时它们什么也不做，`Application.launchAtLogin()` 返回 `false`，`setLaunchAtLogin` 以 `ERR_ACCESS_DENIED`（`permission` 为 `"application"`）拒绝。右键菜单（`Menu.popup`）显示在应用自己的视图中，应用打开的窗口由 [`windows`](#windows) 授权，两者都不需要这项能力。
+`"application": true` 允许应用在桌面上作用于整个应用（[`nsh/desktop`](../modules/nsh-desktop.md)）：应用菜单（`Menu.setApplicationMenu`）、托盘、全局快捷键、`Application.quit()`、`Application.setQuitMode()`、`Application.restart()` 和 `Application.setLaunchAtLogin()`。没有这项能力时它们什么也不做，`Application.launchAtLogin()` 返回 `false`，`setLaunchAtLogin` 以 `ERR_ACCESS_DENIED`（`permission` 为 `"application"`）拒绝。右键菜单（`Menu.popup`）显示在应用自己的视图中，应用打开的窗口由 [`windows`](#windows) 授权，两者都不需要这项能力。
 
 ### `homeDir`
 
@@ -261,10 +266,10 @@ blob（`blob:null/…`），都不允许。所有平台的检查方式相同。
 |---|---|---|
 | `kinds` | `string[]` | 可以打开的种类：`"normal"`、`"dialog"`、`"panel"`、`"popup"`、`"overlay"`。缺省：除 `"overlay"` 外的所有种类。 |
 | `levels` | `string[]` | 窗口可以使用的层级：`"normal"`、`"floating"`、`"aboveDock"`、`"desktopIcon"`。缺省：所有层级。 |
-| `max` | `number` | 同时可以打开的自己的窗口数。缺省：不限。 |
+| `max` | `number` | 同时可以打开的自己的窗口数，包含第一个窗口。缺省：不限。 |
 | `overlay` | `boolean` | 浮层和点击穿透的窗口（`pointerEvents: "none"`）。只有声明了才会授予，没有 `"capabilities"` 的应用也不例外。 |
 
-`overlay` 单独列出，是因为一个透明、点击穿透、位于所有窗口之上的窗口可以冒充系统自己的界面。主窗口不需要授权。
+`overlay` 单独列出，是因为一个透明、点击穿透、位于所有窗口之上的窗口可以冒充系统自己的界面。每个窗口都需要授权，第一个窗口也不例外：没有特权窗口。
 
 ### 存储
 
@@ -303,6 +308,7 @@ if (host.available()) {
 | 状态栏修改、画布图片 | 不修改也不绘制任何东西；拒绝会记录在日志中。 |
 | 剪贴板 | `Clipboard` 的每个函数都以 `ERR_ACCESS_DENIED` 被 reject，`permission` 为 `"clipboard"`，`resource` 为 `""`；不会访问系统剪贴板。 |
 | 选择器 | `pickImages` 和 `pickFiles` 不显示任何内容，以 `ERR_ACCESS_DENIED` 被 reject，`permission` 为 `"picker"`，`resource` 为 `""`。 |
+| 分享 | `Share.available()` resolve 为 `false`，`Share.show` 不显示任何内容，以 `ERR_ACCESS_DENIED` 被 reject，`permission` 为 `"share"`，`resource` 为 `""`。 |
 | 声音 | `Sound.load` reject、`new AudioPlayer` 抛出 `ERR_ACCESS_DENIED`，`permission` 为 `"audio"`，`resource` 为音源；不读取也不播放任何内容。 |
 | 语音 | `Speech.start` 抛出 `ERR_ACCESS_DENIED`，`permission` 为 `"speech"`，`resource` 为 `""`；麦克风不会打开。 |
 | 通知 | `Notifications` 的函数 reject 或抛出 `ERR_ACCESS_DENIED`，`permission` 为 `"notifications"`，`resource` 为 `""`；不会显示任何东西。 |

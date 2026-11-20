@@ -8,6 +8,7 @@ import android.text.Editable;
 import android.text.InputFilter;
 import android.text.InputType;
 import android.text.Layout;
+import android.text.Spanned;
 import android.text.TextWatcher;
 import android.text.method.ArrowKeyMovementMethod;
 import android.util.TypedValue;
@@ -21,6 +22,7 @@ import android.view.inputmethod.InputConnectionWrapper;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import java.text.BreakIterator;
 
 /** `<input>`: an EditText inside a container that carries the decoration. */
 @SuppressLint("ViewConstructor")
@@ -49,6 +51,11 @@ final class InputBox extends FrameLayout implements Node {
     private int submit = SUBMIT_AND_BLUR;
     private boolean applying;
     private boolean configured;
+
+    /** It has had its first props (an `autoFocus` then focuses it). */
+    boolean isConfigured() {
+        return configured;
+    }
     /** The composition last seen (`onCompositionChange` reports its changes). */
     private boolean inComposition;
     private String composed = "";
@@ -64,6 +71,8 @@ final class InputBox extends FrameLayout implements Node {
     boolean pasteInserts = true;
     /** Whether the EditText shows a vertical scroll bar of its own by default. */
     private final boolean defaultVerticalBar;
+    /** Platform hint colors before any explicit `placeholderTextColor` override. */
+    private final android.content.res.ColorStateList defaultHintColors;
     /**
      * A built-in bar replaces the scroll indicator (`InputConfig::replaced`):
      * how far the text scrolled is reported to the engine.
@@ -190,6 +199,7 @@ final class InputBox extends FrameLayout implements Node {
         if (Build.VERSION.SDK_INT >= 28) edit.setFallbackLineSpacing(false);
         if (Build.VERSION.SDK_INT >= 35) edit.setLocalePreferredLineHeightForMinimumUsed(false);
         defaultVerticalBar = edit.isVerticalScrollBarEnabled();
+        defaultHintColors = edit.getHintTextColors();
         edit.addTextChangedListener(new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
@@ -302,19 +312,21 @@ final class InputBox extends FrameLayout implements Node {
     void configure(float fontSizeDp, int weight, boolean italic, int color, String family, float letterSpacingDp,
                    int align, String placeholder, boolean hasPlaceholderColor, int placeholderColor,
                    boolean secure, int keyboard, int returnKey, int capitalize, boolean autoCorrect,
-                   boolean multiline, int maxLength, boolean editable, boolean autoFocus,
+                   boolean multiline, int maxLength, boolean editable, boolean autoFocus, boolean selectOnFocus,
                    boolean hasSelectionColor, int selectionColor, boolean hasCaretColor, int caretColor,
-                   int submit) {
+                   int submit, boolean rtl, int fontVariant) {
         boolean restart = this.submit != submit && multiline && configured;
         this.multiline = multiline;
         this.submit = submit;
         edit.setTextSize(TypedValue.COMPLEX_UNIT_PX, fontSizeDp * mounter.density);
         edit.setTextColor(color);
-        if (letterSpacingDp != 0) edit.setLetterSpacing(letterSpacingDp / fontSizeDp);
-        int horizontal = align == 1 ? Gravity.CENTER_HORIZONTAL : align == 2 ? Gravity.END : Gravity.START;
+        edit.setLetterSpacing(TextLayouts.letterSpacing(letterSpacingDp, fontSizeDp));
+        edit.setFontFeatureSettings(TextLayouts.features(fontVariant));
+        int horizontal = TextLayouts.horizontalGravity(align, rtl);
         edit.setGravity(horizontal | (multiline ? Gravity.TOP : Gravity.CENTER_VERTICAL));
         edit.setHint(placeholder);
         if (hasPlaceholderColor) edit.setHintTextColor(placeholderColor);
+        else if (defaultHintColors != null) edit.setHintTextColor(defaultHintColors);
         int type;
         switch (keyboard) {
             case 1: type = InputType.TYPE_CLASS_NUMBER; break;
@@ -347,7 +359,7 @@ final class InputBox extends FrameLayout implements Node {
         } else if (secure && (type & InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_NUMBER) {
             type |= InputType.TYPE_NUMBER_VARIATION_PASSWORD;
         }
-        int selection = edit.getSelectionEnd();
+        int selectionStart = edit.getSelectionStart(), selectionEnd = edit.getSelectionEnd();
         // Before the input type: setSingleLine replaces a password's
         // transformation (the text would show).
         edit.setSingleLine(!multiline);
@@ -355,7 +367,11 @@ final class InputBox extends FrameLayout implements Node {
         edit.setInputType(type);
         // After the input type: password types reset the typeface to monospace.
         edit.setTypeface(TextLayouts.typeface(family, weight, italic));
-        if (selection >= 0 && selection <= edit.length()) edit.setSelection(selection);
+        // The whole selection, not only its end: an update while the text is
+        // selected (`selectTextOnFocus`, then a prop set from `onFocus`) keeps it.
+        if (selectionStart >= 0 && selectionEnd >= 0 && Math.max(selectionStart, selectionEnd) <= edit.length()) {
+            edit.setSelection(selectionStart, selectionEnd);
+        }
         int ime;
         switch (returnKey) {
             case 1: ime = EditorInfo.IME_ACTION_DONE; break;
@@ -366,7 +382,7 @@ final class InputBox extends FrameLayout implements Node {
             default: ime = multiline && submit == NEWLINE ? EditorInfo.IME_ACTION_NONE : EditorInfo.IME_ACTION_DONE;
         }
         edit.setImeOptions(ime);
-        edit.setFilters(maxLength >= 0 ? new InputFilter[] {new InputFilter.LengthFilter(maxLength)} : new InputFilter[0]);
+        edit.setFilters(maxLength >= 0 ? new InputFilter[] {new CharLengthFilter(maxLength)} : new InputFilter[0]);
         // `readonly` keeps focus and selection, as the docs say: the text selects as a selectable TextView's does (a
         // long press on a word, the handles, Copy) while no key listener edits it and no keyboard comes up. Disabling
         // the EditText instead, as before, took the selection away too.
@@ -389,7 +405,11 @@ final class InputBox extends FrameLayout implements Node {
                 }
             });
         }
+        // TextView's own `selectAllOnFocus`: any focus (a tap, a key, `requestFocus`) selects the text; a tap that
+        // focuses keeps that selection rather than placing the caret, and one on the focused field places it.
+        edit.setSelectAllOnFocus(selectOnFocus);
         edit.setHighlightColor(hasSelectionColor ? (selectionColor & 0x00ffffff) | 0x55000000 : 0x5533b5e5);
+        tintHandles(hasSelectionColor ? selectionColor : null);
         boolean first = !configured;
         configured = true;
         if (first && autoFocus) post(this::focus);
@@ -398,6 +418,37 @@ final class InputBox extends FrameLayout implements Node {
             InputMethodManager imm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
             if (imm != null) imm.restartInput(edit);
         }
+    }
+
+    /** The color the selection handles are tinted (null: the theme's). */
+    private Integer handleColor;
+
+    /**
+     * Tints the selection and insertion handles {@code color}, as the
+     * selection's highlight (null: the theme's, as a fresh copy of the
+     * theme's drawables keeps it). Android 10 (API 29) and later.
+     */
+    private void tintHandles(Integer color) {
+        if (Build.VERSION.SDK_INT < 29 || java.util.Objects.equals(handleColor, color)) return;
+        int[] attrs = {
+            android.R.attr.textSelectHandleLeft, android.R.attr.textSelectHandleRight, android.R.attr.textSelectHandle
+        };
+        for (int i = 0; i < attrs.length; i++) {
+            android.content.res.TypedArray a = getContext().obtainStyledAttributes(new int[] {attrs[i]});
+            android.graphics.drawable.Drawable d = a.getDrawable(0);
+            a.recycle();
+            // A handle the theme has no drawable for keeps the EditText's own;
+            // the others still take the color.
+            if (d == null) continue;
+            d = d.mutate();
+            if (color != null) d.setTint(color);
+            if (i == 0) edit.setTextSelectHandleLeft(d);
+            else if (i == 1) edit.setTextSelectHandleRight(d);
+            else edit.setTextSelectHandle(d);
+        }
+        // Recorded only once applied, so the same color asked again is not
+        // skipped as already set.
+        handleColor = color;
     }
 
     /** Return submitted: `onSubmitEditing`, then unfocuses for `blurAndSubmit`. */
@@ -485,6 +536,42 @@ final class InputBox extends FrameLayout implements Node {
         String text = pendingText;
         pendingText = null;
         setValue(text, pendingCount);
+    }
+
+    /**
+     * `maxLength`: the user's edits keep the text within {@code max} characters, counted as Unicode code points (an
+     * emoji is one, though a Java string holds two chars for it), as on every platform; `LengthFilter` counts chars.
+     * An insertion longer than the room left goes in cut between user-perceived characters, never inside one (a
+     * letter with its accent, an emoji with its skin tone), as the core's `clip_chars` cuts. The app's value is
+     * never cut, as nowhere else.
+     */
+    private final class CharLengthFilter implements InputFilter {
+        private final int max;
+
+        CharLengthFilter(int max) {
+            this.max = max;
+        }
+
+        @Override
+        public CharSequence filter(CharSequence source, int start, int end, Spanned dest, int dstart, int dend) {
+            if (applying) return null;
+            int kept = Character.codePointCount(dest, 0, dstart)
+                    + Character.codePointCount(dest, dend, dest.length());
+            int room = max - kept;
+            if (Character.codePointCount(source, start, end) <= room) return null;
+            if (room <= 0) return "";
+            BreakIterator graphemes = BreakIterator.getCharacterInstance();
+            String text = source.subSequence(start, end).toString();
+            graphemes.setText(text);
+            int cut = 0;
+            int used = 0;
+            for (int next = graphemes.next(); next != BreakIterator.DONE; next = graphemes.next()) {
+                used += text.codePointCount(cut, next);
+                if (used > room) break;
+                cut = next;
+            }
+            return source.subSequence(start, start + cut);
+        }
     }
 
     /**
@@ -787,6 +874,9 @@ final class InputBox extends FrameLayout implements Node {
         };
         getViewTreeObserver().addOnGlobalLayoutListener(pendingFocus);
         getViewTreeObserver().addOnWindowFocusChangeListener(pendingWindowFocus);
+        // Whoever asked (`ref.focus()` or `autoFocus`), this is now
+        // the latest request: a newer one or a blur ends the wait.
+        if (mounter != null) mounter.inputFocusWaits(this);
     }
 
     /** {@link #focus()} waiting for the field to be shown in a focused window. */
@@ -795,11 +885,22 @@ final class InputBox extends FrameLayout implements Node {
         if (focused && pendingFocus != null) pendingFocus.onGlobalLayout();
     };
 
-    private void cancelPendingFocus() {
+    /** Whether {@link #focus()} still waits for the field to be shown in a focused window. */
+    boolean focusPending() {
+        return pendingFocus != null;
+    }
+
+    /**
+     * Ends a waiting {@link #focus()}: the field is shown (it is focused
+     * next), a newer focus request or a blur took over, or it left its
+     * window. The mounter forgets the request with it.
+     */
+    void cancelPendingFocus() {
         if (pendingFocus == null) return;
         getViewTreeObserver().removeOnGlobalLayoutListener(pendingFocus);
         getViewTreeObserver().removeOnWindowFocusChangeListener(pendingWindowFocus);
         pendingFocus = null;
+        if (mounter != null) mounter.inputFocusWaitEnded(this);
     }
 
     @Override

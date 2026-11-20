@@ -22,7 +22,7 @@ use block2::RcBlock;
 use nsh_core::{
     Color, EdgeInsets, EventKind, EventPayload, HeaderItem, HeaderItemContent, HeaderSystemItem,
     ModalAnimation, ModalConfig, ModalPresentation, NavShader, NodeId, PayloadValue, Points,
-    ScreenAnimation, ScreenConfig, Size,
+    ScreenAnimation, ScreenConfig, SheetDetent, Size,
     desktop::{MenuAction, MenuItem},
     element::header::{KeptContent, same_right_buttons},
 };
@@ -33,19 +33,24 @@ use objc2::{
     runtime::{AnyClass, AnyObject, ProtocolObject},
     sel,
 };
-use objc2_core_foundation::{CGFloat, CGSize};
+use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSString};
 use objc2_quartz_core::{CAMediaTiming, CATransition};
 use objc2_ui_kit::{
-    NSForegroundColorAttributeName, UIAction, UIAdaptivePresentationControllerDelegate,
-    UIBarButtonItem, UIBarButtonItemStyle, UIBarButtonSystemItem, UIBehavioralStyle, UIColor,
-    UIEdgeInsets, UIGestureRecognizer, UIGestureRecognizerDelegate, UIImage,
-    UIInterfaceOrientationMask, UIMenu, UIMenuElement, UIMenuElementAttributes, UIMenuElementState,
-    UIMenuOptions, UIModalPresentationStyle, UIModalTransitionStyle, UINavigationBar,
-    UINavigationBarAppearance, UINavigationController, UINavigationControllerDelegate,
-    UINavigationItem, UINavigationItemLargeTitleDisplayMode, UIPresentationController, UIResponder,
-    UIScrollView, UIView, UIViewAutoresizing, UIViewController,
-    UIViewControllerTransitionCoordinator, UIViewControllerTransitionCoordinatorContext,
+    NSDirectionalRectEdge, NSForegroundColorAttributeName, UIAction,
+    UIAdaptivePresentationControllerDelegate, UIBarButtonItem, UIBarButtonItemStyle,
+    UIBarButtonSystemItem, UIBehavioralStyle, UIColor, UIEdgeInsets, UIGestureRecognizer,
+    UIGestureRecognizerDelegate, UIImage, UIInterfaceOrientationMask, UIMenu, UIMenuElement,
+    UIMenuElementAttributes, UIMenuElementState, UIMenuOptions, UIModalPresentationStyle,
+    UIModalTransitionStyle, UINavigationBar, UINavigationBarAppearance, UINavigationController,
+    UINavigationControllerDelegate, UINavigationItem, UINavigationItemLargeTitleDisplayMode,
+    UIPresentationController, UIResponder, UIScrollView, UISheetPresentationController,
+    UISheetPresentationControllerDelegate, UISheetPresentationControllerDetent,
+    UISheetPresentationControllerDetentIdentifierLarge,
+    UISheetPresentationControllerDetentIdentifierMedium,
+    UISheetPresentationControllerDetentResolutionContext, UIView, UIViewAutoresizing,
+    UIViewController, UIViewControllerTransitionCoordinator,
+    UIViewControllerTransitionCoordinatorContext,
 };
 
 use crate::{mount::SharedMounter, native_view::NshView};
@@ -94,6 +99,11 @@ pub(crate) struct ScreenIvars {
     /// The header height last reported to the core.
     measured: Cell<Option<f32>>,
     insets: Cell<Option<EdgeInsets>>,
+    /// `headerBackgroundOnScroll`: the header follows the scroll view that
+    /// runs under it (`follow_content_scroll`).
+    follow_scroll: Cell<bool>,
+    /// The scroll view last given to UIKit as the content scroll view.
+    followed: RefCell<Option<Weak<UIScrollView>>>,
 }
 
 define_class!(
@@ -109,6 +119,7 @@ define_class!(
             // SAFETY: calling the superclass implementation.
             let _: () = unsafe { msg_send![super(self), viewDidLayoutSubviews] };
             self.report_insets();
+            self.follow_content_scroll();
         }
 
         /// The stack correcting what UIKit granted a screen beside a side
@@ -156,6 +167,8 @@ impl ScreenController {
             measure: Cell::new(false),
             measured: Cell::new(None),
             insets: Cell::new(None),
+            follow_scroll: Cell::new(false),
+            followed: RefCell::new(None),
         });
         // SAFETY: UIViewController's designated initializer.
         unsafe {
@@ -165,6 +178,27 @@ impl ScreenController {
 
     pub(crate) fn screen_id(&self) -> NodeId {
         self.ivars().id
+    }
+
+    /// With `headerBackgroundOnScroll`, the header switches to its standard
+    /// appearance once the content scrolls under it. UIKit watches the
+    /// controller's content scroll view for that, and before iOS 26 finds it
+    /// on its own only next to the root view, not deep in the screen's
+    /// content: it is pointed at the scroll view that runs under the header.
+    pub(crate) fn follow_content_scroll(&self) {
+        let ivars = self.ivars();
+        let found = if ivars.follow_scroll.get() {
+            self.view().and_then(|view| scroll_under_header(&view))
+        } else {
+            None
+        };
+        let followed = ivars.followed.borrow().as_ref().and_then(Weak::load);
+        if followed.as_deref().map(|v| v as *const UIScrollView)
+            != found.as_deref().map(|v| v as *const UIScrollView)
+        {
+            self.setContentScrollView_forEdge(found.as_deref(), NSDirectionalRectEdge::Top);
+            *ivars.followed.borrow_mut() = found.as_deref().map(Weak::new);
+        }
     }
 
     /// The screen's insets not covered by system UI or its header, for
@@ -187,6 +221,38 @@ impl ScreenController {
                 .dispatch_event(id, EventKind::Insets, insets_payload(insets));
         }
     }
+}
+
+/// The scroll view a header follows: the visible one that starts at the top of
+/// `root` (under a transparent header) and shows the most of itself, outside
+/// other scroll views.
+fn scroll_under_header(root: &UIView) -> Option<Retained<UIScrollView>> {
+    let bounds = root.bounds();
+    let mut best: Option<(CGFloat, Retained<UIScrollView>)> = None;
+    let mut queue = vec![root.retain()];
+    while let Some(parent) = queue.pop() {
+        for child in parent.subviews().iter() {
+            if child.isHidden() || child.alpha() <= 0.0 {
+                continue;
+            }
+            let Ok(scroll) = child.clone().downcast::<UIScrollView>() else {
+                queue.push(child);
+                continue;
+            };
+            let frame = parent.convertRect_toView(scroll.frame(), Some(root));
+            let width = (frame.origin.x + frame.size.width).min(bounds.size.width)
+                - frame.origin.x.max(0.0);
+            let height = (frame.origin.y + frame.size.height).min(bounds.size.height);
+            if frame.origin.y > 0.5 || width <= 0.0 || height <= 0.0 {
+                continue;
+            }
+            let area = width * height;
+            if best.as_ref().is_none_or(|(most, _)| area > *most) {
+                best = Some((area, scroll));
+            }
+        }
+    }
+    best.map(|(_, scroll)| scroll)
 }
 
 fn first_responder(view: &UIView) -> Option<Retained<UIView>> {
@@ -213,6 +279,12 @@ pub(crate) struct ModalIvars {
     animated: Cell<bool>,
     /// The user closed it natively; the app has not hidden it yet.
     closed: Cell<bool>,
+    /// The identifiers of the sheet's UIKit detents and the detents
+    /// (`detents`) they stand for, to report the one the user picks.
+    detents: RefCell<Vec<(Retained<NSString>, SheetDetent)>>,
+    /// The height of the window it was presented over, which decides
+    /// between medium and large for a custom detent before iOS 16.
+    screen: Cell<CGFloat>,
 }
 
 define_class!(
@@ -327,6 +399,31 @@ define_class!(
                 .dispatch_event(id, EventKind::RequestClose, close_reason("swipe"));
         }
     }
+
+    unsafe impl UISheetPresentationControllerDelegate for ModalController {
+        /// The user moved the sheet to another detent (a drag, the
+        /// grabber, a scroll at its edge, a screen reader).
+        #[unsafe(method(sheetPresentationControllerDidChangeSelectedDetentIdentifier:))]
+        fn did_change_detent(&self, sheet: &UISheetPresentationController) {
+            let Some(selected) = sheet.selectedDetentIdentifier() else {
+                return;
+            };
+            let ivars = self.ivars();
+            let detent = ivars
+                .detents
+                .borrow()
+                .iter()
+                .find(|(identifier, _)| identifier.isEqualToString(&selected))
+                .map(|&(_, detent)| detent);
+            if let Some(detent) = detent {
+                ivars.control.dispatch_event(
+                    ivars.id,
+                    EventKind::DetentChange,
+                    detent.change_payload(),
+                );
+            }
+        }
+    }
 );
 
 impl ModalController {
@@ -340,6 +437,8 @@ impl ModalController {
             close_on_escape: Cell::new(false),
             animated: Cell::new(true),
             closed: Cell::new(false),
+            detents: RefCell::new(Vec::new()),
+            screen: Cell::new(0.0),
         });
         // SAFETY: UIViewController's designated initializer.
         unsafe {
@@ -356,6 +455,71 @@ impl ModalController {
         // A sheet that stays only reports the swipe
         // (`presentationControllerDidAttemptToDismiss:`).
         self.setModalInPresentation(!c.close_on_swipe);
+    }
+
+    /// Applies the sheet's detents, grabber and undimmed detent of `c`
+    /// (a sheet presentation only), against `old`, what it had (`None`
+    /// before it is presented: it opens at `detent`, else `defaultDetent`,
+    /// else the smallest). The app's `detent` moves it when it changes.
+    fn apply_sheet(&self, c: &ModalConfig, old: Option<&ModalConfig>) {
+        let Some(sheet) = self.sheetPresentationController() else {
+            return;
+        };
+        let has = |c: &ModalConfig| {
+            !c.detents.is_empty()
+                || c.grabber
+                || c.detent.is_some()
+                || c.default_detent.is_some()
+                || c.largest_undimmed_detent.is_some()
+        };
+        // A sheet without the options keeps UIKit's own defaults untouched.
+        if !has(c) && !old.is_some_and(has) {
+            return;
+        }
+        let same = old.is_some_and(|o| {
+            o.detents == c.detents
+                && o.grabber == c.grabber
+                && o.detent == c.detent
+                && o.largest_undimmed_detent == c.largest_undimmed_detent
+        });
+        if same {
+            return;
+        }
+        let mtm = self.mtm();
+        let made = sheet_detents(mtm, &c.detents, self.ivars().screen.get());
+        let identifier = |detent: Option<SheetDetent>| {
+            let detent = detent?;
+            made.iter()
+                .find(|d| d.detent == detent)
+                .map(|d| d.identifier.clone())
+        };
+        let selected = match old {
+            None => Some(identifier(c.detent.or(c.default_detent))),
+            Some(o) if o.detent != c.detent && c.detent.is_some() => Some(identifier(c.detent)),
+            Some(_) => None,
+        };
+        let undimmed = identifier(c.largest_undimmed_detent);
+        let natives: Vec<Retained<UISheetPresentationControllerDetent>> = if made.is_empty() {
+            // UIKit's default: the full height.
+            vec![UISheetPresentationControllerDetent::largeDetent(mtm)]
+        } else {
+            made.iter().map(|d| d.native.clone()).collect()
+        };
+        *self.ivars().detents.borrow_mut() =
+            made.into_iter().map(|d| (d.identifier, d.detent)).collect();
+        let apply = || {
+            sheet.setDetents(&NSArray::from_retained_slice(&natives));
+            sheet.setPrefersGrabberVisible(c.grabber);
+            sheet.setLargestUndimmedDetentIdentifier(undimmed.as_deref());
+            if let Some(selected) = &selected {
+                sheet.setSelectedDetentIdentifier(selected.as_deref());
+            }
+        };
+        if old.is_some() && self.presentingViewController().is_some() {
+            sheet.animateChanges(&RcBlock::new(apply));
+        } else {
+            apply();
+        }
     }
 
     /// Escape: reported as `cancel`, and closed natively with
@@ -407,6 +571,121 @@ impl ModalController {
             .control
             .dispatch_event(ivars.id, EventKind::Insets, insets_payload(insets));
     }
+}
+
+/// A UIKit detent made for a [`SheetDetent`], with its identifier.
+struct MadeDetent {
+    native: Retained<UISheetPresentationControllerDetent>,
+    /// Known when it is made: `-[UISheetPresentationControllerDetent
+    /// identifier]` needs iOS 16.
+    identifier: Retained<NSString>,
+    detent: SheetDetent,
+}
+
+/// The UIKit detents of `detents`: UIKit's medium and large, and a custom
+/// detent of the height asked for (iOS 16 and later; before, the nearer
+/// of medium and large). A detent that comes out the same as an earlier
+/// one is left out. `screen`: the height of the window, against which a
+/// height is a share before iOS 16.
+fn sheet_detents(
+    mtm: MainThreadMarker,
+    detents: &[SheetDetent],
+    screen: CGFloat,
+) -> Vec<MadeDetent> {
+    let class = <UISheetPresentationControllerDetent as ClassType>::class();
+    // SAFETY: `respondsToSelector:` on the class object.
+    let custom: bool =
+        unsafe { msg_send![class, respondsToSelector: sel!(customDetentWithIdentifier:resolver:)] };
+    let screen = screen.max(1.0);
+    let medium = || {
+        // SAFETY: a constant of UIKit since iOS 15, the oldest NSH runs on.
+        let identifier = unsafe { UISheetPresentationControllerDetentIdentifierMedium }.retain();
+        (
+            UISheetPresentationControllerDetent::mediumDetent(mtm),
+            identifier,
+        )
+    };
+    let large = || {
+        // SAFETY: as `medium`'s.
+        let identifier = unsafe { UISheetPresentationControllerDetentIdentifierLarge }.retain();
+        (
+            UISheetPresentationControllerDetent::largeDetent(mtm),
+            identifier,
+        )
+    };
+    let mut out: Vec<MadeDetent> = Vec::new();
+    for &detent in detents {
+        let (native, identifier) = match detent {
+            SheetDetent::Medium => medium(),
+            SheetDetent::Large => large(),
+            // Named by their value, so a detent the app moves in its list
+            // keeps its identifier and UIKit keeps it selected.
+            SheetDetent::Height(height) if custom => custom_detent(
+                mtm,
+                &format!("nsh.height.{:08x}", height.0.to_bits()),
+                detent,
+            ),
+            SheetDetent::Fraction(fraction) if custom => custom_detent(
+                mtm,
+                &format!("nsh.fraction.{:08x}", fraction.0.to_bits()),
+                detent,
+            ),
+            SheetDetent::Height(_) | SheetDetent::Fraction(_) => {
+                let share = match detent {
+                    SheetDetent::Height(height) => height.0 as CGFloat / screen,
+                    SheetDetent::Fraction(fraction) => fraction.0 as CGFloat,
+                    SheetDetent::Medium | SheetDetent::Large => 1.0,
+                };
+                if share < 0.75 { medium() } else { large() }
+            }
+        };
+        if out
+            .iter()
+            .any(|made| made.identifier.isEqualToString(&identifier))
+        {
+            continue;
+        }
+        out.push(MadeDetent {
+            native,
+            identifier,
+            detent,
+        });
+    }
+    out
+}
+
+/// A custom UIKit detent (iOS 16 and later) named `name`, at the height
+/// of `detent` (`Height` or `Fraction`) within the sheet's room.
+fn custom_detent(
+    mtm: MainThreadMarker,
+    name: &str,
+    detent: SheetDetent,
+) -> (
+    Retained<UISheetPresentationControllerDetent>,
+    Retained<NSString>,
+) {
+    let identifier = NSString::from_str(name);
+    let resolver = RcBlock::new(
+        move |context: NonNull<
+            ProtocolObject<dyn UISheetPresentationControllerDetentResolutionContext>,
+        >|
+              -> CGFloat {
+            // SAFETY: UIKit passes a live context for the call.
+            let max = unsafe { context.as_ref() }.maximumDetentValue();
+            let height = match detent {
+                SheetDetent::Height(height) => height.0 as CGFloat,
+                SheetDetent::Fraction(fraction) => max * fraction.0 as CGFloat,
+                SheetDetent::Medium | SheetDetent::Large => max,
+            };
+            height.clamp(0.0, max)
+        },
+    );
+    let native = UISheetPresentationControllerDetent::customDetentWithIdentifier_resolver(
+        Some(&identifier),
+        &resolver,
+        mtm,
+    );
+    (native, identifier)
 }
 
 pub(crate) struct NavIvars {
@@ -506,7 +785,9 @@ fn size_screens(nav: &UINavigationController) {
 /// stays behind) that subtraction hands the overshoot straight back, and every
 /// later pass arrives at the same wrong number again. Taken from geometry and
 /// written to both sides every time, it is idempotent, and leaves nothing
-/// behind on the side the bar left.
+/// behind on the side the bar left. The stack's frame is its untransformed
+/// place: a container's transform moves the picture of the stack, not the
+/// part of the window it covers (see [`hold_safe_area`]).
 fn clip_side_safe_area(nav: &UINavigationController) {
     let Some(view) = nav.viewIfLoaded() else {
         return;
@@ -518,7 +799,10 @@ fn clip_side_safe_area(nav: &UINavigationController) {
     };
     let safe = window.safeAreaInsets();
     let bounds = window.bounds();
-    let frame = view.convertRect_toView(view.bounds(), Some(&window));
+    let frame = match untransformed_place(&view) {
+        Some((above, frame)) => above.convertRect_toView(frame, Some(&window)),
+        None => view.convertRect_toView(view.bounds(), Some(&window)),
+    };
     let (stack_min, stack_max) = (frame.min().x, frame.max().x);
     let covered = |min: CGFloat, max: CGFloat| (stack_max.min(max) - stack_min.max(min)).max(0.0);
     let left = covered(bounds.min().x, bounds.min().x + safe.left) - safe.left;
@@ -534,6 +818,106 @@ fn clip_side_safe_area(nav: &UINavigationController) {
             ..current
         });
     }
+}
+
+/// The superview of the outermost transformed layer between `view` (itself
+/// included) and its window, with `view`'s bounds where they sit in it when
+/// no transform applies; `None` when no layer on the way has a transform.
+fn untransformed_place(view: &UIView) -> Option<(Retained<UIView>, CGRect)> {
+    let size = view.bounds().size;
+    let (mut x, mut y) = (0.0, 0.0);
+    let mut place = None;
+    let mut v = view.retain();
+    while let Some(parent) = v.superview() {
+        let layer = v.layer();
+        let (center, bounds, anchor) = (v.center(), v.bounds(), layer.anchorPoint());
+        // Where `view` sits in `parent`'s bounds, which a scroll view moves
+        // by its offset: the rectangle is kept in those coordinates.
+        x += center.x - bounds.size.width * anchor.x;
+        y += center.y - bounds.size.height * anchor.y;
+        if !layer.transform().is_identity() {
+            place = Some((parent.clone(), CGRect::new(CGPoint::new(x, y), size)));
+        }
+        let offset = parent.bounds().origin;
+        x -= offset.x;
+        y -= offset.y;
+        v = parent;
+    }
+    place
+}
+
+/// Keeps the safe area UIKit measures through a transform from falling short
+/// of what the stack's untransformed place is owed.
+///
+/// UIKit measures a controller's safe area through the transforms around it,
+/// on its own layout passes only: a pass while a container shows the stack
+/// scaled or moved (a drawer that shrinks the page into a card) hands it the
+/// insets of that picture, and they stay after the transform goes, since a
+/// transform starts no pass. What the stack is owed comes from the safe area
+/// of the view just above the outermost transform (the window's insets and
+/// whatever a host or an outer stack adds there), against the stack's
+/// untransformed place in that view; what falls short goes into the stack's
+/// `additionalSafeAreaInsets`. Insets added inside the transformed views (a
+/// host's tab bar when the host scales its tab controller) are measured by
+/// UIKit in the same picture and stay as they are: nothing here takes away
+/// from what UIKit granted. With no transform around, nothing is added.
+fn hold_safe_area(nav: &UINavigationController) {
+    let Some(view) = nav.viewIfLoaded() else {
+        return;
+    };
+    if view.window().is_none() {
+        return;
+    }
+    let current = nav.additionalSafeAreaInsets();
+    let wanted = match untransformed_place(&view) {
+        None => UIEdgeInsets {
+            top: 0.0,
+            left: 0.0,
+            bottom: 0.0,
+            right: 0.0,
+        },
+        Some((above, frame)) => {
+            let (bounds, area) = (above.bounds(), above.safeAreaInsets());
+            let safe = view.safeAreaInsets();
+            // What is added is never negative, so UIKit's floor at zero
+            // never cuts the sum: less what was added, the safe area is
+            // exactly what UIKit granted.
+            let short = |owed: CGFloat, safe: CGFloat, added: CGFloat| {
+                (owed.max(0.0) - (safe - added)).max(0.0)
+            };
+            UIEdgeInsets {
+                top: short(
+                    bounds.min().y + area.top - frame.min().y,
+                    safe.top,
+                    current.top,
+                ),
+                left: short(
+                    bounds.min().x + area.left - frame.min().x,
+                    safe.left,
+                    current.left,
+                ),
+                bottom: short(
+                    frame.max().y - bounds.max().y + area.bottom,
+                    safe.bottom,
+                    current.bottom,
+                ),
+                right: short(
+                    frame.max().x - bounds.max().x + area.right,
+                    safe.right,
+                    current.right,
+                ),
+            }
+        }
+    };
+    let near = |a: CGFloat, b: CGFloat| (a - b).abs() < 0.01;
+    if near(current.top, wanted.top)
+        && near(current.left, wanted.left)
+        && near(current.bottom, wanted.bottom)
+        && near(current.right, wanted.right)
+    {
+        return;
+    }
+    nav.setAdditionalSafeAreaInsets(wanted);
 }
 
 /// Gives the bar of `nav` the height of the large title its top screen asks
@@ -620,6 +1004,7 @@ define_class!(
             let _: () = unsafe { msg_send![super(self), viewDidLayoutSubviews] };
             size_screens(self);
             clip_side_safe_area(self);
+            hold_safe_area(self);
             // A column of a split (or its compact stack): the core lays the
             // column's pages out at the size the split gives it.
             let ivars = self.ivars();
@@ -637,6 +1022,7 @@ define_class!(
             // SAFETY: calling the superclass implementation.
             let _: () = unsafe { msg_send![super(self), viewSafeAreaInsetsDidChange] };
             clip_side_safe_area(self);
+            hold_safe_area(self);
         }
     }
 );
@@ -1210,6 +1596,16 @@ fn update_right_item(
         let label = kept.label.map(NSString::from_str);
         button.setAccessibilityLabel(label.as_deref(), mtm);
     }
+    set_item_id(button, item);
+}
+
+/// The button's accessibility identifier from the item's `key`, as a view's
+/// `testID` is: what UI tests (a test's selector `id:<key>`) find it by.
+fn set_item_id(button: &UIBarButtonItem, item: &HeaderItem) {
+    let id = item.key.as_deref().map(NSString::from_str);
+    // SAFETY: UIBarButtonItem's `UIAccessibilityIdentification` setter, an
+    // optional string.
+    let _: () = unsafe { msg_send![button, setAccessibilityIdentifier: id.as_deref()] };
 }
 
 /// One trailing `ios.headerRightItems` button.
@@ -1244,6 +1640,7 @@ fn make_right_item(
         use objc2_ui_kit::NSObjectUIAccessibility;
         button.setAccessibilityLabel(Some(&NSString::from_str(label)), mtm);
     }
+    set_item_id(&button, item);
     button
 }
 
@@ -1356,12 +1753,21 @@ impl StackHost {
     /// the stack (appearance callbacks, safe areas, rotation).
     pub(crate) fn contain(&mut self) {
         // A split's column: the split is its parent.
-        if self.contained || self.split.is_some() || self.container.window().is_none() {
+        if self.contained || self.split.is_some() {
             return;
         }
         let Some(parent) = controller_of(&self.container) else {
             return;
         };
+        // Off screen, the controller found may not be the one that shows
+        // the stack yet; a dialog's is (its views are its own), and its
+        // stack joins it before the dialog is presented, which happens
+        // after its first screens are given, in the same batch.
+        if self.container.window().is_none()
+            && !parent.isKindOfClass(<ModalController as ClassType>::class())
+        {
+            return;
+        }
         parent.addChildViewController(&self.nav);
         self.nav.didMoveToParentViewController(Some(&parent));
         self.contained = true;
@@ -1794,10 +2200,14 @@ impl ScreenHost {
         } else {
             UINavigationItemLargeTitleDisplayMode::Never
         });
-        let appearance = header_appearance(mtm, c);
-        nav_item.setStandardAppearance(appearance.as_deref());
-        nav_item.setScrollEdgeAppearance(appearance.as_deref());
-        nav_item.setCompactAppearance(appearance.as_deref());
+        let appearances = header_appearances(mtm, c);
+        let (standard, scroll_edge) = match &appearances {
+            Some((standard, scroll_edge)) => (Some(&**standard), Some(&**scroll_edge)),
+            None => (None, None),
+        };
+        nav_item.setStandardAppearance(standard);
+        nav_item.setScrollEdgeAppearance(scroll_edge);
+        nav_item.setCompactAppearance(standard);
         // The bar of the screen on top, too (Catalyst does not always take
         // the item's appearance).
         if let Some(nav) = self.controller.navigationController()
@@ -1817,7 +2227,11 @@ impl ScreenHost {
         ivars
             .measure
             .set(c.header_visible && !c.header_transparent && !c.large_title);
+        ivars
+            .follow_scroll
+            .set(c.header_transparent && c.header_background_on_scroll);
         self.controller.report_insets();
+        self.controller.follow_content_scroll();
     }
 }
 
@@ -1844,22 +2258,54 @@ pub(crate) fn keep_in_window(bar: &UINavigationBar) {
     }
 }
 
-/// The header's appearance from the screen's options (`None`: UIKit's).
+/// The header's appearances from the screen's options (`None`: UIKit's):
+/// the standard one (also the compact one), and the one while the content
+/// rests at its top (the scroll edge), clear for a transparent header that
+/// shows its background only on scroll.
+fn header_appearances(
+    mtm: MainThreadMarker,
+    c: &ScreenConfig,
+) -> Option<(
+    Retained<UINavigationBarAppearance>,
+    Retained<UINavigationBarAppearance>,
+)> {
+    if c.background_color.is_none()
+        && c.title_color.is_none()
+        && !c.header_transparent
+        && c.header_shadow_visible
+    {
+        return None;
+    }
+    let on_scroll = c.header_transparent && c.header_background_on_scroll;
+    let standard = header_appearance(mtm, c, c.header_transparent && !on_scroll);
+    let scroll_edge = if on_scroll {
+        header_appearance(mtm, c, true)
+    } else {
+        standard.clone()
+    };
+    Some((standard, scroll_edge))
+}
+
+/// One appearance of the header: `transparent`, or its background color,
+/// else UIKit's default background.
 fn header_appearance(
     mtm: MainThreadMarker,
     c: &ScreenConfig,
-) -> Option<Retained<UINavigationBarAppearance>> {
-    if c.background_color.is_none() && c.title_color.is_none() && !c.header_transparent {
-        return None;
-    }
+    transparent: bool,
+) -> Retained<UINavigationBarAppearance> {
     let appearance = UINavigationBarAppearance::new(mtm);
-    if c.header_transparent {
+    if transparent {
         appearance.configureWithTransparentBackground();
     } else if let Some(bg) = c.background_color {
         appearance.configureWithOpaqueBackground();
         appearance.setBackgroundColor(Some(&ui_color(bg)));
     } else {
         appearance.configureWithDefaultBackground();
+    }
+    if !c.header_shadow_visible {
+        // The configured backgrounds come with UIKit's hairline (the shadow
+        // image is nil after `configureWith…`): no color, no line.
+        appearance.setShadowColor(None);
     }
     if let Some(color) = c.title_color {
         let attributes = objc2_foundation::NSDictionary::from_retained_objects(
@@ -1873,7 +2319,7 @@ fn header_appearance(
             appearance.setLargeTitleTextAttributes(&attributes);
         }
     }
-    Some(appearance)
+    appearance
 }
 
 /// Styles a stack's navigation bar for the screen it shows: the screen's
@@ -1885,11 +2331,11 @@ pub(crate) fn style_bar(bar: &UINavigationBar, c: &ScreenConfig) {
     let tint = c.tint_color.map(ui_color);
     // SAFETY: a plain setter; `None` restores the default tint.
     unsafe { bar.setTintColor(tint.as_deref()) };
-    match header_appearance(mtm, c) {
-        Some(appearance) => {
-            bar.setStandardAppearance(&appearance);
-            bar.setScrollEdgeAppearance(Some(&appearance));
-            bar.setCompactAppearance(Some(&appearance));
+    match header_appearances(mtm, c) {
+        Some((standard, scroll_edge)) => {
+            bar.setStandardAppearance(&standard);
+            bar.setScrollEdgeAppearance(Some(&scroll_edge));
+            bar.setCompactAppearance(Some(&standard));
         }
         None => {
             let appearance = UINavigationBarAppearance::new(mtm);
@@ -1947,13 +2393,13 @@ impl ModalHost {
         while let Some(next) = presenter.presentedViewController() {
             presenter = next;
         }
-        let c = self.config;
+        let c = &self.config;
         let controller = &self.controller;
         controller
             .ivars()
             .orientations
             .set(crate::system::orientation_mask(c.orientations));
-        controller.set_flags(&c);
+        controller.set_flags(c);
         // Full screen, the modal has no look of its own: the app's popup
         // and backdrop show over what is behind. Sheets are the system's.
         let sheet = c.presentation != ModalPresentation::FullScreen;
@@ -1992,20 +2438,37 @@ impl ModalHost {
             // presentation.
             unsafe { p.setDelegate(Some(ProtocolObject::from_ref(&**controller))) };
         }
+        // Its detents and grabber, set before it is presented, as UIKit
+        // asks.
+        if let Some(window) = from.window() {
+            controller.ivars().screen.set(window.bounds().size.height);
+        }
+        controller.apply_sheet(c, None);
         // Presented outside the surface: the app's appearance is set on
         // it too.
         controller.setOverrideUserInterfaceStyle(crate::system::appearance());
+        // Its container (a sheet's glass) is styled again once shown: UIKit
+        // makes the views of the presentation as it runs.
+        let shown = controller.clone();
+        let done = RcBlock::new(move || {
+            crate::system::style_presented(&shown, crate::system::appearance());
+        });
         presenter.presentViewController_animated_completion(
             controller,
             c.animation != ModalAnimation::None && !at_once,
-            None,
+            Some(&done),
         );
+        crate::system::style_presented(controller, crate::system::appearance());
         self.presented = true;
     }
 
-    /// Applies `config` (the close flags also while presented).
+    /// Applies `config` (the close flags and the sheet's detents also
+    /// while presented).
     pub(crate) fn configure(&mut self, config: ModalConfig) {
         self.controller.set_flags(&config);
+        if self.presented && !self.controller.ivars().closed.get() {
+            self.controller.apply_sheet(&config, Some(&self.config));
+        }
         self.config = config;
     }
 
@@ -2042,40 +2505,151 @@ impl ModalHost {
     }
 }
 
-/// The back button a user taps in the header shown over `window`: the
-/// navigation bar's (UIKit draws it, so it is found by what it is).
+/// The navigation bars showing in `view`'s subtree, in drawing order (the
+/// front one last).
 #[cfg(feature = "dev")]
-pub(crate) fn back_button(window: &objc2_ui_kit::UIWindow) -> Option<Retained<UIView>> {
-    fn bars(view: &UIView, out: &mut Vec<Retained<UIView>>) {
-        if view.isHidden() || view.alpha() < 0.01 {
-            return;
-        }
-        if view.isKindOfClass(<UINavigationBar as objc2::ClassType>::class()) {
-            out.push(objc2::Message::retain(view));
-        }
-        for sub in view.subviews().iter() {
-            bars(&sub, out);
-        }
+fn bars(view: &UIView, out: &mut Vec<Retained<UIView>>) {
+    if view.isHidden() || view.alpha() < 0.01 {
+        return;
     }
-    fn named(view: &UIView, part: &str) -> bool {
-        view.class().name().to_string_lossy().contains(part)
+    if view.isKindOfClass(<UINavigationBar as objc2::ClassType>::class()) {
+        out.push(objc2::Message::retain(view));
     }
-    // A bar button that carries the back chevron's mask.
+    for sub in view.subviews().iter() {
+        bars(&sub, out);
+    }
+}
+
+/// Whether `view`'s class name has `part` in it (UIKit's private views are
+/// found by what they are).
+#[cfg(feature = "dev")]
+pub(crate) fn class_named(view: &UIView, part: &str) -> bool {
+    view.class().name().to_string_lossy().contains(part)
+}
+
+/// The back button a user taps in the front header shown in `root` (a
+/// window, a sheet's view): the navigation bar's (UIKit draws it, so it is
+/// found by what it is).
+#[cfg(feature = "dev")]
+pub(crate) fn back_button(root: &UIView) -> Option<Retained<UIView>> {
+    // A showing bar button that carries the back chevron's mask (the bar
+    // keeps a page's it left, hidden, for a while).
     fn back(view: &UIView) -> Option<Retained<UIView>> {
+        if view.isHidden() || view.alpha() < 0.01 {
+            return None;
+        }
         let subviews = view.subviews();
-        if named(view, "ButtonBarButton")
-            && !view.isHidden()
-            && view.alpha() > 0.01
-            && subviews.iter().any(|v| named(&v, "BackButton"))
+        if class_named(view, "ButtonBarButton")
+            && subviews.iter().any(|v| class_named(&v, "BackButton"))
         {
             return Some(objc2::Message::retain(view));
         }
         subviews.iter().find_map(|v| back(&v))
     }
     let mut found = Vec::new();
-    bars(window, &mut found);
+    bars(root, &mut found);
     // The front one: the last drawn.
     found.iter().rev().find_map(|bar| back(bar))
+}
+
+/// What names a bar button to a test: its identifier (the item's `key`) or
+/// its accessibility label.
+#[cfg(feature = "dev")]
+pub(crate) enum BarName<'a> {
+    Id(&'a str),
+    Label(&'a str),
+}
+
+/// The button a user taps for the bar button `name` names in the front
+/// header that has one over `window` (UIKit draws it for the item, which
+/// carries the name).
+#[cfg(feature = "dev")]
+pub(crate) fn bar_button(
+    window: &objc2_ui_kit::UIWindow,
+    name: &BarName<'_>,
+) -> Option<Retained<UIView>> {
+    fn text(object: &AnyObject, getter: objc2::runtime::Sel) -> Option<String> {
+        // SAFETY: an optional-string getter (`accessibilityIdentifier`,
+        // `accessibilityLabel`) the object answers, checked first.
+        unsafe {
+            let answers: bool = msg_send![object, respondsToSelector: getter];
+            if !answers {
+                return None;
+            }
+            let text: Option<Retained<NSString>> =
+                objc2::msg_send![object, performSelector: getter];
+            text.map(|t| t.to_string())
+        }
+    }
+    fn named(object: &AnyObject, name: &BarName<'_>) -> bool {
+        match name {
+            BarName::Id(id) => {
+                text(object, objc2::sel!(accessibilityIdentifier)).as_deref() == Some(*id)
+            }
+            BarName::Label(label) => {
+                text(object, objc2::sel!(accessibilityLabel)).is_some_and(|l| l.trim() == *label)
+                    || text(object, objc2::sel!(title)).is_some_and(|l| l.trim() == *label)
+            }
+        }
+    }
+    // A showing view in the bar that carries the name itself.
+    fn view_named(view: &UIView, name: &BarName<'_>) -> Option<Retained<UIView>> {
+        if view.isHidden() || view.alpha() < 0.01 {
+            return None;
+        }
+        if class_named(view, "ButtonBarButton") && named(view, name) {
+            return Some(objc2::Message::retain(view));
+        }
+        view.subviews().iter().find_map(|v| view_named(&v, name))
+    }
+    let mut found = Vec::new();
+    bars(window, &mut found);
+    found.iter().rev().find_map(|bar| {
+        let bar = bar.downcast_ref::<UINavigationBar>()?;
+        let item = bar.topItem()?;
+        let items = [item.rightBarButtonItems(), item.leftBarButtonItems()];
+        let item = items
+            .iter()
+            .flatten()
+            .flat_map(|items| items.to_vec())
+            .find(|item| named(item, name));
+        match item {
+            // The view UIKit made for the item (`view`, private), else
+            // the bar's button that took the item's name.
+            Some(item) => {
+                // SAFETY: the item's `view` getter (private), returning an
+                // optional view; an item without one is asked first.
+                let view: Option<Retained<UIView>> = unsafe {
+                    let answers: bool = msg_send![&*item, respondsToSelector: objc2::sel!(view)];
+                    if answers {
+                        msg_send![&*item, view]
+                    } else {
+                        None
+                    }
+                };
+                view.filter(|v| v.window().is_some() && !v.isHidden())
+                    .or_else(|| view_named(bar, name))
+            }
+            None => view_named(bar, name),
+        }
+    })
+}
+
+/// Whether a navigation controller in `window`'s app (its presented
+/// controllers' included) is in a transition: a push or pop UIKit is still
+/// animating, which takes no gesture for a sheet until it ends.
+#[cfg(feature = "dev")]
+pub(crate) fn navigation_transitioning(window: &objc2_ui_kit::UIWindow) -> bool {
+    fn walk(c: &UIViewController) -> bool {
+        if c.isKindOfClass(<UINavigationController as objc2::ClassType>::class())
+            && c.transitionCoordinator().is_some()
+        {
+            return true;
+        }
+        c.childViewControllers().iter().any(|c| walk(&c))
+            || c.presentedViewController().is_some_and(|p| walk(&p))
+    }
+    window.rootViewController().is_some_and(|root| walk(&root))
 }
 
 /// The sheet presented over `window`'s app (a modal), whose swipe down
