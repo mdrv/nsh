@@ -885,6 +885,37 @@ pub(crate) fn load_menu_icon(
     )
 }
 
+/// Whether an SVG names any explicit hex color other than a gray: a
+/// mask-style icon omits colors (or stays black/white/gray), a colored
+/// one names them. The tray keeps a colored SVG's colors instead of
+/// painting it a template.
+pub(crate) fn svg_declares_color(bytes: &[u8]) -> bool {
+    let text = std::str::from_utf8(bytes).unwrap_or("");
+    for (at, _) in text.match_indices('#') {
+        for len in [6, 3] {
+            let Some(hex) = text.get(at + 1..at + 1 + len) else {
+                continue;
+            };
+            let Ok(value) = u32::from_str_radix(hex, 16) else {
+                continue;
+            };
+            let (r, g, b) = if len == 6 {
+                (value >> 16 & 0xff, value >> 8 & 0xff, value & 0xff)
+            } else {
+                (
+                    (value >> 8 & 0xf) * 17,
+                    (value >> 4 & 0xf) * 17,
+                    (value & 0xf) * 17,
+                )
+            };
+            if r != g || g != b {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// An image a canvas draws: its pixels, and how many of them make one unit
 /// of the image's own size (what `drawImage`'s source rectangle and its
 /// default size are in).

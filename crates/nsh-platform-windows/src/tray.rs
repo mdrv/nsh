@@ -6,7 +6,9 @@
 //!   loaded through the image pipeline as a menu item's icon is. An SVG is a
 //!   template, painted in the taskbar's text color (white on the dark
 //!   taskbar, black on the light one: Settings > Personalization > Colors,
-//!   "Windows mode"), and painted again when that changes. Without an icon
+//!   "Windows mode"), and painted again when that changes — unless it
+//!   declares a color of its own (a hex color other than a gray), which
+//!   keeps its colors: a colored tray icon, not a mask. Without an icon
 //!   the tray shows the app's (the executable's first icon resource, else
 //!   its window's, else Windows' default application icon). The old icon stays until a new
 //!   one has loaded.
@@ -172,6 +174,13 @@ fn load_icon(surface: &Surface, hwnd: HWND, source: Option<ImageSource>) {
         return;
     };
     let (side, scale) = icon_size(hwnd);
+    // A colored SVG keeps its colors: the tray icon is a picture, not a
+    // mask (as on Linux).
+    let colored = src
+        .data
+        .as_ref()
+        .map(|data| crate::image::svg_declares_color(data.bytes()))
+        .unwrap_or(false);
     let uri = src.uri.clone();
     ITEM.with(|item| {
         if let Some(item) = item.borrow_mut().as_mut() {
@@ -183,7 +192,10 @@ fn load_icon(surface: &Surface, hwnd: HWND, source: Option<ImageSource>) {
     let load = crate::image::load_menu_icon(surface, &src, scale, move |loaded| {
         done.set(true);
         let icon = match loaded {
-            Ok(icon) => Rc::new(icon),
+            Ok(icon) => Rc::new(crate::image::MenuIcon {
+                template: icon.template && !colored,
+                frame: icon.frame,
+            }),
             Err(e) => {
                 log::warn!("tray icon {uri}: {e}");
                 return;
