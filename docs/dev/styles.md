@@ -291,8 +291,9 @@
   drawn by `TextView`. Android: `Decor` draws shadows, gradients and outlines; filters are `RenderEffect`s (API 31+; below, only
   color filters through a layer paint), blend modes a layer paint (API 29+), transitions / keyframes `ValueAnimator`s,
   backdrop blur (API 31+) a `RenderNode` recorded before each frame with what lies behind the view (`Backdrop.java`: each
-  ancestor's background and the siblings drawn before the next ancestor, never the view itself) and blurred by a
-  `RenderEffect`, drawn clipped under the view's background.
+  ancestor's background and the siblings drawn before the next ancestor, never the view itself; at the size where the
+  blur's deviation is 4 px, nothing off screen) and blurred by a `RenderEffect`, drawn stretched and clipped under the
+  view's background; box shadows are drawn once into small bitmaps and stretched in slices (`Decor.drawCachedShadow`).
   Known limits: iOS has no CSS filters on views (only `opacity`, `brightness` ≤ 1 and `drop-shadow`; images take every color filter
   and `blur`, applied while decoding); iOS texts draw no gradients or inset shadows; Android has no backdrop blur, `blur` or
   `drop-shadow` before API 31; Linux and GPUI draw no backdrop filter, GPUI no `blur()` or `mixBlendMode`; iOS, macOS and Android draw one `drop-shadow()`,
@@ -459,10 +460,13 @@ scroll view too; **grids** take their columns from the template
   text's explicit width rounds up: it was set to hold its line in a GUI's font, and the Cell it would round off
   keeps the line's last column (curve names 84pt wide hold "cubic inOut").
 - What a terminal cannot show well is never emulated. At an icon's size (an explicit width and height both at most
-  48pt) images, videos, web views, shaders and canvases are `display: none`, so they take no Cells, no frame and no
-  hits, and their margins and the gaps beside them go with them (`Core::grid_role`). Larger, they keep their box: a
-  canvas is drawn in braille, the others stay blank (their fill too), and the labels around them stay where the box
-  puts them instead of closing up over it. An empty box in flow (no control) with an explicit size of two Cells or
+  48pt) videos, web views, shaders and canvases are `display: none`, so they take no Cells, no frame and no hits, and
+  their margins and the gaps beside them go with them (`Core::grid_role`). Larger, they keep their box: a canvas is
+  drawn in braille, the others stay blank (their fill too), and the labels around them stay where the box
+  puts them instead of closing up over it. An image keeps its box at every size, as the terminal draws pictures
+  (`LeftOut::Picture`); a box holding only absolute layers in flow (an avatar holding its picture once its initials
+  went) fills its parent's explicit height, as an image filling it does. A box holding a scroll view in flow that grows into what is left and
+  states no height (a picker's grid under its search field) keeps its explicit height, which the scroll view fills. An empty box in flow (no control) with an explicit size of two Cells or
   more each way and a border draws its outline, as its size is its own: a code cell waiting for its digit (an absolute
   one, a selection's box over its items, draws none). So is
   a view with nothing in it smaller than a row both ways and not growing (a status dot in a row, a swatch), except a

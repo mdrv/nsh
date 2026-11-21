@@ -409,8 +409,17 @@ final class Mounter {
                     // updating live allocates nothing for it.
                     boolean uniform = b.getInt() != 0;
                     int uniformColor = b.getInt();
+                    // What attachments copy as: offset, string object.
+                    int copies = b.getInt();
+                    int[] copyAt = copies == 0 ? TextLayouts.NO_COPIES : new int[copies];
+                    String[] copyTexts = copies == 0 ? TextLayouts.NO_COPY_TEXTS : new String[copies];
+                    for (int i = 0; i < copies; i++) {
+                        copyAt[i] = b.getInt();
+                        copyTexts[i] = (String) objects[b.getInt()];
+                    }
                     if (v instanceof TextBox) {
                         TextBox t = (TextBox) v;
+                        t.setCopyTexts(copyAt, copyTexts);
                         t.setSelectable(selectable == 1, selectable == 0, selectionColor);
                         t.setLayout((Layout) layout, x * density, y * density, w * density, h * density);
                         t.recolor(uniform, uniformColor, effects.get(t.id));
@@ -2502,6 +2511,14 @@ final class Mounter {
         view.performHapticFeedback(feedback);
     }
 
+    /** Whether {@code inner} is {@code outer} or inside it. */
+    private static boolean within(View inner, View outer) {
+        for (Object at = inner; at instanceof View; at = ((View) at).getParent()) {
+            if (at == outer) return true;
+        }
+        return false;
+    }
+
     private void command(ByteBuffer b, Object[] objects, long seq) {
         int id = b.getInt(), kind = b.getInt();
         View v = views.get(id);
@@ -2674,6 +2691,15 @@ final class Mounter {
             case 50:
                 if (v instanceof InputBox) ((InputBox) v).closeEditMenu();
                 break;
+            case 62: {
+                // ref.clearSelection(): the selection of the selectable view
+                // v is, is in or holds.
+                SelectableView area = selectedArea;
+                if (area != null && v != null && (within(area.view, v) || within(v, area.view))) {
+                    area.clear();
+                }
+                break;
+            }
             case 21: {
                 String name = string(objects, b.getInt());
                 String json = string(objects, b.getInt());

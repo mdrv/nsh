@@ -5372,6 +5372,11 @@ impl<M: TextEngine> Core<M> {
     /// own parts' events never reach JS, which does not know them).
     pub fn component_event(&mut self, id: NodeId, kind: EventKind, payload: &EventPayload) -> bool {
         let _entered = self.components.runtime.enter();
+        // A Rust text block's final layout, for its `on_text_layout`.
+        let _geometry = (kind == EventKind::TextLayout)
+            .then(|| self.geometries.remove(&id))
+            .flatten()
+            .map(crate::text::GeometryScope::enter);
         let handled = self.dispatch_event(id, kind, payload);
         self.flush_component_emits();
         handled
@@ -6729,6 +6734,13 @@ impl<M: TextEngine> Core<M> {
                 code: Some(crate::element::codes::ACCESS_DENIED.into()),
                 message: denied.message().to_owned(),
             })
+        } else if !in_app && !self.components.environment.scheme_links {
+            // This platform hands the app no links of its schemes (the web,
+            // the GPUI and terminal backends): the callback could never come
+            // back.
+            Some(AuthSessionError::unavailable(format!(
+                "openAuthSession: no in-app sign-in here, and no link of `{scheme}:` can reach the app on this platform"
+            )))
         } else if !in_app && !self.components.url_schemes.schemes.contains(&scheme) {
             // Only a link of a scheme the app claims brings the callback
             // back to it here; without one the session could never end.
@@ -6937,7 +6949,23 @@ impl<M: TextEngine> Core<M> {
                 };
                 let automatic =
                     crate::webview::downloads::automatic_destination(&offer.id, &offer.filename);
-                let effects = self.components.downloads.offer(id, offer, mode, automatic);
+                // The offer's URL is the response's, after the platform
+                // followed its redirects: a download from a host takes the
+                // grant a page there would, so a redirect cannot carry it to
+                // a host the web view may not show. One of the page's own
+                // content (`data:`, `blob:`) reaches no host, and stays
+                // allowed as it was.
+                let refused = (!self.access.is_unrestricted()
+                    && !page_content(&offer.url)
+                    && !self.access.allows_webview(&offer.url))
+                .then(|| super::not_granted("the download", &offer.url, "webview.hosts"));
+                if let Some(message) = &refused {
+                    self.deny(message.clone());
+                }
+                let effects = self
+                    .components
+                    .downloads
+                    .offer(id, offer, mode, automatic, refused);
                 self.apply_download_effects(effects);
             }
             EventKind::DownloadProgress => {
@@ -7997,4 +8025,12 @@ fn row_position(
 /// decodes).
 fn pixels(n: f64) -> crate::geometry::DevicePixels {
     crate::geometry::DevicePixels(n.round() as i32)
+}
+
+/// Whether `url` names content of the page itself (`data:`, `blob:`), which
+/// a download takes from the page rather than from a host.
+fn page_content(url: &str) -> bool {
+    let scheme = url.split(':').next().unwrap_or_default();
+    url.contains(':')
+        && (scheme.eq_ignore_ascii_case("data") || scheme.eq_ignore_ascii_case("blob"))
 }

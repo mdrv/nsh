@@ -67,7 +67,7 @@ pub use nsh_core::{
     main_thread::MainThreadTask,
     platform::{
         ColorScheme, Environment, FetchEvent, FetchOp, HostEnvironment, HourCycle, HttpBody,
-        HttpHead, HttpRequest, Idiom, Languages, Lifecycle, Locale, LocaleSettings,
+        HttpCache, HttpHead, HttpRequest, Idiom, Languages, Lifecycle, Locale, LocaleSettings,
         MeasurementSystem, Os, TemperatureUnit, TimeZone, Weekday,
     },
     storage::{StorageBackend, StorageChange},
@@ -165,6 +165,16 @@ impl App {
         match self {
             App::Rust(root) => root.application_ref(),
             App::Js(bundle) => bundle.application.as_ref(),
+        }
+    }
+
+    /// The app as it was built: a Rust app root's
+    /// ([`nsh_core::element::Root::app_info`]); `None` for a JS app, whose
+    /// VM reports its own (`appInfo()`).
+    pub fn app_info(&self) -> Option<&nsh_core::platform::AppInfo> {
+        match self {
+            App::Rust(root) => root.app_info_ref(),
+            App::Js(_) => None,
         }
     }
 
@@ -2431,6 +2441,7 @@ impl<M: TextEngine + 'static> Driver<M> {
         core.set_picker(config.picker.clone());
         core.set_speech(config.speech.clone());
         core.set_url_schemes(config.app.url_schemes().iter().cloned());
+        core.set_app_info(config.app.app_info().cloned());
         // Every VM reads the core's address where it is (`UrlScheme.url()`).
         #[cfg(any(feature = "js-core", all(feature = "browser", target_arch = "wasm32")))]
         let app_url = core.app_url_cell();
@@ -3870,6 +3881,9 @@ impl<M: TextEngine> State<M> {
                             ApplyError::TooManyNodes(max) => {
                                 format!("the app created more than {max} nodes and was stopped")
                             }
+                            ApplyError::TooDeep(max) => {
+                                format!("the app nested views more than {max} deep and was stopped")
+                            }
                             other => {
                                 format!("the app sent an invalid op ({other:?}) and was stopped")
                             }
@@ -3994,6 +4008,7 @@ fn ui_environment(env: &Environment, window: Size<Points>) -> nsh_core::element:
         canvas_render: env.canvas_render,
         share: env.share,
         auth_session: env.auth_session,
+        scheme_links: env.scheme_links(),
         file_requests: env.file_requests,
         speech: env.speech,
         notifications: env.notifications,

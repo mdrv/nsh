@@ -10,9 +10,9 @@
 //! drags that scroll), multilevel undo, the clipboard, the IME in place
 //! with its candidate window at the caret, Text Services Framework input
 //! (dictation, the emoji panel, the touch keyboard, reconversion), spell
-//! checking (`autoCorrect`), password masking and scrolling. The field
-//! keeps it in plain text mode with one character and paragraph format,
-//! made from the config's font, color, alignment and line height.
+//! checking (`autoCorrect`), password masking and scrolling. The text
+//! keeps one character and paragraph format, RichEdit's defaults, which the
+//! field makes from the config's font, color, alignment and line height.
 //!
 //! The view draws the decoration (background, border, corners) from the
 //! core's style like any other view; the field ([`InputState`], a
@@ -55,7 +55,7 @@
 //! `VK_PROCESSKEY`), so a return that commits a composition (CJK input
 //! methods) submits nothing. Tab moves between fields, never into the text.
 //! RichEdit's formatting shortcuts (Ctrl+B, Ctrl+E, ...) are never sent:
-//! the text is plain, and the app's shortcuts get those keys.
+//! the text keeps one format, and the app's shortcuts get those keys.
 //!
 //! Pastes go through the field (`onPaste`, `pasteBehavior`, line breaks of
 //! a single line turned into spaces), then into RichEdit as a replacement
@@ -107,11 +107,11 @@ use windows::{
                 EM_SETTEXTMODE, EM_SETTYPOGRAPHYOPTIONS, ENM_CHANGE, ENM_ENDCOMPOSITION,
                 ENM_SELCHANGE, ENM_STARTCOMPOSITION, IMF_SPELLCHECKING, IMF_TKBPREDICTION,
                 PFA_CENTER, PFA_JUSTIFY, PFA_LEFT, PFA_RIGHT, PFM_ALIGNMENT, PFM_LINESPACING,
-                PFM_RTLPARA, SES_USECTF, TM_MULTICODEPAGE, TM_MULTILEVELUNDO, TM_PLAINTEXT,
+                PFM_RTLPARA, SES_USECTF, TM_MULTICODEPAGE, TM_MULTILEVELUNDO, TM_RICHTEXT,
                 TO_ADVANCEDTYPOGRAPHY, TXTBIT_AUTOWORDSEL, TXTBIT_CHARFORMATCHANGE,
                 TXTBIT_CLIENTRECTCHANGE, TXTBIT_D2DDWRITE, TXTBIT_DISABLEDRAG,
                 TXTBIT_HIDESELECTION, TXTBIT_MAXLENGTHCHANGE, TXTBIT_MULTILINE,
-                TXTBIT_PARAFORMATCHANGE, TXTBIT_READONLY, TXTBIT_SCROLLBARCHANGE,
+                TXTBIT_PARAFORMATCHANGE, TXTBIT_READONLY, TXTBIT_RICHTEXT, TXTBIT_SCROLLBARCHANGE,
                 TXTBIT_USEPASSWORD, TXTBIT_WORDWRAP,
             },
             Input::{
@@ -270,10 +270,9 @@ impl InputState {
                 Box::new(after_timer),
             );
             if let Some(e) = &editor {
-                // Plain text with many undo levels (only while empty), the
-                // notifications the field follows, DirectWrite's shaping.
-                let mode = TM_PLAINTEXT.0 | TM_MULTILEVELUNDO.0 | TM_MULTICODEPAGE.0;
-                e.send(EM_SETTEXTMODE, mode as usize, 0);
+                // The text mode (only while empty), the notifications the
+                // field follows, DirectWrite's shaping.
+                e.send(EM_SETTEXTMODE, TEXT_MODE as usize, 0);
                 let mask = ENM_CHANGE | ENM_SELCHANGE | ENM_STARTCOMPOSITION | ENM_ENDCOMPOSITION;
                 e.send(EM_SETEVENTMASK, 0, mask as isize);
                 // Text Services Framework input: dictation, the emoji
@@ -958,14 +957,25 @@ impl Hosted for InputState {
     }
 }
 
-/// The property bits of a config (DirectWrite drawing, lines, read-only,
-/// password); RichEdit's own drag and drop stays off (the window is the
-/// drop target of files).
+/// RichEdit's text mode: rich text with many undo levels. Plain text mode
+/// would suit the field's single format, but it ignores the paragraph
+/// format's line spacing, which then drew lines at the font's height
+/// instead of the line height the field is laid out with (#2655). The text
+/// still keeps one format: the field never forwards the formatting
+/// shortcuts, pastes insert plain text and RichEdit's drag and drop is off.
+const TEXT_MODE: i32 = TM_RICHTEXT.0 | TM_MULTILEVELUNDO.0 | TM_MULTICODEPAGE.0;
+
+/// The property bits of a config (DirectWrite drawing, rich text as
+/// [`TEXT_MODE`] says, lines, read-only, password); RichEdit's own drag and
+/// drop stays off (the window is the drop target of files).
 fn base_bits(config: &InputConfig) -> u32 {
     // The selection shows only while the field has the keys, as on the
     // other platforms.
-    let mut bits =
-        TXTBIT_D2DDWRITE | TXTBIT_AUTOWORDSEL | TXTBIT_DISABLEDRAG | TXTBIT_HIDESELECTION;
+    let mut bits = TXTBIT_D2DDWRITE
+        | TXTBIT_RICHTEXT
+        | TXTBIT_AUTOWORDSEL
+        | TXTBIT_DISABLEDRAG
+        | TXTBIT_HIDESELECTION;
     if config.multiline {
         bits |= TXTBIT_MULTILINE | TXTBIT_WORDWRAP;
     }
@@ -2389,6 +2399,159 @@ mod tests {
             editor.send(0x00BA, 0, 0); // EM_GETLINECOUNT forces text layout.
             let (min, max, _, _) = editor.vscroll();
             assert!(max - min > 80, "vertical overflow missing: {min}..{max}");
+        }
+    }
+
+    /// Several lines are as far apart as the line height says, the same
+    /// height the field is laid out with, also for text the field held
+    /// before the line height was set (#2655).
+    #[test]
+    fn multiline_lines_follow_the_line_height() {
+        // Where the 12th of 12 lines starts below the first, in pixels.
+        let travel = |twips: i32| {
+            let config = InputConfig {
+                multiline: true,
+                ..Default::default()
+            };
+            let editor = Editor::new(
+                HWND::default(),
+                Props {
+                    client: RECT {
+                        right: 800,
+                        bottom: 2000,
+                        ..Default::default()
+                    },
+                    bits: base_bits(&config),
+                    ..Default::default()
+                },
+                Box::new(|| {}),
+                Box::new(|| {}),
+            )
+            .expect("RichEdit");
+            editor.send(EM_SETTEXTMODE, TEXT_MODE as usize, 0);
+            editor.set_text(&["The quick brown fox"; 12].join("\r"));
+            editor.update(
+                |p| {
+                    let pf = &mut p.para_format;
+                    pf.Base.dwMask = PFM_LINESPACING;
+                    pf.bLineSpacingRule = 4;
+                    pf.dyLineSpacing = twips;
+                },
+                TXTBIT_PARAFORMATCHANGE,
+            );
+            let y = |line: usize| {
+                let (index, _) = editor.send(0x00BB, line, 0); // EM_LINEINDEX
+                let mut at = windows::Win32::Foundation::POINTL::default();
+                editor.send(0x00D6, &mut at as *mut _ as usize, index.0); // EM_POSFROMCHAR
+                at.y
+            };
+            y(11) - y(0)
+        };
+        let (single, double) = (travel(400), travel(800));
+        assert!(single > 0, "lines not laid out: {single}");
+        assert!(
+            (double - 2 * single).abs() <= 11,
+            "line spacing ignored: {single} px at 400 twips, {double} px at 800"
+        );
+    }
+
+    /// The font the field sets reaches the text it already holds: one
+    /// format for all of it, as the text mode promises ([`TEXT_MODE`]).
+    #[test]
+    fn font_changes_reach_held_text() {
+        let config = InputConfig {
+            multiline: true,
+            ..Default::default()
+        };
+        let editor = Editor::new(
+            HWND::default(),
+            Props {
+                client: RECT {
+                    right: 800,
+                    bottom: 2000,
+                    ..Default::default()
+                },
+                bits: base_bits(&config),
+                ..Default::default()
+            },
+            Box::new(|| {}),
+            Box::new(|| {}),
+        )
+        .expect("RichEdit");
+        editor.send(EM_SETTEXTMODE, TEXT_MODE as usize, 0);
+        editor.set_text(&["The quick brown fox"; 12].join("\r"));
+        // Where the 12th of 12 lines starts below the first, in pixels.
+        let travel = || {
+            let y = |line: usize| {
+                let (index, _) = editor.send(0x00BB, line, 0); // EM_LINEINDEX
+                let mut at = windows::Win32::Foundation::POINTL::default();
+                editor.send(0x00D6, &mut at as *mut _ as usize, index.0); // EM_POSFROMCHAR
+                at.y
+            };
+            y(11) - y(0)
+        };
+        let size = |twips: i32| {
+            editor.update(
+                |p| {
+                    p.char_format.Base.dwMask = CFM_SIZE;
+                    p.char_format.Base.yHeight = twips;
+                },
+                TXTBIT_CHARFORMATCHANGE,
+            );
+            travel()
+        };
+        let (small, large) = (size(200), size(600));
+        assert!(small > 0, "lines not laid out: {small}");
+        assert!(
+            large > 2 * small,
+            "font size ignored: {small} px at 10 pt, {large} px at 30 pt"
+        );
+    }
+
+    /// Rich text's final paragraph mark ([`TEXT_MODE`]) is not the
+    /// field's: its text, selection and limit leave it out.
+    #[test]
+    fn rich_text_keeps_its_final_mark_out_of_the_text() {
+        for multiline in [false, true] {
+            let config = InputConfig {
+                multiline,
+                ..Default::default()
+            };
+            let editor = Editor::new(
+                HWND::default(),
+                Props {
+                    client: RECT {
+                        right: 800,
+                        bottom: 200,
+                        ..Default::default()
+                    },
+                    bits: base_bits(&config),
+                    ..Default::default()
+                },
+                Box::new(|| {}),
+                Box::new(|| {}),
+            )
+            .expect("RichEdit");
+            editor.send(EM_SETTEXTMODE, TEXT_MODE as usize, 0);
+            let text = || String::from_utf16_lossy(&editor.text_units());
+            assert_eq!(text(), "", "multiline {multiline}");
+            editor.send(EM_SETSEL, 0, -1);
+            assert_eq!(editor.selection(), (0, 0), "multiline {multiline}");
+            editor.set_text("own words");
+            assert_eq!(text(), "own words", "multiline {multiline}");
+            editor.send(EM_SETSEL, 0, -1);
+            assert_eq!(editor.selection(), (0, 9), "multiline {multiline}");
+            if multiline {
+                editor.set_text("a\rb\r");
+                assert_eq!(text(), "a\rb\r");
+            }
+            // As many units as the limit says, typed.
+            editor.set_text("");
+            editor.update(|p| p.max_length = 5, TXTBIT_MAXLENGTHCHANGE);
+            for _ in 0..7 {
+                editor.send(WM_CHAR, 'a' as usize, 1);
+            }
+            assert_eq!(text(), "aaaaa", "multiline {multiline}");
         }
     }
 

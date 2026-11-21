@@ -405,7 +405,30 @@ Things that were found the hard way. Read the section of the area you change bef
 - **Android, shadows moved by fractions of a pixel**: Skia caches a shadow's blurred mask keyed on the subpixel part
   of its position, so a view moved by a fractional offset each frame blurs its shadows again every frame (on the GPU,
   each into a new render target, slow on PowerVR). `StackBox`'s push / pop slides move by whole pixels; going back to
-  the gallery's index ran at about half the frame rate before (#519).
+  the gallery's index ran at about half the frame rate before (#519). Box shadows no longer draw shadow layers on a
+  hardware canvas (next point); text shadows and a `<Canvas>`'s still do.
+- **Android, box shadows on a hardware canvas**: a shadow layer of the box's path, clipped by that path, is blurred
+  and clipped again on every frame a box moves in. Four boxes as large as the screen, each with an outer shadow and a
+  1 px inset rim, slid at 32 ms a frame on an emulator (p50; 6 ms without the shadows). `Decor.drawCachedShadow`
+  draws each layer once, unclipped, into a bitmap of the smallest box with the same corners (as Android 8's
+  `drawShadowSlices`), at a pixel for every quarter of its blur, and stretches it in slices cut along the clip's edge:
+  pieces on the hidden side are left out, and the squares of the corners' curves (each as wide as its side's
+  corners need) come from a second bitmap drawn clipped at full size, so no path is clipped as the box is drawn
+  (clipping those squares by the path as they were drawn still cost ~2 ms a frame of the emulator's RenderThread).
+  A layer blurred by less than 8 px is at full size anyway: it is drawn clipped into its bitmap, and its slices are
+  drawn whole, as fewer pieces matter where every backdrop recorded behind the box draws them again. The middle of
+  an inset shadow is left out: it lies more than twice the blur from where it casts. A shadow whose bitmaps would
+  take more than a quarter of the 8 MiB cache (a spread of the screen's size) is drawn as a shadow layer, as
+  before. The same boxes slide at 10 ms a frame.
+- **Android, backdrop blur**: `Backdrop` records what lies behind the view into a `RenderNode` before every frame,
+  and hwui draws that whole node into a layer and blurs it every frame. The node is recorded at the size where the
+  blur's deviation is 4 px (Skia's GPU blur scales its input down to that before blurring anyway) and stretched
+  back by its own scale, a property the RenderThread applies (a scale in the view's display list would stay stale
+  when an older backdrop's pre-draw records the view first, #2101); a view with nothing on screen
+  (`getGlobalVisibleRect`) records nothing. Four glass views of about the screen's size, without shadows, slid at
+  34 ms a frame on an emulator, 12 ms after. Every blurred view still records and blurs its backdrop again on
+  every frame, also when nothing behind it changed: a drawer sliding over blurred panes makes each of them blur
+  again (31 ms a frame on the emulator, 17 ms with the panes not blurred).
 - **Android, hidden views lose their display lists**: HWUI drops the display list of a RenderNode no longer drawn,
   and `setVisibility` tells every view under the one that changes, whose background `Drawable.setVisible` calls
   `invalidateSelf`. A whole screen hidden and shown again therefore records all of its views again (22–36 ms for the
@@ -479,6 +502,13 @@ Things that were found the hard way. Read the section of the area you change bef
   child sees it, with the same slop as `ZScroll`, so the pager took every horizontal drag of a zoomed image. `ZScroll`
   asks its parents not to intercept from the down (`requestDisallowInterceptTouchEvent`) while it has content to pan and
   gives that back when the drag has nothing to move or pushes past an edge a scroll view around can go on from.
+- **Android, moving a scroll view during its fling**: `ScrollView` / `HorizontalScrollView` keep their fling's
+  `OverScroller` private, and `computeScroll` sets the position the curve reached every frame, so a `scrollTo` during a
+  fling lasts one frame: the core's anchoring `ScrollBy` (rows above a list's viewport measured mid-fling) was undone
+  and the visible rows jumped by it, while a slow drag over the same rows kept them still. `VScroll` and `HScroll` run
+  their flings themselves (`ScrollBox.Glide`: the platform's `OverScroller.fling` arguments, plus the shifts
+  `scrollByPx` applied). Starting a new fling from the moved position instead goes farther than the rest of the curve:
+  repeated over a run of measured rows it sped the fling up and ran it far past its end.
 - **Android, safe area**: `NshView` reports only the parts of the system bars / keyboard that overlap it (like UIKit's
   `safeAreaInsets`), so embedded views below a toolbar get no top inset. Overlays use the same overlap (`topInset()`).
 - **Android, dev assets come over plain HTTP**, which apps block by default (API 28+): the dev host APK and `nsh-dev.aar` set
@@ -670,6 +700,14 @@ Things that were found the hard way. Read the section of the area you change bef
   (an activity stopped behind the lock screen of a phone) is drawn into a bitmap, the views as the CPU draws them.
 
 ## macOS, AppKit
+
+- **`performWindowDragWithEvent:` moves the window only from the event AppKit is delivering**: given a press whose
+  drags a `nextEventMatchingMask:` tracking loop already took off the queue, the window stayed put (#2274); given a
+  drag that loop dequeued, it stayed put as well. Called from the view's `mouseDragged:` with that event, the window
+  server moves the window from then on, in step with the pointer and with edge tiling (real mouse events posted with
+  `cliclick` over a hidden title bar, macOS 26.6). Moving the window from a loop instead, one `setFrameOrigin:` per
+  event (#2295), trails the pointer, as the app sets every frame. `input::window_press` keeps the press and lets
+  AppKit deliver its drags, as GPUI's `start_window_move` does.
 
 - **A view's display link follows the window to another screen but keeps the frame rates it was asked for**: one
   resumed while the window was on a 60 Hz screen (range 60–60) and kept running by a looping animation or the

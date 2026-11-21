@@ -3375,6 +3375,7 @@
 		for (const name of [
 			"focus",
 			"blur",
+			"clearSelection",
 			"scrollTo",
 			"zoomTo",
 			"scrollToIndex",
@@ -5948,7 +5949,8 @@
 					url,
 					headers,
 					body,
-					request.redirect === "follow"
+					request.redirect === "follow",
+					request.cache
 				]);
 				const entry = {
 					resolve,
