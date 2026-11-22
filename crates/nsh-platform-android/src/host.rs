@@ -702,6 +702,12 @@ extern "system" fn Java_com_longbridge_nsh_Native_create(
             // wgpu on Vulkan or GLES, in builds with it, until it finds no
             // GPU.
             shaders: nsh_engine::shader::LINKED,
+            // The view's host channel: an app (or an embedding) registers
+            // handlers on it (`NshView.handle`), so `nsh/host` has
+            // somewhere to go in standalone apps too — a call no handler
+            // registered rejects with `HOST_ERROR` instead of the core's
+            // "platform has no host".
+            host: true,
             ..Environment::default()
         }),
         animation_queue: Mutex::new(VecDeque::new()),
