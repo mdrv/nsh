@@ -517,6 +517,16 @@ fn dispatch_host_calls(host: &Host, batch: &MountBatch) {
             .unwrap_or_else(|e| e.into_inner())
             .get(name)
             .cloned();
+        log::info!(
+            "core host call \"{name}\": {} handler(s) registered",
+            host.core_host_handlers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let reply = CoreHostReply {
             id: *id,
             control: host.control(),
@@ -2938,6 +2948,7 @@ extern "system" fn Java_com_longbridge_nsh_Native_setHostHandler(
     // The core's calls (`Command::HostCall` — a packaged Rust app has no
     // JS to go through the channel's `HostBridge`).
     let view_for_core = view.clone();
+    log::info!("core host handler registered: {name}");
     host.core_host_handlers
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2945,6 +2956,7 @@ extern "system" fn Java_com_longbridge_nsh_Native_setHostHandler(
             name.clone(),
             Arc::new(move |call: CoreHostCall| {
                 let (name, json, call) = call.into_java();
+                log::info!("core host call \"{name}\" handed to Java");
                 if !jni_host_message(&view_for_core, &name, &json, call) && call != 0 {
                     // Java never got it: the call fails rather than waits.
                     // SAFETY: made in `into_java` and not handed over.
