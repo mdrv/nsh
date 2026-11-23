@@ -3,7 +3,7 @@
 //! exported here.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -97,6 +97,12 @@ pub(crate) struct Host {
     /// The embedding app's channel with the apps (`nsh/host`; Java
     /// `NshView.setParams`, `send`, `handle`).
     host: nsh_engine::HostChannel,
+    /// The calls the core hands over (`Command::HostCall` in a batch —
+    /// a packaged Rust app has no JS, so its `nsh/host` calls travel the
+    /// command stream, not the channel above): the Java handler
+    /// registered for `name` (`NshView.handle`) answers them, and the
+    /// answer returns as an `EventKind::Host` `{ type: "reply" }`.
+    core_host_handlers: Mutex<HashMap<String, CoreHostHandler>>,
     /// The app's keyboard shortcuts, and the keys consumed by them or by
     /// a capture rule, matched on the UI thread.
     pub(crate) keymap: Mutex<crate::keymap::KeymapState>,
@@ -394,6 +400,143 @@ impl Host {
     }
 }
 
+/// A call the running app made through the core (`nsh/host`'s `call`,
+/// arriving as a `Command::HostCall`): the Java handler registered for
+/// its name runs it and answers once, from any thread.
+pub(crate) struct CoreHostCall {
+    name: String,
+    json: String,
+    reply: CoreHostReply,
+}
+
+pub(crate) struct CoreHostReply {
+    id: u64,
+    control: Option<EngineControl>,
+}
+
+impl CoreHostCall {
+    /// How the Java handler gets the call: its name and JSON-encoded
+    /// arguments, and the pointer it answers through (`Native.hostReply`).
+    fn into_java(self) -> (String, String, jlong) {
+        let name = self.name.clone();
+        let json = self.json.clone();
+        // SAFETY: handed to `Native.hostReply` exactly once.
+        let call = Box::into_raw(Box::new(JavaCall::Core(Box::new(self)))) as jlong;
+        (name, json, call)
+    }
+
+    fn resolve(self, value: nsh_core::JsonValue) {
+        self.answer(true, Some(value), None);
+    }
+
+    fn reject(self, message: String) {
+        self.answer(false, None, Some(message));
+    }
+
+    fn answer(self, ok: bool, value: Option<nsh_core::JsonValue>, error: Option<String>) {
+        let CoreHostCall {
+            name: _,
+            json: _,
+            reply,
+        } = self;
+        let Some(control) = reply.control else {
+            return;
+        };
+        let reply = if ok {
+            serde_json::json!({
+                "type": "reply",
+                "id": reply.id,
+                "ok": true,
+                "value": value,
+            })
+        } else {
+            serde_json::json!({
+                "type": "reply",
+                "id": reply.id,
+                "ok": false,
+                "error": error,
+            })
+        };
+        control.dispatch_event(
+            nsh_core::ROOT_ID,
+            EventKind::Host,
+            EventPayload::Json(reply),
+        );
+    }
+}
+
+/// What `Native.hostReply` answers: the embedding channel's call (a
+/// `js-core` build), or the packaged app's core call.
+enum JavaCall {
+    Channel(nsh_engine::HostCall),
+    Core(Box<CoreHostCall>),
+}
+
+type CoreHostHandler = Arc<dyn Fn(CoreHostCall) + Send + Sync>;
+
+/// Hands (`name`, `json`, `call`) to `NshView.hostMessage` on the UI
+/// thread. False when Java could not be reached: the caller answers the
+/// call with a failure instead of leaving it hanging.
+fn jni_host_message(view: &GlobalRef, name: &str, json: &str, call: jlong) -> bool {
+    with_env(|env| {
+        let name = env.new_string(name)?;
+        let json = env.new_string(json)?;
+        // SAFETY: matches the signature checked in `java::init`.
+        unsafe {
+            env.call_method_unchecked(
+                view.as_obj(),
+                java().view_host_message,
+                ReturnType::Primitive(Primitive::Void),
+                &[
+                    JValue::Object(&name).as_jni(),
+                    JValue::Object(&json).as_jni(),
+                    JValue::Long(call).as_jni(),
+                ],
+            )
+        }
+        .map(|_| true)
+    })
+}
+
+/// Hands the app's `nsh/host` calls in the batch (`Command::HostCall`s
+/// on the root) to the Java handler registered for each name; handlers
+/// without one answer at once. The answers return as
+/// `EventKind::Host` `{ type: "reply" }` events.
+fn dispatch_host_calls(host: &Host, batch: &MountBatch) {
+    for item in &batch.items {
+        let MountItem::Command {
+            id: nsh_core::ROOT_ID,
+            command: nsh_core::Command::HostCall { id, name, args },
+        } = item
+        else {
+            continue;
+        };
+        let handler = host
+            .core_host_handlers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned();
+        let reply = CoreHostReply {
+            id: *id,
+            control: host.control(),
+        };
+        match handler {
+            Some(handler) => handler(CoreHostCall {
+                name: name.clone(),
+                json: args.to_string(),
+                reply,
+            }),
+            None => CoreHostCall {
+                name: name.clone(),
+                json: String::new(),
+                reply,
+            }
+            .reject(format!("nsh/host: the embedding app handles no \"{name}\"")),
+        }
+    }
+}
+
 /// Answers the clipboard's image and file reads, which Android's
 /// clipboard holds as content URIs NSH does not read yet: no image, no
 /// files.
@@ -460,6 +603,7 @@ impl MountSink for Sink {
         }
         answer_clipboard_reads(host, &batch);
         register_inline_images(host, &batch);
+        dispatch_host_calls(host, &batch);
         let mut encoded = encode::encode(batch, self.1);
         if let Some(keymap) = encoded.keymap.take() {
             host.keymap
@@ -729,6 +873,7 @@ extern "system" fn Java_com_longbridge_nsh_Native_create(
         system_cache_dir: cache_dir,
         image_cache: Mutex::new(None),
         host: nsh_engine::HostChannel::new(),
+        core_host_handlers: Mutex::new(HashMap::new()),
         keymap: Mutex::default(),
         #[cfg(feature = "dev")]
         dev: Mutex::new(None),
@@ -2782,40 +2927,49 @@ extern "system" fn Java_com_longbridge_nsh_Native_setHostHandler(
         return;
     };
     if handled == 0 {
+        host.core_host_handlers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&name);
         return host.host.remove_handler(&name);
     }
-    // The view's reference, not the host's: the channel the host owns keeps
-    // the handler.
+    // The view's reference, not the host's: the handlers outlive the call.
     let view = host.view.clone();
+    // The core's calls (`Command::HostCall` — a packaged Rust app has no
+    // JS to go through the channel's `HostBridge`).
+    let view_for_core = view.clone();
+    host.core_host_handlers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            name.clone(),
+            Arc::new(move |call: CoreHostCall| {
+                let (name, json, call) = call.into_java();
+                if !jni_host_message(&view_for_core, &name, &json, call) && call != 0 {
+                    // Java never got it: the call fails rather than waits.
+                    // SAFETY: made in `into_java` and not handed over.
+                    match *unsafe { Box::from_raw(call as *mut JavaCall) } {
+                        JavaCall::Core(call) => call.reject(
+                            "nsh/host: the call could not reach the embedding app".to_owned(),
+                        ),
+                        JavaCall::Channel(call) => drop(call),
+                    }
+                }
+            }),
+        );
+    // The embedding JS's own calls (`js-core` builds only; the channel's
+    // `HostBridge` invokes them there).
     host.host.handle(name.clone(), move |mut call| {
         let json = call.take_data().to_string();
         let call = if call.is_post() {
             0
         } else {
-            Box::into_raw(Box::new(call)) as jlong
+            Box::into_raw(Box::new(JavaCall::Channel(call))) as jlong
         };
-        let delivered = with_env(|env| {
-            let name = env.new_string(&name)?;
-            let json = env.new_string(&json)?;
-            // SAFETY: matches the signature checked in `java::init`.
-            unsafe {
-                env.call_method_unchecked(
-                    view.as_obj(),
-                    java().view_host_message,
-                    ReturnType::Primitive(Primitive::Void),
-                    &[
-                        JValue::Object(&name).as_jni(),
-                        JValue::Object(&json).as_jni(),
-                        JValue::Long(call).as_jni(),
-                    ],
-                )
-            }
-            .map(|_| true)
-        });
-        if !delivered && call != 0 {
+        if !jni_host_message(&view, &name, &json, call) && call != 0 {
             // Java never got it: the call fails rather than waits.
             // SAFETY: made above and not handed over.
-            drop(unsafe { Box::from_raw(call as *mut nsh_engine::HostCall) });
+            drop(unsafe { Box::from_raw(call as *mut JavaCall) });
         }
     });
 }
@@ -2833,13 +2987,25 @@ extern "system" fn Java_com_longbridge_nsh_Native_hostReply(
     if call == 0 {
         return;
     }
-    // SAFETY: a call `setHostHandler`'s handler handed to Java, answered once.
-    let call = unsafe { Box::from_raw(call as *mut nsh_engine::HostCall) };
-    let result = match optional_string(&mut env, &error) {
-        Some(message) => Err(message),
-        None => json_value(&mut env, &json, "the answer"),
-    };
-    call.reply(result);
+    // SAFETY: a call `setHostHandler`'s handlers handed to Java, answered once.
+    let call = unsafe { Box::from_raw(call as *mut JavaCall) };
+    let failure = optional_string(&mut env, &error);
+    match *call {
+        JavaCall::Channel(call) => {
+            let result = match failure {
+                Some(message) => Err(message),
+                None => json_value(&mut env, &json, "the answer"),
+            };
+            call.reply(result);
+        }
+        JavaCall::Core(call) => match failure {
+            Some(message) => call.reject(message),
+            None => match json_value(&mut env, &json, "the answer") {
+                Ok(value) => call.resolve(value),
+                Err(message) => call.reject(message),
+            },
+        },
+    }
 }
 
 /// `NshView` takes the URLs the app opens first (`handled`), or no longer
