@@ -48,6 +48,23 @@ features, in most places better:
   `on_key_up` (`KeyEvent` with the DOM's `key`/`code`), `on_mouse_up`,
   `PinchPhase`.
 
+**2026-11-21: merged upstream/main (the v0.6.1 line, 101 commits).**
+One conflict (`rust_app.rs`), complementary: upstream added per-crate
+`opt-level = 0, debug = true` for the app's own and nsh's checkout crates
+(quick rebuilds, still debuggable); our wildcard strip of dependency
+debuginfo sat outside it. Both kept then.
+
+**2026-11-24: merged upstream/main (250 commits).**
+One conflict (`README.md`, kept the banner). The merge retired the dev-profile
+patch: upstream now writes `[profile.dev.package."*"] opt-level = 3,
+debug = "line-tables-only"` for every generated workspace (plus a `shared`
+release-shaped profile), which covers the debuginfo bloat and additionally
+builds dependencies at speed — strictly better than our `debug = false`
+only table, so ours is dropped. The three remaining patches survived; the
+`onPanMove` hook was re-fitted to upstream's rewritten pan plumbing
+(`pan_move` now reports through `pan_payload` with the pointer, so it keeps
+velocity).
+
 ## Patches
 
 ### linux: overlay windows on Wayland's layer shell (674350bf, pushed)
@@ -61,26 +78,47 @@ compositor binds. Survived the merge untouched except the
 `gtk4-layer-shell` dep line (upstream made gstreamer optional in the same
 section; both kept).
 
-### cli: lighter dev profiles for the generated workspace
+### linux: stale picture behind a reloading image (87f1ab4)
 
-`write_workspace_manifest` adds `[profile.dev.package."*"] debug = false`
-next to the existing per-crate `opt-level = 3` overrides.
+Setting a new `src` used to drop the old texture immediately and paint
+nothing until the replacement decoded: a white flash per swap, many a
+second for a viewport fed frame by frame (`ImageSrc::rgba` from a renderer,
+camera previews). The view now parks the previous picture as `stale`,
+draws it until the new load completes, and lets it go then.
 
-The problem is real and measured: an app whose crates pull Bevy
+- _upstream?_ yes, for any app animating a `<Image>` source.
+
+### core + linux: `onPanMove`, the continuous drag stream (e50943b)
+
+`onPanStart` / `onPanEnd` carried only the ends of a drag, so a
+Blender-style orbit could jump the camera once per gesture or, via
+`onWheel`, feel stepped. `EventKind::PanMove` is delivered between them
+with the same `EventPayload::Pan` (translation from the start, velocity),
+on the view the pan was claimed on, wherever the pointer is.
+
+Upstream's `onMouseMove` (0.6.x) carries buttons and coordinates, but only
+to the views under the pointer as it moves: a drag that leaves the
+viewport stops updating. Pan targetting is what the orbit needs.
+
+- _upstream?_ yes — it is the missing middle of the existing pan events.
+
+## Retired patches
+
+### cli: lighter dev profiles for the generated workspace (retired 2026-11-24)
+
+`write_workspace_manifest` added `[profile.dev.package."*"] debug = false`.
+
+The problem was real and measured: an app whose crates pull Bevy
 (`nsh-bevy-test`) linked its development runner for over an hour and
 peaked ~10 GB of RSS — dependency debuginfo alone (bevy_render, wgpu,
-hickory, ...) dwarfs everything else, and the describe program links the
-same tree again. With debuginfo left out of dependencies, links drop to
-minutes and the memory spike goes with them; the app's own crates keep
-their debuginfo (where breakpoints live anyway), and TSX apps feel it
-only as faster dev rebuilds of the same binaries.
+hickory, ...) dwarfs everything else. Upstream now emits the same wildcard
+with `debug = "line-tables-only"` and `opt-level = 3`, so the bloat is
+gone and dependencies actually run at speed; the app's own crates keep
+full debuginfo (`opt-level = 0, debug = true`), where breakpoints live.
 
 Pair it with mold in the app (`.cargo/config.toml`,
 `rustflags = ["-C", "link-arg=-fuse-ld=mold"]`) — that part is per-app,
 not patched into the CLI.
-
-- _upstream?_ yes — every Rust app with heavy dependencies benefits; TSX
-  apps pay nothing.
 
 ## Tooling
 

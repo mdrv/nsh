@@ -31,14 +31,15 @@ final class A11y extends View.AccessibilityDelegate {
         "android.widget.GridView", "android.view.View", "android.view.View", "android.view.View", "android.view.View",
         "android.widget.ListView", "android.view.View", "android.view.View", "android.view.View",
         "android.view.View", "android.view.View", "android.view.View", "android.view.View", "android.view.View",
-        "android.view.View", "android.view.View",
+        "android.view.View", "android.view.View", "android.widget.EditText", "android.view.View",
     };
     /** Spoken role descriptions for roles without a widget class. */
     private static final String[] ROLE_DESCRIPTIONS = {
         null, null, "link", null, null, null, null, null, null, null, "summary", "alert", null, null, "menu",
         "menu bar", "menu item", null, null, null, "scroll bar", null, null, "tab", "tab list", "timer", null,
         null, null, null, "row", "cell", "column header", "row group", null, "option", null, "region",
-        "navigation", "tree", "tree item", "menu item", "menu item", "dialog", "alert dialog",
+        "navigation", "tree", "tree item", "menu item", "menu item", "dialog", "alert dialog", null,
+        "tab panel",
     };
     private static final int ROLE_ADJUSTABLE = 8;
     private static final int ROLE_HEADER = 9;
@@ -340,9 +341,22 @@ final class A11y extends View.AccessibilityDelegate {
 
     /** What the node says of its state: mixed, expanded, current, the value's text, invalid, and the checked word with them. */
     private String stateDescription() {
-        // In the app's language (its per-app language, else the system's), as the service speaks.
+        // In the language the app's text shows in, as the rest the service reads.
         return A11yChanges.stateDescription(state, shownValueText(), (state & 256) != 0 || role == ROLE_SWITCH,
-                java.util.Locale.getDefault());
+                mounter.textLocale);
+    }
+
+    /**
+     * The language of the state words changed ({@link Mounter#textLocale}): a service refreshes
+     * its copy of {@code v}'s node when it has a state description, saying nothing (the next read
+     * has the new words).
+     */
+    void wordsChanged(View v) {
+        if (hidden || !v.isShown() || stateDescription() == null) return;
+        ViewParent parent = v.getParent();
+        if (parent != null) {
+            parent.notifySubtreeAccessibilityStateChanged(v, v, AccessibilityEvent.CONTENT_CHANGE_TYPE_UNDEFINED);
+        }
     }
 
     private boolean has(String name) {

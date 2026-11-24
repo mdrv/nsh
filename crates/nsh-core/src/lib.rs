@@ -23,6 +23,7 @@ mod css_named;
 pub mod desktop;
 mod effects;
 pub mod element;
+pub mod fake;
 mod fenwick;
 pub mod file_dialog;
 pub mod file_type;
@@ -63,7 +64,6 @@ pub mod shader;
 pub mod shape;
 pub mod share;
 pub mod single_instance;
-pub mod speech;
 pub mod storage;
 mod style;
 #[cfg(feature = "svg")]
@@ -116,12 +116,15 @@ pub use text::ApproxPrepared;
 
 pub use crate::{
     color::{Hsla, Rgba},
-    core::{ApplyError, Core, ListBind, ListScrollPosition, MAX_TREE_DEPTH, Measurement},
+    core::{
+        ApplyError, Core, ListBind, ListScrollPosition, MAX_TREE_DEPTH, Measurement,
+        set_part_requester,
+    },
     effects::{
-        BackdropMaterial, BlendMode, BoxShadow, ColorStop, Cursor, Effects, Filter, GlassEffect,
-        Gradient, GradientKind, GradientSize, KeyframeAnimation, Keyframes, MacOsBackdrop,
-        MacOsBackdropBlending, MacOsBackdropMaterial, MacOsBackdropState, Outline, Transition,
-        TransitionProps, WindowsBackdrop, WindowsBackdropMaterial, blur_radius,
+        BackdropMaterial, BlendMode, BoxShadow, ClipInset, ColorStop, Cursor, Effects, Filter,
+        GlassEffect, Gradient, GradientKind, GradientSize, KeyframeAnimation, Keyframes,
+        MacOsBackdrop, MacOsBackdropBlending, MacOsBackdropMaterial, MacOsBackdropState, Outline,
+        Transition, TransitionProps, WindowsBackdrop, WindowsBackdropMaterial, blur_radius,
         compose_color_matrices,
     },
     geometry::{Bounds, Corners, Edges, Point, Points, Size},
@@ -133,25 +136,27 @@ pub use crate::{
         VideoProps, ViewKind, WebProps,
     },
     ops::{
-        AutoCapitalize, AutoFill, CellSlot, Command, ContextMenuEvent, Dialog, DialogButton,
-        DialogButtonStyle, DialogInput, EditAction, EventKind, EventMask, EventPayload, FpsMode,
-        Haptic, HapticImpact, HapticNotification, HeaderItem, HeaderItemContent, HeaderSlot,
-        HeaderSystemItem, HeaderTitleAlign, IMAGE_SCALES, ImageProp, ImageScales, ImageSource,
-        KeyboardAppearance, KeyboardDismissMode, KeyboardTaps, KeyboardType, ListAlignment,
-        ListContentStyle, ListViewport, ModalAnimation, ModalPresentation, ModalProp, MouseButton,
-        MouseEvent, NativeProp, NodeId, Op, OverlayProp, PasteBehavior, PasteEvent, PastedFile,
-        PayloadValue, PinchEvent, PinchPhase, PointerType, PressEvent, Prop, ROOT_ID, ResizeMode,
-        ReturnKeyType, RevealOptions, ScreenAnimation, ScreenProp, ScrollAlignment, ScrollProp,
-        ScrollbarSetting, SheetDetent, SnapAlignment, StatusBarConfig, StatusBarSetting,
-        StatusBarStyle, SubmitBehavior, Tag, TouchEvent, TouchPhase, TouchPoint,
-        TransitionFallback, Viewability, WebElement, WebInput, WebKey, WebLoad, WebSource,
-        WheelDelta, WheelEvent, dialog_default_button,
+        AutoCapitalize, AutoFill, BackPhase, BackProgressEvent, CellSlot, Command,
+        ContextMenuEvent, Dialog, DialogButton, DialogButtonStyle, DialogInput, EditAction,
+        EventKind, EventMask, EventPayload, FileContents, FpsMode, Haptic, HapticImpact,
+        HapticNotification, HeaderItem, HeaderItemContent, HeaderSlot, HeaderSystemItem,
+        HeaderTitleAlign, IMAGE_SCALES, ImageProp, ImageScales, ImageSource, KeyboardAppearance,
+        KeyboardDismissMode, KeyboardTaps, KeyboardType, ListAlignment, ListContentStyle,
+        ListViewport, ModalAnimation, ModalPresentation, ModalProp, MouseButton, MouseEvent,
+        NativeProp, NodeId, Op, OverlayProp, PasteBehavior, PasteEvent, PastedFile, PayloadValue,
+        PinchEvent, PinchPhase, PointerType, PressEvent, Prop, ROOT_ID, ResizeMode, ReturnKeyType,
+        RevealOptions, ScreenAnimation, ScreenProp, ScrollAlignment, ScrollProp, ScrollbarSetting,
+        SheetDetent, SnapAlignment, StatusBarConfig, StatusBarSetting, StatusBarStyle,
+        SubmitBehavior, Tag, TextDrop, TouchEvent, TouchPhase, TouchPoint, TransitionFallback,
+        Viewability, WebElement, WebInput, WebKey, WebLoad, WebSource, WheelDelta, WheelEvent,
+        dialog_default_button,
     },
     props::{
         Accessibility, AccessibilityActionDef, AccessibilityCurrent, AccessibilityProp,
         AccessibilityRole, AccessibilityState, AccessibilityValue, Checked, EdgeInsets,
         GestureValues, LayoutAnimation, LayoutCurve, LayoutProperty, LayoutTransition, LiveRegion,
-        PanActivation, PointerEvents, Ripple, ScrollEdge, ScrollEdgeElement, ViewProps,
+        PanActivation, PanDirection, PanEdge, PointerEvents, Ripple, ScrollEdge, ScrollEdgeElement,
+        ViewProps,
     },
     style::{
         BorderStyle, Borders, Color, CornerRadii, DecorationStyle, EllipsizeMode, EnvVar,
@@ -163,9 +168,9 @@ pub use crate::{
     },
     text::{
         ATTACHMENT_CHAR, Affinity, ApproxTextEngine, AttachmentAlignments, AttachmentCopyText,
-        AttributedText, BackgroundBox, FontExtent, LinePiece, ResolvedTextStyle, SpanTestId,
-        TextAttachment, TextBackground, TextEngine, TextGeometry, TextLayout, TextLine, TextLink,
-        TextPosition, TextSpan, font_data, font_family, keep_font,
+        AttributedText, BackgroundBox, FontExtent, LinePiece, LinkHref, ResolvedTextStyle,
+        SpanTestId, TextAttachment, TextBackground, TextEngine, TextGeometry, TextLayout, TextLine,
+        TextLink, TextPosition, TextSpan, font_data, font_family, keep_font,
     },
     transform::{
         Decomposed, MAX_TRANSFORMS, Matrix, Transform, TransformKind, TransformOp, translation,

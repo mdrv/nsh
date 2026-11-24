@@ -77,6 +77,30 @@ mount(() => (
 
 在 iOS 和 Android 上，编辑器像平台自己的文本视图一样选择文本。长按选中手指下的词，之后移动手指按整词扩展选区；在空白处长按则放置光标。双击选中一个词，三击选中整段。触摸产生的选区两端各有一个手柄（`selectionHandle`，主题 `primary` 色的圆点），手指拖动手柄即可移动那一端。手指抬起时，系统编辑菜单在选区上方打开，提供剪切、拷贝、粘贴和全选；点按选区会再次打开它，点按光标则打开粘贴和全选。菜单只提供适用的操作：全部选中后不再提供全选，只读编辑器只提供拷贝和全选。每个操作都是编辑器的事务，因此工具栏的 `isActive` 跟随选区，`toggleMark` 作用于它，撤销可以撤回剪切或粘贴。点按、键盘、输入法和鼠标的选择方式不变。
 
+### 键盘上方的工具栏
+
+`inputAccessoryViewID`（Rust 中为 `.input_accessory(id)`）在编辑器获得焦点时，把 `nativeID` 为该值的 [`InputAccessoryView`](../docs/forms-and-keyboard.md#键盘上方的工具栏inputaccessoryview) 显示在键盘顶部，与 `Input` 的 `ios={{ inputAccessoryViewID }}` 一样：它随键盘出现和消失，并由原生跟随键盘移动。其中的格式按钮作用于会话，焦点仍留在编辑器中：
+
+```tsx
+import { Text, View } from "nsh";
+import { Button, RichEditor, command } from "nsh/base";
+import { InputAccessoryView } from "nsh/mobile";
+
+<RichEditor editor={editor} inputAccessoryViewID="format" />
+<InputAccessoryView nativeID="format">
+  <View style={{ flexDirection: "row", padding: 8, gap: 8 }}>
+    <Button onPress={() => editor.run(command("toggleBold"))}>
+      <Text>Bold</Text>
+    </Button>
+    <Button onPress={() => editor.blur()}>
+      <Text>Done</Text>
+    </Button>
+  </View>
+</InputAccessoryView>
+```
+
+输入附件视图是 iOS 的功能，其他平台上编辑器不显示它。
+
 ### 气泡菜单
 
 `bubbleMenu` 即 Tiptap 的气泡菜单：应用的内容显示在选区旁，默认在其上方（`bubbleMenuPlacement`，没有空间时翻到另一侧），相距 `bubbleMenuOffset` 点（8），位于一个随文本滚动的浮层中。应用在希望显示它时传入，依据会话的状态：
@@ -116,6 +140,8 @@ Markdown），以及按 schema 的 `renderHTML` 写出的 HTML，邮件、文档
 ### 粘贴和拖入的文件
 
 文件交给应用，由应用决定它们变成什么（图片节点、附件、指向上传副本的链接）；编辑器不为它们插入任何内容，选区保持不变，应用在选区处插入自己生成的内容。粘贴图片或在文件管理器中复制的文件时调用 `onPasteFiles`，参数为 `{ files, uris }`：`files` 是带字节的图片，`uris` 是被复制文件的 `file:` URL。在桌面平台上，从其他应用拖到编辑器上的文件调用它的 `onFileDrop`，参数为 `{ uris, mimeTypes }`，与[视图的文件拖放](./view.md#桌面文件拖放)相同；`onFileDragEnter` / `onFileDragLeave` 跟随拖动，可用于显示「松开以添加附件」之类的提示。没有 `onFileDrop` 时，拖入的文件交给外层监听的视图。
+
+从其他应用或其他视图拖到编辑器上的文字插在松手的位置：光标移到那里，文字像粘贴一样插入（拖动带 HTML 时一并使用，经过 `transformPasted` 和 `handlePaste`），算一步撤销。目前 iOS 会派发文字拖放；桌面平台和 Android 上文字拖动仍由平台处理。
 
 ```tsx
 <RichEditor
@@ -441,7 +467,7 @@ editor.run(addRowAfter());
 
 Tab 与 Shift-Tab 在单元格之间移动，在最后一个单元格按 Tab 会添加一行。在单元格边缘按方向键会进入相邻单元格；Shift 加方向键，或跨单元格拖动，会选中一个矩形区域的单元格（类型为 `"cell"` 的选区，其 `anchor` 与 `head` 是首尾单元格之前的位置）。Backspace 与 Delete 清空选中的单元格，选中全部单元格时删除整个表格。
 
-在编辑器中，表格是由其单元格组成的网格：每列与其单元格的 `colwidth` 一样宽，没有宽度的列分享剩余空间（至少 `cellMinWidth` 宽），每行至少为其 `height` 高。默认外观来自主题：1 点 `border` 网格线，表头单元格使用 `muted` 背景，单元格带内边距，选中的单元格覆盖一层 `selectedCell` 部件，使用选区颜色。`classes.nodes`（`table`、`tableCell`、`tableHeader`）和这些部件可以重新设置全部外观。在单元格的第一行或最后一行按上下方向键，会进入上方或下方的单元格。
+列宽随单元格中的文字和组件调整。长段落会换行，表格超出编辑器宽度时可以在表格内左右滚动。拖动或保存的列宽优先，每列至少为 `cellMinWidth` 宽，每行至少为保存的 `height` 高。默认外观来自主题：1 点 `border` 网格线，表头单元格使用 `muted` 背景，单元格带内边距，选中的单元格覆盖一层 `selectedCell` 部件，使用选区颜色。`classes.nodes`（`table`、`tableCell`、`tableHeader`）和这些部件可以重新设置全部外观。在单元格的第一行或最后一行按上下方向键，会进入上方或下方的单元格。
 
 文档可编辑时：
 

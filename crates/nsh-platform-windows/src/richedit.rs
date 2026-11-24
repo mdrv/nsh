@@ -172,10 +172,12 @@ pub(crate) struct Notes {
     pub(crate) changed: bool,
     /// The selection changed (`EN_SELCHANGE`).
     pub(crate) selection: bool,
-    /// A composition started, with the selection (UTF-16) and the text's
-    /// length at that moment.
+    /// A composition started and has not ended yet, with the selection
+    /// (UTF-16) and the text's length at that moment. When
+    /// [`Self::composition_end`] is also set, this composition started after
+    /// the prior one ended.
     pub(crate) composition_start: Option<(u32, u32, u32)>,
-    /// The composition ended.
+    /// A composition the field already knew about ended.
     pub(crate) composition_end: bool,
 }
 
@@ -199,6 +201,10 @@ const NOTES_LATER: u32 = u32::MAX;
 struct Host {
     vtbl: *const HostVtbl,
     refs: Cell<u32>,
+    /// The window the text services were created on: `TxGetWindow` and the
+    /// input context stay here (moving them to `shown_in` leaves compositions
+    /// lost, #2094), so `update_ime` keeps this window's IMC attached whenever
+    /// any window's field takes IME input.
     hwnd: HWND,
     /// The window the field shows in (`hwnd`'s, or one of the app's own):
     /// where its client points are on the screen.
@@ -359,6 +365,33 @@ impl Editor {
         self.host().notes.take()
     }
 
+    /// Delivers `EN_STARTCOMPOSITION` through `tx_notify`, for tests that
+    /// exercise composition transitions without an IME.
+    #[cfg(test)]
+    pub(crate) fn start_composition(&self) {
+        // SAFETY: `self.host` is a live `Host` for the lifetime of `self`.
+        unsafe {
+            let _ = tx_notify(
+                self.host.cast_mut().cast(),
+                EN_STARTCOMPOSITION,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    /// Delivers `EN_ENDCOMPOSITION` through `tx_notify`.
+    #[cfg(test)]
+    pub(crate) fn end_composition(&self) {
+        // SAFETY: `self.host` is a live `Host` for the lifetime of `self`.
+        unsafe {
+            let _ = tx_notify(
+                self.host.cast_mut().cast(),
+                EN_ENDCOMPOSITION,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
     /// The caret the services placed.
     pub(crate) fn caret(&self) -> Caret {
         self.host().caret.get()
@@ -485,6 +518,131 @@ impl Editor {
             log::debug!("TxDrawD2D failed: {hr:?}");
         }
         hr.is_ok()
+    }
+
+    /// Draws the text with GDI (`ITextServices::TxDraw`) into a top-down
+    /// 32-bit premultiplied BGRA pixel buffer covering `bounds` (width × height
+    /// pixels). Used only when the input renders an app-registered custom font,
+    /// because windowless RichEdit's `TXTBIT_D2DDWRITE` path only sees
+    /// DirectWrite's system font collection, whereas GDI resolves
+    /// process-private fonts registered via `AddFontMemResourceEx`.
+    ///
+    /// Dual-pass black/white alpha matting recovers per-pixel alpha for
+    /// transparent backgrounds, antialiased glyphs of any color, and opaque
+    /// selection highlights without ClearType color fringing.
+    pub(crate) fn draw_gdi_bgra(&self, bounds: RECT) -> Option<Vec<u8>> {
+        use windows::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
+            DIB_RGB_COLORS, DeleteDC, DeleteObject, SelectObject, SetViewportOrgEx,
+        };
+        let w = (bounds.right - bounds.left).max(0);
+        let h = (bounds.bottom - bounds.top).max(0);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let byte_len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits_ptr: *mut c_void = std::ptr::null_mut();
+        let _drawing = self.drawing();
+        // SAFETY: GDI DC and DIB section are created and cleaned up within
+        // this scope; `bits_ptr` points to `byte_len` valid bytes while `dib`
+        // is alive; `TxDraw` receives a live DC and `RECTL`.
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() {
+                return None;
+            }
+            let Ok(dib) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
+            else {
+                let _ = DeleteDC(dc);
+                return None;
+            };
+            if bits_ptr.is_null() {
+                let _ = DeleteObject(dib.into());
+                let _ = DeleteDC(dc);
+                return None;
+            }
+            let old = SelectObject(dc, dib.into());
+            let _ = SetViewportOrgEx(dc, -bounds.left, -bounds.top, None);
+            let pixels = std::slice::from_raw_parts_mut(bits_ptr.cast::<u8>(), byte_len);
+
+            let draw_pass = |bg: u8, pixels: &mut [u8]| -> bool {
+                pixels.fill(bg);
+                let mut rc = RECTL {
+                    left: bounds.left,
+                    top: bounds.top,
+                    right: bounds.right,
+                    bottom: bounds.bottom,
+                };
+                self.services
+                    .TxDraw(
+                        windows::Win32::System::Com::DVASPECT_CONTENT,
+                        0,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        dc,
+                        HDC::default(),
+                        &mut rc,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        TXTVIEW_ACTIVE.0,
+                    )
+                    .is_ok()
+            };
+
+            let result = if draw_pass(0x00, pixels) {
+                let mut black = pixels.to_vec();
+                if draw_pass(0xFF, pixels) {
+                    for (b_px, w_px) in black
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(pixels.as_chunks::<4>().0)
+                    {
+                        let ab = 255u32.saturating_sub(u32::from(w_px[0].saturating_sub(b_px[0])));
+                        let ag = 255u32.saturating_sub(u32::from(w_px[1].saturating_sub(b_px[1])));
+                        let ar = 255u32.saturating_sub(u32::from(w_px[2].saturating_sub(b_px[2])));
+                        let alpha = ((ab + ag + ar + 1) / 3).min(255);
+                        if alpha == 0 {
+                            *b_px = [0, 0, 0, 0];
+                        } else {
+                            let premul = |c: u8, ac: u32| -> u8 {
+                                (u32::from(c) * alpha)
+                                    .checked_div(ac)
+                                    .map_or(0, |v| v.min(alpha) as u8)
+                            };
+                            b_px[0] = premul(b_px[0], ab);
+                            b_px[1] = premul(b_px[1], ag);
+                            b_px[2] = premul(b_px[2], ar);
+                            b_px[3] = alpha as u8;
+                        }
+                    }
+                    Some(black)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            SelectObject(dc, old);
+            let _ = DeleteObject(dib.into());
+            let _ = DeleteDC(dc);
+            result
+        }
     }
 
     /// Marks the field as being drawn until the guard drops: what the
@@ -1050,7 +1208,6 @@ unsafe extern "system" fn tx_notify(this: This, code: u32, _: *mut c_void) -> HR
         EN_CHANGE => notes.changed = true,
         EN_SELCHANGE => notes.selection = true,
         EN_STARTCOMPOSITION => {
-            notes.composition_end = false;
             let services = host.services.get();
             if !services.is_null() {
                 // SAFETY: queries the services answer from a notification
@@ -1071,7 +1228,13 @@ unsafe extern "system" fn tx_notify(this: This, code: u32, _: *mut c_void) -> HR
                 }
             }
         }
-        EN_ENDCOMPOSITION => notes.composition_end = true,
+        EN_ENDCOMPOSITION => {
+            // A composition that started since the field last looked ended
+            // unseen: its commit stays in the text as a plain edit.
+            if notes.composition_start.take().is_none() {
+                notes.composition_end = true;
+            }
+        }
         _ => return S_OK,
     }
     host.notes.set(notes);

@@ -115,6 +115,34 @@ once everything is selected, and a read-only editor offers Copy and Select All. 
 toolbar's `isActive` follows the selection, `toggleMark` formats it, and undo takes a cut or a paste back. Taps,
 keys, input methods and the mouse select as before.
 
+### A bar over the keyboard
+
+`inputAccessoryViewID` (Rust `.input_accessory(id)`) shows the
+[`InputAccessoryView`](../docs/forms-and-keyboard.md#a-bar-over-the-keyboard-ios-inputaccessoryview) with that
+`nativeID` on top of the keyboard while the editor has the focus, as an `Input`'s `ios={{ inputAccessoryViewID }}`
+does: it comes and goes with the keyboard and moves with it natively. Formatting buttons there run on the session and
+leave the focus in the editor:
+
+```tsx
+import { Text, View } from "nsh";
+import { Button, RichEditor, command } from "nsh/base";
+import { InputAccessoryView } from "nsh/mobile";
+
+<RichEditor editor={editor} inputAccessoryViewID="format" />
+<InputAccessoryView nativeID="format">
+  <View style={{ flexDirection: "row", padding: 8, gap: 8 }}>
+    <Button onPress={() => editor.run(command("toggleBold"))}>
+      <Text>Bold</Text>
+    </Button>
+    <Button onPress={() => editor.blur()}>
+      <Text>Done</Text>
+    </Button>
+  </View>
+</InputAccessoryView>
+```
+
+Input accessories are iOS's; elsewhere the editor shows none.
+
 ### Bubble menu
 
 `bubbleMenu` is Tiptap's bubble menu: the app's content shown next to the selection, above it by default
@@ -168,6 +196,10 @@ their bytes, `uris` the copied files' `file:` URLs. On the desktops, files dragg
 the editor call its `onFileDrop` with `{ uris, mimeTypes }`, as a [view's file drops](./view.md#desktop-file-drops)
 do, and `onFileDragEnter` / `onFileDragLeave` follow the drag, for a hint such as "Release to attach". Without
 `onFileDrop` the editor leaves dropped files to the view around it that listens.
+
+Text dragged onto the editor from another app or another view goes in where it is let go: the caret moves there and
+the text goes in as a paste of it would (with its HTML when the drag has some, through `transformPasted` and
+`handlePaste`), as one undo step. iOS delivers text drops; the desktops and Android leave text drags to the platform.
 
 ```tsx
 <RichEditor
@@ -596,8 +628,9 @@ next cell; Shift with an arrow, or a drag across cells, selects a rectangle of c
 `"cell"`, whose `anchor` and `head` are the positions before its first and last cells). Backspace and Delete empty
 the selected cells, and delete the table when all its cells are selected.
 
-In the editor a table is a grid of its cells: each column as wide as its cells' `colwidth`, columns without one
-sharing the room (at least `cellMinWidth` wide), each row at least its `height`. Its look starts from the theme: a
+Columns fit the text and components in their cells. Long paragraphs wrap, and a table wider than the editor
+scrolls horizontally inside the document. A saved or dragged column width takes precedence. Each column is at
+least `cellMinWidth` wide and each row is at least its saved `height`. Its look starts from the theme: a
 1-point `border` grid, header cells on `muted`, padded cells, and each selected cell under the `selectedCell` part in
 the selection color. `classes.nodes` (`table`, `tableCell`, `tableHeader`) and the parts restyle
 all of it. Up and Down on a cell's first or last line go to the cell above or below.

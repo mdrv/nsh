@@ -270,13 +270,26 @@ fn web_view_at(window: &NSWindow, event: &NSEvent) -> Option<Retained<NSView>> {
 }
 
 /// Which of the surface's windows a call acts in.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Which {
     Main,
     /// A window by its root node (the main one's is the root).
     Target(NodeId),
     /// The window that has the keyboard.
     Key,
+}
+
+/// The window the app shows that a call about the app's window acts in
+/// (a screenshot, a resize), with the agent targeting `target`: that
+/// window, else the key one (the frontmost of the app's own). In window
+/// model v2 the surface's own window is a host that never shows, and the
+/// app's `<Window>`s are windows of their own.
+fn shown(target: NodeId) -> Which {
+    if target == ROOT_ID {
+        Which::Key
+    } else {
+        Which::Target(target)
+    }
 }
 
 /// `rect` of view `ns` in its window's content, from its top left; `None`
@@ -310,7 +323,18 @@ fn in_window(ns: &NSView, rect: NSRect) -> Option<Bounds<Points>> {
 /// its middle.
 fn mapped(view: &crate::view::NshView, rect: NSRect) -> Option<Bounds<Points>> {
     crate::scroll::commit_ancestors(view);
-    let plain = in_window(view.ns(), rect)?;
+    // A leaf (#2066) is in no window: measure it in its parent's container.
+    let plain = match view.parent_view().filter(|_| view.is_leaf_layer()) {
+        Some(parent) => {
+            let o = view.ns().frame().origin;
+            let at = NSRect::new(
+                NSPoint::new(o.x + rect.origin.x, o.y + rect.origin.y),
+                rect.size,
+            );
+            in_window(&parent.container(), at)?
+        }
+        None => in_window(view.ns(), rect)?,
+    };
     let (x0, y0) = (rect.origin.x as f32, rect.origin.y as f32);
     let (w, h) = (rect.size.width as f32, rect.size.height as f32);
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -424,7 +448,13 @@ impl Native for MacNative {
         gesture(0, 0, 4);
     }
 
-    fn drag(&self, from: Point<Points>, to: Point<Points>) {
+    fn drag(
+        &self,
+        from: Point<Points>,
+        to: Point<Points>,
+        options: nsh_testing::DragOptions,
+    ) -> Result<(), String> {
+        nsh_testing::agent::refuse_custom_drag("drag", options)?;
         self.activate();
         let (x, y) = (f64::from(from.x.0), f64::from(from.y.0));
         let clicks = self
@@ -447,6 +477,7 @@ impl Native for MacNative {
         }
         let (x, y) = (f64::from(last.x.0), f64::from(last.y.0));
         self.on_target(move |_, window| mouse(window, NSEventType::LeftMouseUp, x, y, clicks));
+        Ok(())
     }
 
     fn type_text(&self, text: &str) {
@@ -643,7 +674,7 @@ impl Native for MacNative {
         // made: let it show the last one before taking its picture.
         self.on_main(|_, _| objc2_quartz_core::CATransaction::flush());
         std::thread::sleep(PRESENT);
-        self.on_main(|_, window| synth::shot(window))
+        self.on_window(shown(self.target()), |_, window| synth::shot(window))
             .unwrap_or_else(|| Err("the window is gone".into()))
     }
 
@@ -651,13 +682,7 @@ impl Native for MacNative {
         // `setViewport` resizes the window the app shows, not the hidden
         // host: the targeted window, else the key one (the frontmost of the
         // app's own windows).
-        let id = self.target();
-        let which = if id == ROOT_ID {
-            Which::Key
-        } else {
-            Which::Target(id)
-        };
-        self.on_window(which, |_, window| {
+        self.on_window(shown(self.target()), |_, window| {
             let content = NSSize::new(f64::from(width.0), f64::from(height.0));
             let old = window.frame();
             let size = window
@@ -733,5 +758,18 @@ impl Native for MacNative {
 
     fn quit(&self) {
         self.on_main(|_, window| window.close());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_screenshot_is_of_the_window_the_app_shows() {
+        // The surface's own window is a host that never shows: without a
+        // target, the window with the keyboard (the frontmost shown one).
+        assert_eq!(shown(ROOT_ID), Which::Key);
+        assert_eq!(shown(7), Which::Target(7));
     }
 }

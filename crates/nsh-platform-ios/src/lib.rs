@@ -93,9 +93,9 @@ mod shader;
 mod share;
 mod split;
 mod state_words;
-// Sound (`Sound`, `AudioPlayer`), the Speech framework's recognizer and the
-// notification center, shared with macOS.
-use nsh_platform_apple::{audio, notifications, speech};
+// Sound (`Sound`, `AudioPlayer`) and the notification center, shared with
+// macOS.
+use nsh_platform_apple::{audio, notifications};
 mod surface;
 #[cfg(feature = "dev")]
 mod synth;
@@ -108,6 +108,7 @@ mod system_switch;
 mod system_tab_bar;
 mod target;
 mod text;
+mod text_access;
 mod text_selection;
 mod text_view;
 mod touch;

@@ -161,7 +161,8 @@ it. A view's own `onContextMenu` tells these openings apart by `pointerType`, wh
 
 When you control `open` and set it to `true` yourself, for a shortcut of your own or for a list that has the focus
 while one of its rows is the one asked about, the menu opens the same way: below the trigger, with the keyboard
-focus on its first enabled item, and closing it gives the focus back to the trigger.
+focus on its first enabled item, and closing it gives the focus back to the trigger. On macOS and iOS, a menu a pointer opened
+gives it back where it was before it opened: a press there gives the trigger no focus, so your app's shortcuts keep their keys.
 
 ## Checkable items
 
@@ -409,7 +410,11 @@ submenu inside it sets its own. A menu whose items are all one choice puts them 
 | `title` | `.title(..)` | `string` | none | iOS and Android: the menu's title, above its items. |
 | `disabled` | `.disabled(..)` | `boolean` | `false` | It cannot be pressed and opens nothing. |
 | `accessibilityLabel` | `.accessibility_label(..)` | `string` | none | What screen readers say for the button. |
+| `accessibilityHint` | `.accessibility_hint(..)` | `string` | none | Explains what opening the menu offers, as a view's `accessibilityHint`. |
 | `class`, `style`, `children` | style methods, `.child(..)` | | none | The trigger the app draws. |
+
+`accessibilityHint` follows reactive values; setting it to `undefined` removes the hint. On iOS and Android, the
+hint reaches the native button that screen readers activate.
 
 `MenuButtonItem` is `{ id, label, icon?, svg?, checked?, disabled?, destructive?, items?, inline?, singleSelection? }`
 (Rust: `MenuButtonItem::new(id, label)`, `::submenu(label, items)`, `::section(label, items)`, then `.icon(..)`,

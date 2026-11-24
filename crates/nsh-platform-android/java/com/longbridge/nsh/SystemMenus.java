@@ -71,6 +71,20 @@ final class SystemMenus {
         final List<Entry> items = new ArrayList<>();
     }
 
+    /** The menu on screen, which the test agent chooses from ({@link TestAgent}); null when none is. */
+    static Popup open;
+
+    /**
+     * Closes the menu on screen if it was made in {@code context}, an app's: the activity its window is in goes
+     * ({@link Mounter#leaveWindows}).
+     */
+    static void dismissOf(Context context) {
+        if (open == null || open.owner != context) return;
+        // At once: an exit transition would keep the window until after the activity is gone, leaking it.
+        open.window.setExitTransition(null);
+        open.dismiss();
+    }
+
     /** How deep submenus nest: past it an entry's items are dropped, as on iOS. */
     private static final int MAX_DEPTH = 8;
 
@@ -162,6 +176,8 @@ final class SystemMenus {
      * shows its items in place of its menu's, under its label.
      */
     static final class Popup {
+        /** The context it was made in: its app's. */
+        private final Context owner;
         private final Context context;
         private final Palette palette;
         private final float density;
@@ -177,6 +193,7 @@ final class SystemMenus {
 
         Popup(Context context, boolean night, View anchor, int gravity, String title, List<Entry> entries,
                 Consumer<String> select) {
+            this.owner = context;
             this.context = new ContextThemeWrapper(context,
                     night ? android.R.style.Theme_Material : android.R.style.Theme_Material_Light);
             this.palette = new Palette(night);
@@ -200,6 +217,7 @@ final class SystemMenus {
             window.setOutsideTouchable(true);
             window.setInputMethodMode(PopupWindow.INPUT_METHOD_NOT_NEEDED);
             window.setOnDismissListener(() -> {
+                if (open == this) open = null;
                 if (onDismiss != null) onDismiss.run();
             });
 
@@ -237,10 +255,36 @@ final class SystemMenus {
 
         void show() {
             place(false);
+            open = this;
         }
 
         void dismiss() {
             window.dismiss();
+        }
+
+        /** The root of the menu's window, where its touches and keys go. */
+        View windowRoot() {
+            return root.getRootView();
+        }
+
+        /** The row of the level shown labelled {@code label}; null when it has none. */
+        View row(String label) {
+            for (int i = 0; i < list.getChildCount(); i++) {
+                View child = list.getChildAt(i);
+                CharSequence name = child.getContentDescription();
+                if (child.isClickable() && name != null && label.contentEquals(name)) return child;
+            }
+            return null;
+        }
+
+        /** The labels of the level's rows, in their order. */
+        List<String> labels() {
+            List<String> labels = new ArrayList<>();
+            for (int i = 0; i < list.getChildCount(); i++) {
+                View child = list.getChildAt(i);
+                if (child.isClickable()) labels.add(String.valueOf(child.getContentDescription()));
+            }
+            return labels;
         }
 
         private int dp(float value) {

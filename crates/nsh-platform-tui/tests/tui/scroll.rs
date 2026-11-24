@@ -612,7 +612,7 @@ fn a_focused_scroll_view_shows_its_thumb_in_the_accent() {
     draw_until(&mut view, &mut terminal, &rx, "second");
     let thumb = terminal.backend().buffer()[(10, 1)].clone();
     assert_eq!(thumb.symbol(), "┃");
-    assert_ne!(thumb.fg, Color::Blue, "unfocused, the thumb is plain");
+    assert_ne!(thumb.fg, crate::ACCENT, "unfocused, the thumb is plain");
     view.handle(Input::Key {
         key: "Tab".into(),
         modifiers: Modifiers::default(),
@@ -625,10 +625,14 @@ fn a_focused_scroll_view_shows_its_thumb_in_the_accent() {
     assert_eq!(buffer[(10, 1)].symbol(), "┃");
     assert_eq!(
         buffer[(10, 1)].fg,
-        Color::Blue,
+        crate::ACCENT,
         "focused, the thumb is the accent"
     );
-    assert_ne!(buffer[(10, 2)].fg, Color::Blue, "the track keeps its look");
+    assert_ne!(
+        buffer[(10, 2)].fg,
+        crate::ACCENT,
+        "the track keeps its look"
+    );
 }
 
 #[component]
@@ -678,12 +682,13 @@ fn a_text_the_viewport_cuts_below_ends_in_no_ellipsis_inside_a_card() {
 fn StickySections() -> impl IntoElement {
     view().flex_1().child(
         virtual_list(10usize, |at| {
-            let label = match at.index() {
+            // Cells are reused, so read the index reactively.
+            text(move || match at.index() {
                 0 => "head A".to_owned(),
                 5 => "head B".to_owned(),
                 i => format!("row {i}"),
-            };
-            text(label).h(px(16.0))
+            })
+            .h(px(16.0))
         })
         .estimated_item_size(px(16.0))
         .w(px(80.0))

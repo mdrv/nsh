@@ -806,7 +806,9 @@ browsers' touches into what phones report:
   text, selectable views and hosted pages), as in native apps; it focuses the app's window in an iframe. A touch moves
   the focus as the browser does (a tap outside a field closes the keyboard), unless its press made the app focus a field
   (an editor's text): the mouse events the browser makes of the touch then leave the focus in the field (`mouseDown`,
-  `pressFocus`), so the keyboard stays open. The views under the newest
+  `pressFocus`), so the keyboard stays open. An `autoFocus` input takes the focus at the end of the batch that put it in
+  the page (`focusAppeared`), in the same turn, never from a timer: iOS Safari raises the keyboard only for a focus inside
+  the event's handler, and the focus is the press's (`pressFocus`) as a focus command's is. The views under the newest
   `Dialog` or alert are `inert`; the focus one took comes back when it closes.
 - **Accessibility**: `op_vp` sets ARIA from the accessibility props (roles mapped by `ARIA_ROLES`, `aria-disabled`,
   `-selected`, `-checked`, `-busy`, `-expanded`, `-value*`, `-live`, `-hidden`, the hint as `aria-description`);
@@ -1095,7 +1097,7 @@ scroll events postpone it, and the browser's `scrollend` cancels it.
   `{ type: "reply", id, ok, value?, error? }` (`EventPayload::Json`, `nsh_event`): `ok: false` with the error's message when the page has no host, `call` throws or
   its promise rejects, or the result is not JSON, since the app's call waits until it is answered; the app's call
   rejects with that message and `code` `ERR_NSH_HOST_ERROR` (`nsh_core::host_channel::host_error`). A page without a
-  host sets the environment's `host` to `false`, so the core rejects the calls first, with
+  host sets the environment's `host` to `false`, so the core rejects the calls it checked (name, then grant) with
   `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. A `host.post` without the native SDK channel (`browser/host.js`) goes to the
   platform module's `post` (`nsh-core` `runtime/host.rs`), which checks the name and grant in Rust and throws
   synchronously, then the core sends `Command::HostPost` (command `hostPost`) where the environment has a host;
@@ -1140,9 +1142,22 @@ before the props that name its tag: `retag` adds the old element's listeners to 
 browser's margins, fonts, colors, underlines and list markers off those tags, so the view looks as a `div` does. A
 link gets `href` and is not draggable; a plain click on it stays the app's (`Link`'s press; the root's `click`
 listener prevents the browser's navigation), a click with a modifier key or the middle button opens `href` as the
-browser does, and a context menu on it is the browser's (open in a new tab, copy the link) unless the link or a view
+browser does and starts no press (`pointerDown`: the link does not open it again, nor hear `onOpen` or `onPress`),
+and a context menu on it is the browser's (open in a new tab, copy the link) unless the link or a view
 in it listens for `onContextMenu` (`contextMenu`, where the runtime otherwise prevents the browser's menu). The other
 backends store `web_element` and draw nothing differently.
+
+**Links of text.** A link of a text (a nested `<Text>` taking presses, `AttributedText::links`) whose span has an
+`href` (`AttributedText::link_hrefs`: `TextView` gives each of its links its URL, as `Link` gives its view its `href`)
+is an `a` inside its run (`fillRun`, class `nsh-link`; the link record of the text item is `[node, events, href]`)
+when its address is one a browser opens from a page (`textLinkAddress`: `http:`, `https:`, `mailto:`, `tel:` and
+paths, under the site's base as a `Link`'s `href`, `linkHref`); an `#anchor` of the document and any other scheme (an
+app's own routes, `javascript:`) stay a span, pressed as before. The `a` keeps its run's shaping, bidi order, color
+and decoration (a rule of the runtime's stylesheet takes the browser's off `a.nsh-link`), is not draggable (a drag
+selects its characters) and keeps `tabindex="-1"`, as Tab passes the web's links of text. Its clicks are a `Link`'s
+(`LINK_SELECTOR`): a plain click presses the link through its text (`linkPress`), a click with a modifier key or the
+middle button is the browser's alone; its context menu is the browser's unless its text listens for `onContextMenu`.
+`text-browser.test.mjs` checks that the `a` sits where the span would.
 
 **The page's head.** `nsh/web` is a native module like the platform modules (`nsh_core::js::NATIVE_MODULES`): the
 QuickJS hosts serve `nsh-js`'s `web_page.rs` (`Head` renders nothing), the browser runtime its

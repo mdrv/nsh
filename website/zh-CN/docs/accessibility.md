@@ -12,6 +12,7 @@ NSH 用原生视图渲染，所以平台的辅助技术（iOS 和 Mac Catalyst �
 ## 无需任何操作就能得到的
 
 - **文本会被朗读。** 文本元素是一个无障碍元素，标签就是它的文字。没有标签的视图会朗读其内部的文字。
+- **文本里的链接和行内视图可以逐个到达。** 在 iOS 和 macOS 的 VoiceOver 下，文本中每个可按压的片段（嵌套的 `<Text onPress>`、Markdown 链接）各是一个链接，激活即按下它，用链接转子可在链接间跳转；文本里的每个行内视图各是一个元素，在句中它所在的位置被读到。在 iOS 上，给了标签、角色或自身带按压的文本仍是一个元素。
 - **可按压视图是元素。** 带按压或长按处理函数（`.on_press`、`onPress`）的视图默认是无障碍元素，激活它（在 VoiceOver 或 TalkBack 下双击）就会按下它。
 - **输入框是文本框**，带有占位文字、值和键盘。
 - **文字跟随用户的大小设置。** 见[文字大小](#文字大小)。
@@ -55,18 +56,18 @@ view()
 | `.accessibility_active_descendant(..)` | `accessibilityActiveDescendant` | `ViewRef \| null` | 获得焦点的元素里当前活动的那一项：组合框高亮的选项、列表的光标行。 |
 | `.accessibility_controls(..)` | `accessibilityControls` | `ViewRef \| null` | 内容由这个元素控制的元素：组合框的列表。 |
 | `.accessibility_described_by(..)` | `accessibilityDescribedBy` | `ViewRef \| null` | 文字用来说明这个元素的元素：输入框的错误提示行。 |
-| | `accessibilityActions` | `{ name, label? }[]` | 提供给辅助技术的操作。 |
+| `.accessibility_actions(..)` | `accessibilityActions` | `{ name, label? }[]` | 提供给辅助技术的操作。 |
 | `.on_accessibility_action(..)` | `onAccessibilityAction` | `(e: { actionName }) => void` | 执行了某个操作（Rust：操作名称）。 |
 | `.accessibility_elements_hidden(..)` | `accessibilityElementsHidden` | `boolean` | 对辅助技术隐藏该视图及其子树。 |
 | | `importantForAccessibility` | `"auto" \| "yes" \| "no" \| "no-hide-descendants"` | 视图（及其子树）是否暴露。 |
-| | `android={{ accessibilityLiveRegion }}` | `"none" \| "polite" \| "assertive"` | Android：视图的变化如何播报给 TalkBack。 |
+| `.accessibility_live_region(..)` | `accessibilityLiveRegion` | `"none" \| "polite" \| "assertive"` | 视图的变化如何自动播报：Android 上的 TalkBack、macOS 上的 VoiceOver、web 的 `aria-live`、Windows 上的实时区域。 |
 | `.test_id(..)` | `testID` | `string` | UI 测试用的标识（iOS 上的 accessibility identifier，Android 上的 resource id）；不会被朗读。 |
 
 给每个只有图标的控件加上标签：屏幕阅读器无法朗读一个符号或一张图片。标签保持简短，不要包含角色（写 "Play"，不要写 "Play button"）：角色会单独播报。
 
 ### 角色
 
-角色（`.role(AccessibilityRole::Header)`、`role="header"`）告诉用户这是哪一类元素、如何操作。在 Rust 中它是 `AccessibilityRole` 的一个变体（`Button`、`Header`、`Switch` 等）；TSX 的取值有 `"none"`、`"button"`、`"link"`、`"search"`、`"image"`、`"imagebutton"`、`"keyboardkey"`、`"text"`、`"adjustable"`、`"header"`、`"summary"`、`"alert"`、`"checkbox"`、`"combobox"`、`"menu"`、`"menubar"`、`"menuitem"`、`"progressbar"`、`"radio"`、`"radiogroup"`、`"scrollbar"`、`"spinbutton"`、`"switch"`、`"tab"`、`"tablist"`、`"timer"`、`"toolbar"`、`"list"`、`"grid"`、`"table"`、`"rowgroup"`、`"row"`、`"columnheader"`、`"cell"`（[`Table`](../elements/table.md) 各部件的角色），以及 `"listbox"` 和 `"option"`（一组可供选择的选项，例如 [`Select`](../elements/select.md) 弹出的列表，及其中的选项，选中的那项由 `accessibilityState.selected` 标出），`"group"`（一组相关的元素），`"region"`（值得单独到达的一块区域，例如折叠面板的内容），`"navigation"`（在应用内跳转的一组链接，例如分页），`"tree"` 和 `"treeitem"`（可展开、收起的节点，各在自己的 `accessibilityLevel`），`"menuitemcheckbox"` 和 `"menuitemradio"`（可勾选的菜单项，单独勾选或在一组中单选），`"dialog"` 和 `"alertdialog"`（位于应用其余内容之上、以 `accessibilityLabel` 命名的对话框，以及请用户确认某件事的对话框；[`Dialog`](../elements/dialog.md) 默认是 `"dialog"`，除非它的 `role` 另有指定）。
+角色（`.role(AccessibilityRole::Header)`、`role="header"`）告诉用户这是哪一类元素、如何操作。在 Rust 中它是 `AccessibilityRole` 的一个变体（`Button`、`Header`、`Switch` 等）；TSX 的取值有 `"none"`、`"button"`、`"link"`、`"search"`、`"textbox"`、`"image"`、`"imagebutton"`、`"keyboardkey"`、`"text"`、`"adjustable"`、`"header"`、`"summary"`、`"alert"`、`"checkbox"`、`"combobox"`、`"menu"`、`"menubar"`、`"menuitem"`、`"progressbar"`、`"radio"`、`"radiogroup"`、`"scrollbar"`、`"spinbutton"`、`"switch"`、`"tab"`、`"tablist"`、`"timer"`、`"toolbar"`、`"list"`、`"grid"`、`"table"`、`"rowgroup"`、`"row"`、`"columnheader"`、`"cell"`（[`Table`](../elements/table.md) 各部件的角色），以及 `"listbox"` 和 `"option"`（一组可供选择的选项，例如 [`Select`](../elements/select.md) 弹出的列表，及其中的选项，选中的那项由 `accessibilityState.selected` 标出），`"group"`（一组相关的元素），`"region"`（值得单独到达的一块区域，例如折叠面板的内容），`"navigation"`（在应用内跳转的一组链接，例如分页），`"tree"` 和 `"treeitem"`（可展开、收起的节点，各在自己的 `accessibilityLevel`），`"menuitemcheckbox"` 和 `"menuitemradio"`（可勾选的菜单项，单独勾选或在一组中单选），`"dialog"` 和 `"alertdialog"`（位于应用其余内容之上、以 `accessibilityLabel` 命名的对话框，以及请用户确认某件事的对话框；[`Dialog`](../elements/dialog.md) 默认是 `"dialog"`，除非它的 `role` 另有指定），`"tabpanel"`（标签列表中选中的标签页所显示的内容，标签页用 `accessibilityControls` 指向它；[`DockArea`](../elements/dock.md) 的每个组都是一个）。
 
 最常用的几个：
 
@@ -74,6 +75,7 @@ view()
 - `"header"` 用于分区标题：屏幕阅读器用户会在标题之间跳转来快速浏览页面。平台能读出级别时，`accessibilityLevel` 给出它的级别（1 为最高）。
 - `"button"` 配合 `accessibilityState.pressed` 用于切换按钮，即保持开或关的按钮（工具栏里的加粗）。
 - `"navigation"` 包住在页面之间跳转的链接，当前页的链接带 `accessibilityState.current: "page"`。
+- `"textbox"` 用于用户输入文本的输入框，当它是应用自己的视图而不是 [`Input`](../elements/input.md) 时（后者的原生输入框本身就有这个角色）。
 - `"switch"`、`"checkbox"`、`"radio"` 配合 `accessibilityState.checked`。
 - `"adjustable"` 用于滑块和步进器，配合 `accessibilityValue` 以及 `increment` / `decrement` 操作（[`Slider`](../elements/slider.md) 的每个滑块都是）。
 - `"spinbutton"` 用于存放一个数字、也能步进的输入框，配合同样的值和操作（[`NumberInput`](../elements/number-input.md) 的输入框）。
@@ -137,6 +139,8 @@ view()
 ```
 
 状态在 Rust 中是 `AccessibilityState { disabled, selected, checked: Option<Checked>, busy, expanded, pressed: Option<Checked>, current: Option<AccessibilityCurrent>, has_popup, invalid }`，在 TSX 中是 `{ disabled?, selected?, checked?: boolean | "mixed", busy?, expanded?, pressed?: boolean | "mixed", current?: boolean | "page" | "step" | "location" | "date" | "time", hasPopup?, invalid? }`。`pressed` 让按钮成为切换按钮（ARIA 的 `aria-pressed`）；`current` 标出一组中的当前项（ARIA 的 `aria-current`）：分页的当前页、向导的当前步骤；`hasPopup` 标出打开弹出层、菜单或列表的触发器（ARIA 的 `aria-haspopup`），它的 `expanded` 表示弹出层是否打开，没有 `hasPopup` 的 `expanded` 元素是就地展开内容的折叠项（`Popover`、`Menu`、`HoverCard`、`Select`、`Combobox` 和 `DatePicker` 会在各自的触发器上设置它）；`invalid` 标出没有通过应用校验的内容（ARIA 的 `aria-invalid`）：文字被拒绝的输入框、必选却留空的下拉选择。读屏随元素一起读出它，`aria-invalid:` 类可以为它设置样式。禁用视图（`.disabled(..)`、`disabled`）也意味着禁用状态。带 `min`、`max` 和 `now` 的 `accessibilityValue` 以百分比朗读；带 `text` 时按原文朗读（"3 of 10"、"Medium"）。
+
+在 iOS 和 Android 上，系统自己没有朗读词的状态（选中、部分选中、展开、收起、当前、无效）由 NSH 提供朗读词。它们使用应用文字显示的语言（[国际化](./i18n.md)），包括 `setLocale` 选择的语言，并随它改变：英文、中文（简体和繁体）、日文或韩文。其他平台用读屏自己的词朗读这些状态。
 
 ### 获得焦点的元素里的活动项
 
@@ -285,6 +289,32 @@ function Quantity() {
 </View>
 ```
 
+读取 signal 或[翻译](i18n.md)的标签会在已挂载的元素上跟着更新：应用切换语言时，操作换上新标签，元素本身、`onAccessibilityAction` 收到的名称和读屏焦点都保持不变。在 Rust 中给 `.accessibility_actions(..)` 传一个闭包：
+
+```rust tabs
+view()
+    .accessibility_actions(|| {
+        vec![AccessibilityActionDef {
+            name: "delete".into(),
+            label: Some(t!("mail.delete").into()),
+        }]
+    })
+    .on_accessibility_action(move |name: &str| {
+        if name == "delete" {
+            remove(id);
+        }
+    })
+```
+
+```tsx tabs
+<View
+  accessibilityActions={[{ name: "delete", label: t("mail.delete") }]}
+  onAccessibilityAction={() => remove(mail.id)}
+>
+  …
+</View>
+```
+
 ## 分组与隐藏
 
 让视图成为无障碍元素（`.accessible(true)`、`accessible`）会让一个视图成为一个整体元素：带标题、副标题和价格的卡片会一次读完，而不需要用户在三段文字之间来回轻扫。
@@ -377,9 +407,9 @@ function Upload() {
 }
 ```
 
-播报那些用户否则会错过的变化：后台保存完成、在焦点之外出现的错误、计时结束。在 Android 上，给视图设置 `android={{ accessibilityLiveRegion: "polite" }}`，TalkBack 就会自动播报它的变化。
+播报那些用户否则会错过的变化：后台保存完成、在焦点之外出现的错误、计时结束。给视图设置 `accessibilityLiveRegion: "polite"`，屏幕阅读器就会自动播报它的变化——Android 上的 TalkBack、macOS 上的 VoiceOver、web 上的 `aria-live`、Windows 上的实时区域（`"assertive"` 不等用户空闲，立即朗读）。
 
-在 macOS 和 Web 上，警告（`.role(AccessibilityRole::Alert)`、`role="alert"`）会自己被读出：出现时、以及内容变化时，读它的标签，没有标签就读其中的文字，并打断屏幕阅读器正在读的内容。带这个角色显示的错误在这两个平台上不必再自己播报；在 macOS 上，同一次更新里播报的相同文字只读一次。在其他平台上，仍要自己播报。
+在 macOS 和 Web 上，警告（`.role(AccessibilityRole::Alert)`、`role="alert"`）会自己被读出：出现时、以及内容变化时，读它的标签，没有标签就读其中的文字，并打断屏幕阅读器正在读的内容。带这个角色显示的错误在这两个平台上不必再自己播报；在 macOS 上，同一次更新里播报的相同文字只读一次，同一次更新里拿掉又以相同文字重建的警告（移到另一个父节点下）也不会再读。在其他平台上，仍要自己播报。
 
 ## 文字大小
 

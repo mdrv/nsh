@@ -15,13 +15,14 @@ See [MDRV.md](MDRV.md) for the full log. Highlights:
 
 - Wayland layer-shell overlay windows (compositor-anchored toasts/popups/
   HUD), verified on Hyprland.
-- Rust apps declare capabilities in `nsh.json`, and can take global
-  shortcuts (`desktop_el::global_shortcut`).
-- `nsh.json "baseParts"` — a Rust app lists the parts of `nsh/base` it
-  serves; everything unregistered (and its dependencies: syntect, ropey,
-  vte) drops out of every generated runtime at link time. The packaged
-  web main module of a game-shaped app: 10.78 MB → 5.15 MB (1.33 MB
-  brotli), app unchanged.
+- `onPanMove` — the continuous drag stream between `onPanStart` and
+  `onPanEnd`, targetting the pan's view wherever the pointer goes (a
+  Blender-style orbit keeps updating past the viewport's edge).
+- An `<Image>` whose `src` changes keeps its previous picture on screen
+  until the new one loads, instead of flashing the placeholder.
+
+Upstream has absorbed the fork's earlier capabilities, `baseParts`,
+global-shortcut and dev-profile patches.
 
 ## Using it (if you insist)
 

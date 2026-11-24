@@ -40,6 +40,7 @@ mod web;
 mod windows;
 
 use std::{
+    net::Ipv4Addr,
     path::PathBuf,
     process::ExitCode,
     sync::{Arc, OnceLock, RwLock},
@@ -128,7 +129,7 @@ enum Command {
     /// (`nsh.json` `"root"`): build its crates and gather the files they ship.
     Build {
         /// The entry module, or the app's directory (default: the current one),
-        /// whose `App.tsx` is the entry.
+        /// whose `nsh.json` `"entry"` is the entry (default: its `App.tsx`).
         #[arg(default_value = ".")]
         entry: PathBuf,
         /// Output directory.
@@ -160,6 +161,12 @@ enum Command {
         /// too).
         #[arg(long)]
         filter: Option<String>,
+        /// Build and run in release mode: minify and strip debug info from the
+        /// app bundles under test, run the crates' Rust tests with
+        /// `cargo test --release`, and build an app with Rust crates' headless
+        /// runner and development hosts optimized (`--release`).
+        #[arg(long)]
+        release: bool,
         /// Print every mount batch of the apps the tests open, under the
         /// step it came in, and the time of every commit.
         #[arg(long)]
@@ -174,6 +181,12 @@ enum Command {
         /// format CI services read.
         #[arg(long, value_name = "FILE")]
         junit: Option<PathBuf>,
+        /// How many test files run at once, each on its own engine (by
+        /// default as many as the machine has cores). Their results show
+        /// file by file, in order. Headless runs only: with --target or
+        /// --trace the files run one at a time.
+        #[arg(long, short = 'j', value_name = "N")]
+        jobs: Option<std::num::NonZeroUsize>,
         /// Run the apps the tests open on this platform's development host
         /// instead of headless: the steps act with the platform's own input
         /// (macos, linux, windows, gpui, tui, web, ios and android; tui uses
@@ -221,7 +234,7 @@ enum Command {
     /// Rust app (`"root"`) without a `tsconfig.json` only that.
     Check {
         /// The entry module, or the app's directory (default: the current one),
-        /// whose `App.tsx` is the entry.
+        /// whose `nsh.json` `"entry"` is the entry (default: its `App.tsx`).
         #[arg(default_value = ".")]
         entry: PathBuf,
         /// The `tsc` to run instead of the pinned TypeScript 7.
@@ -234,7 +247,7 @@ enum Command {
     /// Run an app in this system’s native host with hot reload.
     Dev {
         /// The entry module, or the app's directory (default: the current one),
-        /// whose `App.tsx` is the entry.
+        /// whose `nsh.json` `"entry"` is the entry (default: its `App.tsx`).
         #[arg(default_value = ".")]
         entry: PathBuf,
         /// Dev server port (replaces the previous NSH development session on
@@ -242,6 +255,10 @@ enum Command {
         /// from 8790; with --server-only, 8790.
         #[arg(long)]
         port: Option<u16>,
+        /// IPv4 address to bind. Defaults to all interfaces for --server-only
+        /// and network targets, or loopback for local targets.
+        #[arg(long)]
+        host: Option<Ipv4Addr>,
         /// Minify and strip debug info.
         #[arg(long)]
         release: bool,
@@ -274,7 +291,7 @@ enum Command {
     /// hosts, Mac Catalyst, GPUI, a terminal or a browser with --target.
     Run {
         /// The entry module, or the app's directory (default: the current one),
-        /// whose `App.tsx` is the entry.
+        /// whose `nsh.json` `"entry"` is the entry (default: its `App.tsx`).
         #[arg(default_value = ".")]
         entry: PathBuf,
         /// Dev server port (replaces the previous NSH development session on
@@ -330,6 +347,13 @@ enum Command {
         /// main one when there is no such display (`--target macos` only).
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         display: Option<u32>,
+        /// With `--target macos`, `linux`, `windows` or `gpui`: the app
+        /// never becomes the active app, as `nsh test` runs its apps. Its
+        /// window shows (behind the active app's), the keyboard stays with
+        /// the app in use, and input sent to its windows still reaches it
+        /// (TSX entries).
+        #[arg(long)]
+        background: bool,
     },
     /// Create a signing key: `<name>.secret` (keep it offline for a root)
     /// and `<name>.pub` (what apps trust, for a root).
@@ -425,6 +449,11 @@ enum Command {
         /// Where iOS or Android users get it: `ios=<url>`, `android=<url>` (repeatable).
         #[arg(long = "link")]
         links: Vec<String>,
+        /// The previous release's archive of a platform (repeatable):
+        /// writes a patch from it beside the manifest, which apps running
+        /// that version download instead of the whole archive.
+        #[arg(long)]
+        previous: Vec<PathBuf>,
         /// Prefix of the archives' URLs (default: next to the manifest).
         #[arg(long)]
         base_url: Option<String>,
@@ -462,7 +491,8 @@ enum Command {
         #[command(subcommand)]
         store: Option<PublishStore>,
         /// The entry module, the app's directory (default: the current one),
-        /// whose `App.tsx` is the entry, or a package (`.nshpkg`) to sign again.
+        /// whose `nsh.json` `"entry"` is the entry (default: its `App.tsx`),
+        /// or a package (`.nshpkg`) to sign again.
         #[arg(default_value = ".")]
         entry: PathBuf,
         /// The release key's secret key (`.secret`).
@@ -576,7 +606,7 @@ enum PublishStore {
 #[derive(Args, Clone)]
 struct PackageArgs {
     /// The entry module, or the app's directory (default: the current one),
-    /// whose `App.tsx` is the entry.
+    /// whose `nsh.json` `"entry"` is the entry (default: its `App.tsx`).
     #[arg(default_value = ".")]
     entry: PathBuf,
     /// What to build for.
@@ -600,7 +630,8 @@ struct PackageArgs {
     /// App icon: a square PNG, ideally 1024×1024.
     #[arg(long)]
     icon: Option<PathBuf>,
-    /// Code signing identity for devices, e.g. "Apple Development: …".
+    /// Code signing identity for iOS devices or macOS packages, e.g.
+    /// "Apple Development: …" or "Developer ID Application: …".
     #[arg(long)]
     sign: Option<String>,
     /// Provisioning profile for devices (`.mobileprovision`). Repeat it to
@@ -852,6 +883,16 @@ fn run(mut command: Command) -> anyhow::Result<()> {
     if let Some(entry) = command.entry_mut() {
         package::check_nsh_version(entry)?;
     }
+    // `nsh check` runs no bundle, host or runner, so nothing else it does
+    // reads the manifest: what the other commands warn of as they read it
+    // (`read_config`), it says before the type check calls the app fine.
+    // A Rust app's manifest is its describing's (`root_config`), which
+    // refuses what it does not know.
+    if let Command::Check { entry, .. } = &command
+        && !rust_app::is_root(entry)
+    {
+        package::read_config(entry)?;
+    }
     if let Some(entry) = command.entry_mut()
         && rust_app::is_root(entry)
         && !rust_command
@@ -971,9 +1012,11 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             path,
             entry,
             filter,
+            release,
             trace,
             fps,
             junit,
+            jobs,
             target,
             browser,
             web_host,
@@ -984,9 +1027,11 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             &path,
             &entry,
             filter,
+            release,
             trace,
             fps,
             junit.as_deref(),
+            jobs,
             target,
             browser.as_deref(),
             web_host,
@@ -997,6 +1042,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Dev {
             entry,
             port,
+            host,
             release,
             limits,
             target,
@@ -1007,10 +1053,13 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             // `--server-only` serves hosts started elsewhere, on other
             // machines too; a host `nsh dev` starts is on the network only
             // as `nsh run` starts it.
-            let listen = dev::Listen {
-                port: port.unwrap_or_default(),
-                network: server_only || target.uses_network(),
-            };
+            let mut listen = dev::Listen::new(
+                port.unwrap_or_default(),
+                server_only || target.uses_network(),
+            );
+            if let Some(host) = host {
+                listen.host = host;
+            }
             if server_only {
                 let session = dev::DevSession::start(&entry, listen, release, limits)?;
                 session.print_urls();
@@ -1095,15 +1144,13 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             name,
             size,
             display,
+            background,
             points_per_cell,
         } => {
             no_limits_for_rust(&entry, limits)?;
             run::run(
                 &entry,
-                dev::Listen {
-                    port: port.unwrap_or_default(),
-                    network: target.uses_network(),
-                },
+                dev::Listen::new(port.unwrap_or_default(), target.uses_network()),
                 release,
                 run::HostFlags {
                     limits,
@@ -1117,6 +1164,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
                     name: name.as_deref(),
                     size: size.as_deref(),
                     display: display.map(|n| n as usize),
+                    background,
                 },
             )
         }
@@ -1147,6 +1195,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             key,
             notes,
             links,
+            previous,
             base_url,
             out,
         } => updater::manifest(updater::ManifestOptions {
@@ -1156,6 +1205,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             key: key.as_deref(),
             notes: &notes,
             links: &links,
+            previous: &previous,
             base_url: base_url.as_deref(),
             out: &out,
         }),
@@ -1216,6 +1266,8 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod command_tests {
+    use std::net::Ipv4Addr;
+
     use clap::Parser as _;
 
     use super::{Cli, Command, run::Target};
@@ -1398,6 +1450,22 @@ mod command_tests {
         for value in ["x86-64", "i386", "x86_64-apple-darwin"] {
             assert!(arch(&["--arch", value]).is_err(), "{value}");
         }
+        let cli = Cli::try_parse_from([
+            "nsh",
+            "package",
+            "--target",
+            "macos",
+            "--sign",
+            "Developer ID Application: Example Inc (ABCDE12345)",
+        ])
+        .unwrap();
+        let Command::Package(args) = cli.command else {
+            panic!("expected nsh package");
+        };
+        assert_eq!(
+            args.sign.as_deref(),
+            Some("Developer ID Application: Example Inc (ABCDE12345)")
+        );
     }
 
     #[test]
@@ -1441,6 +1509,19 @@ mod command_tests {
     }
 
     #[test]
+    fn dev_accepts_an_explicit_bind_address() {
+        let cli =
+            Cli::try_parse_from(["nsh", "dev", "--server-only", "--host", "127.0.0.1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Dev {
+                host: Some(Ipv4Addr::LOCALHOST),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn dev_can_serve_hosts_started_separately() {
         let cli = Cli::try_parse_from(["nsh", "dev", "--server-only"]).unwrap();
         assert!(matches!(
@@ -1451,5 +1532,36 @@ mod command_tests {
             }
         ));
         assert!(Cli::try_parse_from(["nsh", "dev", "--server-only", "--target", "ios"]).is_err());
+    }
+
+    #[test]
+    fn test_accepts_release_flag() {
+        let default = Cli::try_parse_from(["nsh", "test"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Command::Test { release: false, .. }
+        ));
+        let release = Cli::try_parse_from(["nsh", "test", "--release"]).unwrap();
+        assert!(matches!(
+            release.command,
+            Command::Test { release: true, .. }
+        ));
+        let targeted = Cli::try_parse_from([
+            "nsh",
+            "test",
+            "App.test.tsx",
+            "--release",
+            "--target",
+            "windows",
+        ])
+        .unwrap();
+        assert!(matches!(
+            targeted.command,
+            Command::Test {
+                release: true,
+                target: Some(Target::Windows),
+                ..
+            }
+        ));
     }
 }

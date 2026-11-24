@@ -138,7 +138,10 @@ final class SystemUi {
         }
         b.setOnDismissListener(d -> {
             if (TestAgent.shownDialog == d) TestAgent.shownDialog = null;
-            if (mounter.dialogs.get(dialogId) == d) mounter.dialogs.remove(dialogId);
+            if (mounter.dialogs.get(dialogId) == d) {
+                mounter.dialogs.remove(dialogId);
+                mounter.dialogMoves.remove(dialogId);
+            }
             if (!answered[0]) {
                 answered[0] = true;
                 answer(mounter, dialogId, -1, field);
@@ -153,6 +156,18 @@ final class SystemUi {
         shown.show();
         TestAgent.shownDialog = shown;
         mounter.dialogs.put(dialogId, shown);
+        // Its window is the activity's: going for a configuration change, the activity takes it off, unanswered, and
+        // the one made again shows it again, with what was typed in it.
+        mounter.dialogMoves.put(dialogId, () -> {
+            String typed = field != null ? field.getText().toString() : input;
+            answered[0] = true;
+            mounter.dialogs.remove(dialogId);
+            mounter.dialogMoves.remove(dialogId);
+            shown.dismiss();
+            boolean reselect = selectAll && java.util.Objects.equals(typed, input);
+            return () -> dialog(mounter, dialogId, title, message, cancelable, sheet, texts, styles, typed, placeholder,
+                    reselect, required);
+        });
         if (surface != 0 && shown.getWindow() != null) {
             // The theme's shape (corners, insets), filled with the app's color.
             Drawable background = shown.getWindow().getDecorView().getBackground();
@@ -179,7 +194,10 @@ final class SystemUi {
         android.content.Context context = b.getContext();
         android.widget.EditText field = new android.widget.EditText(context);
         field.setSingleLine(true);
-        field.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE);
+        // Not full screen in landscape: the alert stays in sight, as the app's inputs do (InputBox).
+        field.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+                | android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                | android.view.inputmethod.EditorInfo.IME_FLAG_NO_FULLSCREEN);
         field.setText(input);
         if (placeholder != null) field.setHint(placeholder);
         if (textColor != 0) field.setTextColor(textColor);
@@ -258,6 +276,7 @@ final class SystemUi {
         AlertDialog shown = mounter.dialogs.get(dialogId);
         if (shown == null) return;
         mounter.dialogs.remove(dialogId);
+        mounter.dialogMoves.remove(dialogId);
         shown.dismiss();
     }
 
@@ -287,6 +306,26 @@ final class SystemUi {
     static boolean openUrl(Context context, String url) {
         android.content.Intent intent = new android.content.Intent(
                 android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url));
+        Activity activity = activity(context);
+        if (activity == null) intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            (activity != null ? activity : context).startActivity(intent);
+            return true;
+        } catch (android.content.ActivityNotFoundException | SecurityException e) {
+            return false;
+        }
+    }
+
+    /**
+     * {@code AppSettings.open}: opens the app's page in the system's settings (App info,
+     * {@code Settings.ACTION_APPLICATION_DETAILS_SETTINGS} for {@code package:<the app's package>}), where the user
+     * turns back on a permission they denied. From the view's activity, as {@link #openUrl} opens a URL (a new task
+     * from any other context, as the system needs). Whether the system opened it.
+     */
+    static boolean openAppSettings(Context context) {
+        android.content.Intent intent = new android.content.Intent(
+                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                android.net.Uri.fromParts("package", context.getPackageName(), null));
         Activity activity = activity(context);
         if (activity == null) intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
         try {

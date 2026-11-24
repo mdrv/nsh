@@ -45,7 +45,6 @@ mod menus;
 mod net;
 mod pointer;
 mod selection;
-mod speech;
 mod windows;
 
 pub use audio::AudioCall;
@@ -55,8 +54,8 @@ mod stub;
 use std::{
     io::Write,
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -116,6 +115,8 @@ struct ChannelSink {
     /// On a manual clock: the engine asked for a frame, which the driver
     /// gives it when it moves the clock ([`Headless`]).
     wanted: Option<Arc<AtomicBool>>,
+    /// On the system's clock: frames asked for and not yet given.
+    frames: Arc<AtomicUsize>,
 }
 
 impl MountSink for ChannelSink {
@@ -133,11 +134,14 @@ impl MountSink for ChannelSink {
             return;
         }
         let control = self.control.clone();
+        let frames = self.frames.clone();
+        frames.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
             std::thread::sleep(FRAME);
             if let Some(control) = control.get() {
                 control.frame();
             }
+            frames.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
@@ -158,6 +162,8 @@ struct Launched {
     errors: Receiver<AppError>,
     /// On a manual clock: it asked for a frame.
     wanted: Option<Arc<AtomicBool>>,
+    /// On the system's clock: frames asked for and not yet given.
+    frames: Arc<AtomicUsize>,
 }
 
 /// Reports `url` as a link the system handed the app.
@@ -207,11 +213,13 @@ where
     let (errors, errors_rx) = crossbeam_channel::unbounded();
     let control = Arc::new(OnceLock::new());
     let wanted = config.clock.is_manual().then(Arc::default);
+    let frames = Arc::new(AtomicUsize::new(0));
     let sink = ChannelSink {
         batches,
         errors,
         control: control.clone(),
         wanted: wanted.clone(),
+        frames: frames.clone(),
     };
     let engine = Engine::start_with(config, text_engine, sink, |control| {
         // Steps reach every view of a page, below its fold too.
@@ -229,6 +237,7 @@ where
         batches: batches_rx,
         errors: errors_rx,
         wanted,
+        frames,
     })
 }
 
@@ -337,6 +346,14 @@ const CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// not loaded: no `onLoad` comes, nor an error unless the test fails the
 /// image ([`Headless::fail_images`]), and `Image.getSize` /
 /// `Image.prefetch` fail.
+///
+/// The native modules of the app's sets answer with their fakes
+/// ([`nsh_core::fake`]), which may stand in process-wide: an app whose sets
+/// give fakes waits to start until the apps running with other fakes are
+/// dropped, so two such apps never overlap in one process (two `#[test]`s
+/// that each launch theirs take turns). Apps started with the same fakes,
+/// clones of one registry, run together and share them. A thread holding an
+/// app with fakes must not start one with others: it would wait for itself.
 pub struct Headless {
     engine: Engine,
     batches: Receiver<MountBatch>,
@@ -379,9 +396,9 @@ pub struct Headless {
     failing_images: Vec<stub::Url>,
     /// The URLs that fail to open ([`Headless::fail_open_urls`]).
     failing_url_opens: Vec<stub::Url>,
-    /// The recognizer the test speaks into; `None` when the config gave
-    /// its own (`EngineConfig::speech`).
-    speech: Option<speech::FakeSpeech>,
+    /// The stand-ins the app's sets give headless runs, by name, installed
+    /// when the app started ([`Headless::call_fake`]).
+    fakes: Vec<(&'static str, Arc<dyn nsh_core::fake::Fake>)>,
     /// The speaker the app plays to; `None` when the config gave its own
     /// (`EngineConfig::audio`).
     audio: Option<audio::FakeAudio>,
@@ -398,6 +415,12 @@ pub struct Headless {
     clock: Clock,
     /// On a manual clock: the engine asked for a frame.
     wanted: Option<Arc<AtomicBool>>,
+    /// On the system's clock: frames the engine asked for, not yet given.
+    frames: Arc<AtomicUsize>,
+    /// The app's `nsh/host` calls handed to the test so far: their answer
+    /// comes from elsewhere, so a step that made one waits for the batches
+    /// to stop, as for a request in flight.
+    host_calls_sent: u64,
     /// The embedding app's channel with the app (`EngineConfig::host`),
     /// which the test plays.
     host: nsh_engine::HostChannel,
@@ -415,6 +438,79 @@ pub struct Headless {
     /// The page's history, for an app started at a page's address
     /// ([`Headless::start_at_page`]).
     history: Option<browser::History>,
+    /// The app's turn to have its fakes installed, while its sets give
+    /// any; last, so it ends after the engine stopped.
+    _fakes_turn: Option<FakesTurn>,
+}
+
+/// The fakes installed for the headless apps running in the process, and
+/// how many apps run with them; `None` while none does.
+struct FakesInUse {
+    fakes: Vec<Arc<dyn nsh_core::fake::Fake>>,
+    apps: usize,
+}
+
+static FAKES_IN_USE: Mutex<Option<FakesInUse>> = Mutex::new(None);
+/// Signalled when the last app with the fakes in use is gone.
+static FAKES_FREED: Condvar = Condvar::new();
+
+/// A headless app's turn to have `fakes` installed
+/// ([`Headless`]): taken before they install, given back when the app is
+/// dropped.
+struct FakesTurn;
+
+impl FakesTurn {
+    /// Waits until no app runs with other fakes than `fakes` (the same
+    /// instances, in the same order), then counts the app among those
+    /// running with them; `true` with it when no app ran with them, so
+    /// they are installed now (an app joining others shares their state).
+    /// `None` for no fakes: such an app needs no turn.
+    fn take(fakes: &[(&'static str, Arc<dyn nsh_core::fake::Fake>)]) -> Option<(FakesTurn, bool)> {
+        if fakes.is_empty() {
+            return None;
+        }
+        let same = |in_use: &FakesInUse| {
+            in_use.fakes.len() == fakes.len()
+                && in_use
+                    .fakes
+                    .iter()
+                    .zip(fakes)
+                    .all(|(a, (_, b))| Arc::ptr_eq(a, b))
+        };
+        let mut state = FAKES_IN_USE.lock().unwrap_or_else(|e| e.into_inner());
+        let first = loop {
+            match &mut *state {
+                None => {
+                    *state = Some(FakesInUse {
+                        fakes: fakes.iter().map(|(_, fake)| fake.clone()).collect(),
+                        apps: 1,
+                    });
+                    break true;
+                }
+                Some(in_use) if same(in_use) => {
+                    in_use.apps += 1;
+                    break false;
+                }
+                Some(_) => {
+                    state = FAKES_FREED.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        };
+        Some((FakesTurn, first))
+    }
+}
+
+impl Drop for FakesTurn {
+    fn drop(&mut self) {
+        let mut state = FAKES_IN_USE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(in_use) = &mut *state {
+            in_use.apps -= 1;
+            if in_use.apps == 0 {
+                *state = None;
+                FAKES_FREED.notify_all();
+            }
+        }
+    }
 }
 
 impl Headless {
@@ -453,10 +549,30 @@ impl Headless {
         M: TextEngine + 'static,
         F: FnOnce() -> M + Send + 'static,
     {
-        let speech = config.speech.is_none().then(speech::FakeSpeech::default);
-        if let Some(speech) = &speech {
-            config.speech = Some(Arc::new(speech.clone()));
+        // Before the app runs: its modules answer with their fakes, never
+        // with the machine's devices (a microphone), once no app runs with
+        // other fakes (they may stand in process-wide).
+        let fakes: Vec<_> = config
+            .ui_sets
+            .iter()
+            .flat_map(nsh_core::element::Registry::fakes)
+            .collect();
+        for (n, (name, _)) in fakes.iter().enumerate() {
+            assert!(
+                fakes[..n].iter().all(|(other, _)| other != name),
+                "two fakes are named `{name}`, by two UI sets"
+            );
         }
+        // Installed by the first app with them: one joining an app that runs
+        // shares their state (its sessions), which a reset would take away.
+        let fakes_turn = FakesTurn::take(&fakes).map(|(turn, first)| {
+            if first {
+                for (_, fake) in &fakes {
+                    fake.install();
+                }
+            }
+            turn
+        });
         let audio = config.audio.is_none().then(audio::FakeAudio::default);
         if let Some(audio) = &audio {
             config.audio = Some(Arc::new(audio.clone()));
@@ -492,6 +608,7 @@ impl Headless {
             batches,
             errors,
             wanted,
+            frames,
         } = launch(config, displays, text_engine, link)?;
         let mut screen = Screen::default();
         screen.set_viewport(viewport);
@@ -522,7 +639,7 @@ impl Headless {
             save_path: None,
             failing_images: Vec::new(),
             failing_url_opens: Vec::new(),
-            speech,
+            fakes,
             audio,
             step: "open".to_owned(),
             applied: 0,
@@ -532,6 +649,8 @@ impl Headless {
             observer: None,
             clock,
             wanted,
+            frames,
+            host_calls_sent: 0,
             host,
             last_press: None,
             #[cfg(feature = "js")]
@@ -540,6 +659,7 @@ impl Headless {
             host_posts: None,
             windows,
             history: None,
+            _fakes_turn: fakes_turn,
         })
     }
 
@@ -606,15 +726,21 @@ impl Headless {
     /// sent ([`EngineControl::flush`]): whether it is idle, nothing left to
     /// run and no request in flight. False if it took until `deadline`.
     fn flush(&self, deadline: Instant) -> bool {
+        self.flush_until_due(deadline).0
+    }
+
+    /// [`Headless::flush`], also with when the engine's next timer is due
+    /// ([`EngineControl::flush_until_due`]).
+    fn flush_until_due(&self, deadline: Instant) -> (bool, Option<Instant>) {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        self.engine.control().flush(move |idle| {
-            let _ = tx.send(idle);
+        self.engine.control().flush_until_due(move |idle, due| {
+            let _ = tx.send((idle, due));
         });
         match rx.recv_deadline(deadline) {
-            Ok(idle) => idle,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
+            Ok(answer) => answer,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => (false, None),
             // A gone engine sends nothing more.
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => (true, None),
         }
     }
 
@@ -976,36 +1102,30 @@ impl Headless {
         Ok(())
     }
 
-    /// What the app's speech recognition sessions (`Speech.start`) asked
-    /// for so far, in order. Headless apps recognize speech: a session
-    /// listens at once (its `start`), and the test speaks for the user
-    /// ([`Headless::hear`]).
-    pub fn speech_requests(&self) -> Vec<nsh_core::speech::SpeechRequest> {
-        self.speech
-            .as_ref()
-            .map(speech::FakeSpeech::requests)
-            .unwrap_or_default()
-    }
-
-    /// The user says `text` (the whole transcript so far) to the session
-    /// listening, which reports it as a result that is not final; then
-    /// waits until the app is quiet. Fails when no session listens.
-    pub fn hear(&mut self, text: &str) -> Result<(), String> {
-        self.fake_speech()?.hear(text)?;
-        self.done()
-    }
-
-    /// Ends the session listening: with `error` (`no-speech`,
-    /// `not-allowed`, ...), or (`None`) as when the user stops talking: the
-    /// transcript as the final result, then the end (`no-speech` when
-    /// nothing was heard). Then waits until the app is quiet. The app's
-    /// `stop()` ends it the same way.
-    pub fn end_speech(
+    /// Calls `method` of the fake named `name` with `args` (JSON): a
+    /// stand-in a native module of the app's sets gives headless runs in
+    /// place of a device ([`nsh_core::fake`]; `"nsh-extra/speech"`'s
+    /// `hear` speaks for the user). Its answer, once the app is quiet
+    /// after it. Fails when no set gives that fake (the app does not turn
+    /// the module on) or the fake refuses the call.
+    pub fn call_fake(
         &mut self,
-        error: Option<nsh_core::speech::SpeechError>,
-    ) -> Result<(), String> {
-        self.fake_speech()?.end(error)?;
-        self.done()
+        name: &str,
+        method: &str,
+        args: &[nsh_core::JsonValue],
+    ) -> Result<nsh_core::JsonValue, String> {
+        self.catch_up();
+        let fake = self
+            .fakes
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, fake)| fake.clone())
+            .ok_or_else(|| {
+                format!("no module of the app gives the fake {name:?}: is the module turned on?")
+            })?;
+        let answer = fake.call(method, args)?;
+        self.done()?;
+        Ok(answer)
     }
 
     /// What the app asked of the speaker so far (`Sound`, `AudioPlayer`),
@@ -1027,12 +1147,6 @@ impl Headless {
             .ok_or_else(|| "the app plays sound with EngineConfig::audio".to_owned())?
             .end()?;
         self.done()
-    }
-
-    fn fake_speech(&self) -> Result<speech::FakeSpeech, String> {
-        self.speech
-            .clone()
-            .ok_or_else(|| "the app recognizes speech with EngineConfig::speech".to_owned())
     }
 
     /// Sends the app's `nsh/host` calls (the root's `Command::HostCall`) to
@@ -1153,6 +1267,7 @@ impl Headless {
                     command: Command::HostCall { id, name, args },
                 } = item
                 {
+                    self.host_calls_sent += 1;
                     calls(*id, name, args);
                 }
             }
@@ -1390,6 +1505,7 @@ impl Headless {
 
     /// Applies the batches that came, without waiting.
     fn drain(&mut self) -> bool {
+        self.tick_held_press();
         let mut applied = false;
         while let Ok(batch) = self.batches.try_recv() {
             self.apply(&batch);
@@ -1405,6 +1521,7 @@ impl Headless {
     /// the next check.
     fn pump(&mut self, deadline: Instant) -> Pumped {
         loop {
+            self.tick_held_press();
             if self.exited {
                 return Pumped::Exited;
             }
@@ -1418,6 +1535,12 @@ impl Headless {
                 _ if framed => Instant::now(),
                 Some(frame) if !self.clock.is_manual() => frame.min(deadline),
                 _ => deadline,
+            };
+            let wake = if !self.clock.is_manual() {
+                self.held_press_timeout()
+                    .map_or(wake, |after| wake.min(Instant::now() + after))
+            } else {
+                wake
             };
             let timeout = wake.saturating_duration_since(Instant::now());
             crossbeam_channel::select_biased! {
@@ -1512,12 +1635,18 @@ impl Headless {
                 continue;
             }
             let applied = self.applied;
+            let answered = self.host.calls_answered();
             let idle = self.flush(end);
             self.drain();
             if self.applied != applied || self.wants_frames() || !self.errors.is_empty() {
                 continue;
             }
-            if idle {
+            if idle && self.host.calls_in_flight() == 0 {
+                // An answer that came after the engine said it was idle
+                // waits on its queue: the next flush runs it.
+                if self.host.calls_answered() != answered {
+                    continue;
+                }
                 return true;
             }
             // What comes from elsewhere comes in real time.
@@ -1532,35 +1661,85 @@ impl Headless {
 
     /// Applies batches until the app is done with a step, or for 2 s at
     /// most (an app updating all the time never is): false if the limit
-    /// ended it. On the system's clock it is done once the engine has
-    /// handled what the step sent ([`Headless::caught_up`]) and then no
-    /// batch came for 100 ms and no native animation that ends by itself
-    /// runs; on a manual clock, as soon as the engine says it is idle
-    /// ([`EngineControl::flush`]), without waiting.
+    /// ended it. Either clock asks the engine whether it is idle
+    /// ([`EngineControl::flush`]) instead of waiting for the batches to
+    /// stop; on the system's clock a timer due within 100 ms, a pending
+    /// frame or a native animation that ends by itself is waited for
+    /// ([`Headless::idle_on_system_clock`]).
     pub fn settle(&mut self) -> bool {
         if self.clock.is_manual() {
             self.idle_on_manual_clock(SETTLE)
         } else {
-            let end = Instant::now() + SETTLE;
-            self.caught_up(end);
-            self.quiet(QUIET, end.saturating_duration_since(Instant::now()))
+            self.idle_on_system_clock(SETTLE)
         }
     }
 
-    /// On the system's clock: has the engine run what was sent to it
-    /// ([`EngineControl::flush`]) and applies the batches that brought,
-    /// again while they bring more (what applying them sends back: a
-    /// scroll reported, a focus moved), until `end` at most. The quiet
-    /// that ends a step is then counted from there, so an engine taking
-    /// longer than [`QUIET`] over a step does not end it early, with the
-    /// next step acting on the screen as it was before.
-    fn caught_up(&mut self, end: Instant) {
-        while !self.exited && self.errors.is_empty() && Instant::now() < end {
+    /// On the system's clock: applies batches until the app is done with a
+    /// step, or for `limit` at most: false if the limit ended it. Done is
+    /// asked, as on a manual clock, and means what waiting [`QUIET`] for no
+    /// batch meant: the engine ran everything sent to it and its batches
+    /// were applied, no frame it asked for is pending, no native animation
+    /// that ends by itself runs, and nothing it runs by itself (a timer)
+    /// comes due within [`QUIET`]. Something due sooner is waited for, until
+    /// no batch came for [`QUIET`] as before. A
+    /// request in flight, whose answer comes from elsewhere, is waited for
+    /// by the batches stopping for [`QUIET`], as before.
+    fn idle_on_system_clock(&mut self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        let mut last = Instant::now();
+        let host_calls = self.host_calls_sent;
+        loop {
+            if self.exited || !self.errors.is_empty() {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
             let applied = self.applied;
-            self.flush(end);
+            let answered = self.host.calls_answered();
+            let (idle, due) = self.flush_until_due(end);
             self.drain();
-            if self.applied == applied {
-                return;
+            if self.applied != applied || !self.errors.is_empty() {
+                last = Instant::now();
+                continue;
+            }
+            let framing = self.frames.load(Ordering::SeqCst) > 0 || self.animator.finishing();
+            if !idle || self.host_calls_sent != host_calls {
+                return self.quiet(QUIET, end.saturating_duration_since(Instant::now()));
+            }
+            // A call a handler (the test's) has not answered yet: its answer
+            // comes from another thread, in real time.
+            if self.host.calls_in_flight() > 0 {
+                match self.pump((Instant::now() + FRAME).min(end)) {
+                    Pumped::Batch => last = Instant::now(),
+                    Pumped::Error | Pumped::Exited => return true,
+                    Pumped::Timeout => {}
+                }
+                continue;
+            }
+            // One answered after the engine said it was idle (made in this
+            // flush, or in flight before it) waits on its queue: the next
+            // flush runs it.
+            if self.host.calls_answered() != answered {
+                continue;
+            }
+            let now = Instant::now();
+            let soon = due.filter(|&at| at < now + QUIET);
+            // What the wait for no batch would have ended, it still ends: a
+            // timer that keeps coming due and renders nothing.
+            let quiet = now >= last + QUIET && !self.animator.finishing();
+            if (!framing && soon.is_none()) || quiet {
+                return true;
+            }
+            // Wait for the frame, the animation's next frame or the timer.
+            let wake = match soon {
+                Some(at) if !framing => at,
+                _ => now + FRAME,
+            };
+            match self.pump(wake.min(last + QUIET).min(end)) {
+                Pumped::Batch => last = Instant::now(),
+                Pumped::Error | Pumped::Exited => return true,
+                Pumped::Timeout => {}
             }
         }
     }
@@ -1994,23 +2173,65 @@ impl Headless {
     /// text field that listens to presses takes the focus first, as a tap
     /// in it does.
     pub fn press(&mut self, selector: &str) -> Result<(), String> {
+        self.press_with(selector, None)
+    }
+
+    /// [`Headless::press`] with the pointer at `at` in the view `selector`
+    /// names (its top left corner), else where a tap lands (`None`).
+    pub(crate) fn press_with(
+        &mut self,
+        selector: &str,
+        offset: Option<Point<Points>>,
+    ) -> Result<(), String> {
         let parsed = Selector::parse(selector)?;
-        self.step(format!("press({selector})"));
+        self.step(match offset {
+            Some(at) => format!("press({selector}, {}, {})", at.x.0, at.y.0),
+            None => format!("press({selector})"),
+        });
         self.input_with(InputModality::Pointer);
         let pick = self.screen.pressable(&parsed);
         let mut id = self.picked(pick, selector, "pressable view")?;
         let mut routed = None;
-        // A real finger lands where the view is drawn: a view drawn over it
-        // there takes the press, so the step fails as the user would. The
-        // finger goes on the part of the view that is visible — a view
-        // across a scroll view's fold is pressed on the half left visible,
-        // its laid-out center lying below the fold, on the bar under it; a
-        // view nothing of which is on screen (a target scrolled out of
-        // view) keeps its laid-out center, which a press still reaches as
-        // before. A view that takes no pointer (in a `pointerEvents: none`
-        // subtree, as a data table's cells under its hit layer) is pressed
-        // where it is, by the view a pointer there reaches.
-        if let Some(target) = self.screen.bounds_in_root(id) {
+        // Where on the page the finger lands, when the test gives a point.
+        let mut page = None;
+        if let Some(offset) = offset {
+            let named = match self.screen.resolve(&parsed)[..] {
+                [named] => named,
+                _ => id,
+            };
+            let Some(bounds) = self.screen.bounds_in_root(named) else {
+                return Err(format!(
+                    "`{selector}` has no bounds to place a press at {}, {}; {}",
+                    offset.x.0,
+                    offset.y.0,
+                    self.on_screen()
+                ));
+            };
+            let point = bounds.origin + offset;
+            page = Some(point);
+            // A real finger lands where the view is drawn, so what covers
+            // that point takes the press, as it does at the middle.
+            if let Some((to, inside)) = self.screen.routed_press(id, point) {
+                (id, routed) = (to, Some(inside));
+            } else if let Some(cover) = self.screen.covering(id, point) {
+                return Err(format!(
+                    "{}; {}",
+                    failure::covered(selector, &self.screen.selector_of(cover)),
+                    self.on_screen()
+                ));
+            }
+        } else if let Some(target) = self.screen.bounds_in_root(id) {
+            // A real finger lands where the view is drawn: a view drawn over
+            // it there takes the press, so the step fails as the user would.
+            // The finger goes on the part of the view that is visible — a
+            // view across a scroll view's fold is pressed on the half left
+            // visible, its laid-out center lying below the fold, on the bar
+            // under it; a view nothing of which is on screen (a target
+            // scrolled out of view) keeps its laid-out center, which a press
+            // still reaches as before. A view that takes no pointer (in a
+            // `pointerEvents: none` subtree, as a data table's cells under
+            // its hit layer) is pressed where it is, by the view a pointer
+            // there reaches.
             let point = self
                 .screen
                 .press_point(&parsed, id)
@@ -2033,14 +2254,15 @@ impl Headless {
                 ));
             }
         }
-        let at = self
-            .screen
-            .canvas_node(&parsed)
-            .and_then(|(canvas, center)| {
-                self.screen
-                    .bounds_in_root(canvas)
-                    .map(|b| b.origin + center)
-            });
+        let at = page.or_else(|| {
+            self.screen
+                .canvas_node(&parsed)
+                .and_then(|(canvas, center)| {
+                    self.screen
+                        .bounds_in_root(canvas)
+                        .map(|b| b.origin + center)
+                })
+        });
         self.activate_window_of(id);
         // The finger, as platforms report it to the views around it that
         // listen to touches (an overlay's `onPressOutside` among them).
@@ -2055,7 +2277,10 @@ impl Headless {
         {
             self.move_focus(Some(id));
         }
-        let inside = routed.or_else(|| self.screen.press_point(&parsed, id));
+        let inside = routed.or_else(|| match page {
+            Some(page) => self.screen.bounds_in_root(id).map(|b| page - b.origin),
+            None => self.screen.press_point(&parsed, id),
+        });
         let payload = self.press_payload(id, inside);
         for kind in [EventKind::PressDown, EventKind::PressUp, EventKind::Press] {
             self.send(id, kind, payload.clone());
@@ -2825,6 +3050,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::DragOptions;
 
     /// A paragraph with a link and a marked word.
     #[component]
@@ -2920,7 +3146,7 @@ mod tests {
         view()
             .on_press(move || {
                 count.update(|c| *c += 1);
-                set_clipboard(format!("copied {}", count.get_untracked()));
+                drop(set_clipboard(format!("copied {}", count.get_untracked())));
             })
             .child(text("Copy"))
     }
@@ -2960,13 +3186,13 @@ mod tests {
                         let mut item = ClipboardItem::default();
                         item.text = "a b".into();
                         item.html = Some("<p>a <b>b</b></p>".into());
-                        set_clipboard_item(item)
+                        drop(set_clipboard_item(item))
                     })
                     .child(text("Rich")),
             )
             .child(
                 view()
-                    .on_press(|| set_clipboard("plain"))
+                    .on_press(|| drop(set_clipboard("plain")))
                     .child(text("Plain")),
             )
     }
@@ -4058,19 +4284,28 @@ mod tests {
         let mut app = Headless::start(EngineConfig::new(crate::windowed_root::<Drags>())).unwrap();
         app.first_render().unwrap();
         // A pan follows the finger to the end.
-        app.drag("id:card", point(px(120.0), px(-30.0))).unwrap();
+        app.drag(
+            "id:card",
+            point(px(120.0), px(-30.0)),
+            DragOptions::default(),
+        )
+        .unwrap();
         app.wait_for("Pan 120 -30").unwrap();
         // A finger moving off a button cancels its press: up, no press.
-        app.drag("Button", point(px(0.0), px(40.0))).unwrap();
+        app.drag("Button", point(px(0.0), px(40.0)), DragOptions::default())
+            .unwrap();
         app.wait_for("Presses 0 ups 1").unwrap();
         // A small slip still presses it.
-        app.drag("Button", point(px(0.0), px(4.0))).unwrap();
+        app.drag("Button", point(px(0.0), px(4.0)), DragOptions::default())
+            .unwrap();
         app.wait_for("Presses 1 ups 2").unwrap();
         // The views listening to touches hear the finger down, moving, up.
-        app.drag("id:pad", point(px(0.0), px(30.0))).unwrap();
+        app.drag("id:pad", point(px(0.0), px(30.0)), DragOptions::default())
+            .unwrap();
         assert!(!app.shows("Touches 0"));
         // A list pulled down past its top refreshes; dragged up, it scrolls.
-        app.drag("Row 2", point(px(0.0), px(300.0))).unwrap();
+        app.drag("Row 2", point(px(0.0), px(300.0)), DragOptions::default())
+            .unwrap();
         app.wait_for("Refreshes 1").unwrap();
         let Pick::One(list) = app
             .screen()
@@ -4081,14 +4316,92 @@ mod tests {
         assert_eq!(app.screen().scroll(list).map(|s| s.y), Some(Points::ZERO));
         // It takes the drag over once the finger passed the slop, a frame
         // in, and follows it from there, as the platforms' scroll views do.
-        app.drag("Row 2", point(px(0.0), px(-200.0))).unwrap();
+        app.drag("Row 2", point(px(0.0), px(-200.0)), DragOptions::default())
+            .unwrap();
         assert_eq!(app.screen().scroll(list).map(|s| s.y), Some(px(190.0)));
         // A short pull does not.
-        app.drag("Row 6", point(px(0.0), px(-40.0))).unwrap();
-        app.drag("Row 6", point(px(0.0), px(100.0))).unwrap();
+        app.drag("Row 6", point(px(0.0), px(-40.0)), DragOptions::default())
+            .unwrap();
+        app.drag("Row 6", point(px(0.0), px(100.0)), DragOptions::default())
+            .unwrap();
         assert!(app.shows("Refreshes 1"));
-        let error = app.drag("Nothing", point(px(1.0), px(1.0))).unwrap_err();
+        let error = app
+            .drag("Nothing", point(px(1.0), px(1.0)), DragOptions::default())
+            .unwrap_err();
         assert!(error.starts_with("no view matches `Nothing`"), "{error}");
+    }
+
+    /// A drawer's pans: one from the window's left edge across a row (a
+    /// strip at the edge, a block in the middle), and one that opens it to
+    /// the right over a page of a pager, each saying what it heard.
+    #[component]
+    fn DrawerPans() -> impl IntoElement {
+        let edge = signal(String::from("none"));
+        let content = signal(String::from("none"));
+        let said = |e: &PanEvent| format!("{} from {}", e.translation.x.0, e.origin.x.0);
+        view()
+            .flex_1()
+            .child(text(move || format!("Edge {}", edge.get())))
+            .child(text(move || format!("Content {}", content.get())))
+            .child(
+                view()
+                    .flex_row()
+                    .h(px(100.0))
+                    .pan_activation(PanActivation::default().edge(PanEdge::Left))
+                    .on_pan_end(move |e: &PanEvent| edge.set(said(e)))
+                    .child(view().test_id("strip").w(px(16.0)))
+                    .child(view().test_id("middle").w(px(100.0))),
+            )
+            .child(
+                scroll().test_id("pager").horizontal().h(px(200.0)).child(
+                    view()
+                        .test_id("page")
+                        .w(px(1200.0))
+                        .h(px(200.0))
+                        .pan_activation(PanActivation::default().direction(PanDirection::Right))
+                        .on_pan_end(move |e: &PanEvent| content.set(said(e))),
+                ),
+            )
+    }
+
+    #[test]
+    fn a_pan_takes_only_its_way_and_an_edge_pan_only_its_edge() {
+        let mut app =
+            Headless::start(EngineConfig::new(crate::windowed_root::<DrawerPans>())).unwrap();
+        app.first_render().unwrap();
+        let drag = |app: &mut Headless, selector: &str, dx: f32| {
+            app.drag(selector, point(px(dx), px(0.0)), DragOptions::default())
+                .unwrap();
+        };
+        // From the edge (the strip's center, 8 points in), the edge pan
+        // starts, and says where the finger went down.
+        drag(&mut app, "id:strip", 100.0);
+        app.wait_for("Edge 100 from 8").unwrap();
+        // Further in, it does not; toward the edge, neither.
+        drag(&mut app, "id:middle", 100.0);
+        drag(&mut app, "id:strip", -6.0);
+        assert!(app.shows("Edge 100 from 8"));
+        // A drag to the left over the page is the pager's.
+        let Pick::One(pager) = app
+            .screen()
+            .scroll_view(&Selector::parse("id:pager").unwrap())
+        else {
+            panic!("one pager");
+        };
+        drag(&mut app, "id:page", -150.0);
+        assert!(app.shows("Content none"));
+        let scrolled = app.screen().scroll(pager).map(|s| s.x).unwrap();
+        assert!(scrolled > px(100.0), "the pager scrolled: {scrolled:?}");
+        // One to the right is the page's pan, and the pager stays. The
+        // finger goes down at the page's center, as the driver's drags do.
+        let Pick::One(page) = app.screen().view(&Selector::parse("id:page").unwrap()) else {
+            panic!("one page");
+        };
+        let center = app.screen().bounds_in_root(page).unwrap().center();
+        drag(&mut app, "id:page", 120.0);
+        app.wait_for(&format!("Content 120 from {}", center.x.0))
+            .unwrap();
+        assert_eq!(app.screen().scroll(pager).map(|s| s.x), Some(scrolled));
     }
 
     /// A list with a refresh indicator of its own, 100 tall.
@@ -4114,9 +4427,11 @@ mod tests {
             Headless::start(EngineConfig::new(crate::windowed_root::<FarPull>())).unwrap();
         app.first_render().unwrap();
         // 150 points of finger rubber-band to less than 100 (past 64).
-        app.drag("Row 2", point(px(0.0), px(150.0))).unwrap();
+        app.drag("Row 2", point(px(0.0), px(150.0)), DragOptions::default())
+            .unwrap();
         assert!(app.shows("Refreshes 0"));
-        app.drag("Row 2", point(px(0.0), px(1000.0))).unwrap();
+        app.drag("Row 2", point(px(0.0), px(1000.0)), DragOptions::default())
+            .unwrap();
         app.wait_for("Refreshes 1").unwrap();
     }
 

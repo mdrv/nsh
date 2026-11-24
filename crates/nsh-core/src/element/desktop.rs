@@ -144,9 +144,20 @@ pub struct WindowRef {
     /// The close presses of a window of the app's own: how many, and the
     /// last one's reason (the app root's are the environment's).
     close_press: Option<Signal<(u64, CloseReason)>>,
-    /// What a window of the app's own was set to before its element was
-    /// mounted (its content's first render): opened with it.
-    early: Option<Signal<WindowAttributes>>,
+    /// What a window of the app's own was set to and asked for before its
+    /// element was mounted (its content's first render): opened with it.
+    early: Option<Signal<Early>>,
+}
+
+/// What a window's ref was given before its element was mounted.
+#[derive(Clone, Default, PartialEq)]
+struct Early {
+    /// Joins the options it opens with.
+    attributes: WindowAttributes,
+    /// Sent after it opens, in order (`focus()`, `set_mode()`, ...).
+    commands: Vec<DesktopCommand>,
+    /// It closed: nothing more is kept.
+    closed: bool,
 }
 
 impl fmt::Debug for WindowRef {
@@ -194,6 +205,38 @@ pub fn current_window() -> WindowRef {
     super::use_context::<WindowRef>().unwrap_or_else(main_window)
 }
 
+/// The ref of a window JS opened (`<Window>` of `nsh/desktop`) at node
+/// `node`, under its own owner, for the Rust components rendered inside it:
+/// [`current_window`] finds it as it finds a [`window`]'s, with the state
+/// and title bar area `reported` gives and [`WindowRef::report`] keeps.
+/// Commands go to the node; JS keeps its own handle of the window.
+pub(crate) fn js_window(
+    id: &str,
+    node: crate::NodeId,
+    executor: &Rc<super::Executor>,
+    reported: (Option<WindowState>, Edges<Points>),
+) -> (Owner, WindowRef) {
+    Owner::detached().run(|| {
+        super::create_root(|| {
+            let element = ElementRef::new(executor);
+            if let Some(target) = element.target() {
+                target.attach(node);
+            }
+            let this = WindowRef {
+                id: Rc::from(id),
+                target: Target::Own(element),
+                state: Some(super::signal(reported.0)),
+                title_bar: Some(super::signal(reported.1)),
+                close: None,
+                close_press: None,
+                early: None,
+            };
+            super::provide_context(this.clone());
+            this
+        })
+    })
+}
+
 impl WindowRef {
     /// Its id: the app's (`"main"` is a conventional first-window id, with
     /// no special behavior).
@@ -232,15 +275,23 @@ impl WindowRef {
                     super::ambient::desktop_command(command);
                 }
             }
-            // Not mounted yet (set while it first renders): the attributes
-            // join the options it opens with, nothing else reaches it.
-            Target::Own(element) => match (command, self.early) {
-                (DesktopCommand::SetAttributes(attributes), Some(early))
-                    if element.node().is_none() =>
-                {
-                    early.update(|e| e.merge(&attributes));
+            // Not mounted yet (`open_window`, or set while it first
+            // renders): the attributes join the options it opens with, and
+            // the other commands follow its opening, in order.
+            Target::Own(element) => match self.early {
+                Some(early) if element.node().is_none() => {
+                    if !early.is_live() {
+                        return;
+                    }
+                    early.update(|e| match command {
+                        _ if e.closed => {}
+                        DesktopCommand::SetAttributes(attributes) => {
+                            e.attributes.merge(&attributes)
+                        }
+                        command => e.commands.push(command),
+                    });
                 }
-                (command, _) => element.send(Command::Desktop(Box::new(command))),
+                _ => element.send(Command::Desktop(Box::new(command))),
             },
         }
     }
@@ -298,6 +349,24 @@ impl WindowRef {
         match &self.close {
             Some(close) => close(WindowCloseCause::Close),
             None => self.command(DesktopCommand::Request(WindowRequest::Close)),
+        }
+    }
+
+    /// What the platform reported of a window JS opened
+    /// ([`js_window`]): its state and title bar area follow.
+    pub(crate) fn report(&self, event: &WindowEvent) {
+        match event {
+            WindowEvent::State(next) => {
+                if let Some(state) = self.state {
+                    state.try_set(Some(**next));
+                }
+            }
+            WindowEvent::TitleBar(area) => {
+                if let Some(title_bar) = self.title_bar {
+                    title_bar.try_set(*area);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -672,11 +741,17 @@ impl IntoElement for Window {
                     super::signal(None::<WindowState>),
                     super::signal(Edges::<Points>::default()),
                     super::signal((0u64, CloseReason::default())),
-                    super::signal(WindowAttributes::default()),
+                    super::signal(Early::default()),
                 ),
             };
-            // A window opened again starts from its options.
-            super::untracked(|| early.set(WindowAttributes::default()));
+            // Closed, its ref reaches nothing: what it is asked for then is
+            // not kept for a later opening.
+            super::cleanup(move || {
+                early.try_set(Early {
+                    closed: true,
+                    ..Early::default()
+                });
+            });
             let close: Rc<dyn Fn(WindowCloseCause)> = {
                 let on_open_change = on_open_change.clone();
                 Rc::new(move |cause: WindowCloseCause| {
@@ -714,11 +789,16 @@ impl IntoElement for Window {
                     for r in reactive.iter() {
                         o.attributes.merge(&r.get());
                     }
-                    early.with(|e| o.attributes.merge(e));
-                    o
+                    let commands = early.with(|e| {
+                        o.attributes.merge(&e.attributes);
+                        e.commands.clone()
+                    });
+                    (o, commands)
                 };
-                let apply = |attrs: &mut super::Attrs, o: WindowOptions| {
-                    attrs.rare_mut().window = Some(Box::new(o));
+                let apply = |attrs: &mut super::Attrs, (o, commands): (WindowOptions, _)| {
+                    let rare = attrs.rare_mut();
+                    rare.window = Some(Box::new(o));
+                    rare.window_commands = commands;
                 };
                 // Bound even with static options: what its content sets
                 // while it first renders (`early`) joins them.
@@ -921,7 +1001,7 @@ pub fn open_window(mut window: Window) -> Option<WindowRef> {
                 })
             }),
             close_press: Some(super::signal((0, CloseReason::default()))),
-            early: Some(super::signal(WindowAttributes::default())),
+            early: Some(super::signal(Early::default())),
         })
     });
     window.on_open_change = Some(on_open_change);
@@ -1786,22 +1866,26 @@ pub fn set_tray(tray: impl Into<Option<Tray>>) {
 /// the current owner, until [`unregister_global_shortcut`] or the owner
 /// goes. The keystroke is written as a [`MenuItem::shortcut`]'s
 /// (`"mod+shift+k"`). The answer is whether the system took it: `false`
-/// when another app holds it, or off desktops; it need not be awaited.
-/// Registering a keystroke again replaces its function.
+/// when another app holds it, when the keystroke is not one (a warning
+/// names why in the log, and the component goes on — keystrokes often
+/// come from user settings, where a typo must not end it), or off
+/// desktops; it need not be awaited. Registering a keystroke again
+/// replaces its function.
 ///
 /// On Linux it goes through the desktop portal
 /// (`org.freedesktop.portal.GlobalShortcuts`): the desktop may ask the
 /// user to confirm it or let them pick another keystroke, and Hyprland
 /// binds it in its own configuration
 /// (`bind = …, global, <app id>:<shortcut>`).
-///
-/// # Panics
-///
-/// When `keystroke` is not one.
 pub fn register_global_shortcut(keystroke: &str, on_press: impl Fn() + 'static) -> Answer<bool> {
     let shortcut = match Shortcut::parse(keystroke, super::os() == Os::MacOs) {
         Ok(shortcut) => shortcut,
-        Err(e) => panic!("register_global_shortcut: {e}"),
+        Err(e) => {
+            log::warn!("register_global_shortcut: {e}");
+            let (answer, slot) = Answer::new();
+            slot.borrow_mut().deliver(false);
+            return answer;
+        }
     };
     let (answer, slot) = Answer::new();
     if !desktop_os() {
@@ -1857,5 +1941,27 @@ fn unregister_where(remove: impl Fn(&super::menus::Global) -> bool) {
             slot.borrow_mut().deliver(false);
         }
         super::desktop_command(DesktopCommand::UnregisterGlobalShortcut(g.id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A keystroke that is not one answers `false` where the call was
+    /// made, instead of ending the component that took it from user
+    /// settings (#2758): the answer is already there to poll.
+    #[test]
+    fn a_keystroke_that_is_not_one_answers_false() {
+        let runtime = crate::element::Runtime::default();
+        runtime.set_environment(crate::element::Environment::default());
+        let _entered = runtime.enter();
+        let answer = register_global_shortcut("ctrl+alt+notakey", || {});
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        match std::pin::pin!(answer).poll(&mut cx) {
+            std::task::Poll::Ready(taken) => assert!(!taken),
+            std::task::Poll::Pending => panic!("the answer was to be delivered at once"),
+        }
     }
 }

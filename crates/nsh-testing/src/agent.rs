@@ -26,15 +26,18 @@ use std::{
 use nsh_core::time::Instant;
 use nsh_core::{
     MountBatch, NodeId,
-    geometry::{Bounds, Point, Points, Size, point},
+    geometry::{Bounds, Point, Points, Size, point, px},
 };
-use nsh_dev::protocol::{PickTarget, SceneQuery, SpanStyle, StepOutcome, TestStep, ViewStyle};
+use nsh_dev::protocol::{
+    AccessibilityNode, PickTarget, SceneQuery, SpanStyle, StepOutcome, TestStep, ViewLayout,
+    ViewStyle,
+};
 
 mod forward;
 
 pub use self::forward::{Outgoing, Send as SendOutgoing};
 pub use crate::screen::Pick;
-use crate::{MemoryStorage, screen::Screen, selector::Selector};
+use crate::{DragOptions, MemoryStorage, screen::Screen, selector::Selector};
 
 /// How far a dragging finger moves in a display frame, as headless drags
 /// move it.
@@ -44,7 +47,7 @@ pub const FRAME: Duration = Duration::from_millis(16);
 /// How long a dragging finger rests where it lands before it moves, as a
 /// hand does: the views under it hear it land (a JS responder takes it)
 /// before a drag starts.
-pub const LANDING: Duration = Duration::from_millis(100);
+pub const LANDING: Duration = crate::drag::LANDING;
 
 /// The positions of a finger dragged from `from` to `to`
 /// ([`Native::drag`]), after `from`, a display frame apart: [`DRAG_STEP`]
@@ -56,6 +59,19 @@ pub fn drag_path(from: Point<Points>, to: Point<Points>) -> impl Iterator<Item =
         let t = i as f32 / steps as f32;
         Point::new(from.x + dx * t, from.y + dy * t)
     })
+}
+
+/// Refuses `options` that ask a drag for more than an agent resting
+/// [`LANDING`] does (a custom hold), before it puts a pointer down: `step`
+/// names the test's step (`"drag"`, `"dragAndHold"`).
+pub fn refuse_custom_drag(step: &str, options: DragOptions) -> Result<(), String> {
+    match options.hold {
+        Some(hold) if hold != LANDING => Err(crate::failure::unsupported_here(
+            step,
+            "this platform's test agent does not support a custom hold",
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// How long after the last batch the app is quiet.
@@ -471,6 +487,12 @@ pub trait Scene: Send + Sync {
     fn span_style(&self, selector: &str) -> Result<SpanStyle, String>;
     /// The style of the view `selector` names, `None` when none matches.
     fn view_style(&self, selector: &str) -> Result<Option<ViewStyle>, String>;
+    /// Where layout placed the view `selector` names, `None` when none
+    /// matches.
+    fn layout(&self, selector: &str) -> Result<Option<ViewLayout>, String>;
+    /// The accessibility tree from the view `selector` names (the root
+    /// without one), `None` when none matches.
+    fn accessibility(&self, selector: Option<&str>) -> Result<Option<AccessibilityNode>, String>;
     /// The input `selector` names.
     fn input_id(&self, selector: &str) -> Result<Option<NodeId>, String>;
     /// The dialogs the app showed.
@@ -673,6 +695,20 @@ impl Scene for Model {
             style
         }))
     }
+    fn layout(&self, selector: &str) -> Result<Option<ViewLayout>, String> {
+        Ok(self
+            .lock()
+            .screen
+            .layout(selector)?
+            .map(crate::screen::protocol_layout))
+    }
+    fn accessibility(&self, selector: Option<&str>) -> Result<Option<AccessibilityNode>, String> {
+        Ok(self
+            .lock()
+            .screen
+            .accessibility(selector)?
+            .map(crate::screen::protocol_accessibility))
+    }
     fn input_id(&self, selector: &str) -> Result<Option<NodeId>, String> {
         self.lock().screen.input_id(selector)
     }
@@ -849,6 +885,10 @@ pub fn answer(model: &Model, step: &TestStep) -> Option<Result<serde_json::Value
         TestStep::ViewStyle { selector } => {
             model.view_style(selector).and_then(|s| json(to_value(s)))
         }
+        TestStep::Layout { selector } => model.layout(selector).and_then(|l| json(to_value(l))),
+        TestStep::Accessibility { selector } => model
+            .accessibility(selector.as_deref())
+            .and_then(|a| json(to_value(a))),
         TestStep::Dialogs => model.dialogs().and_then(|d| json(to_value(d))),
         TestStep::PendingDialog => model.pending_dialog().and_then(|d| json(to_value(d))),
         TestStep::Scene { query } => match query {
@@ -1019,6 +1059,16 @@ impl Scene for RemoteScene {
             selector: selector.into(),
         })
     }
+    fn layout(&self, selector: &str) -> Result<Option<ViewLayout>, String> {
+        self.get(TestStep::Layout {
+            selector: selector.into(),
+        })
+    }
+    fn accessibility(&self, selector: Option<&str>) -> Result<Option<AccessibilityNode>, String> {
+        self.get(TestStep::Accessibility {
+            selector: selector.map(Into::into),
+        })
+    }
     fn input_id(&self, selector: &str) -> Result<Option<NodeId>, String> {
         self.query(SceneQuery::InputId {
             selector: selector.into(),
@@ -1120,10 +1170,11 @@ pub trait Native: Send + Sync {
     }
     /// What a press at `at` (in the window's content, as
     /// [`Native::bounds`]) would reach in place of view `id`, a view the
-    /// system draws over the app's (a navigation bar, a tab bar), described
-    /// for a failure; `None` when the press reaches the view, a view inside
-    /// it or one around it, or the platform cannot tell. Asked before a
-    /// step acts on a view, so it fails rather than pressing the bar.
+    /// system draws over the app's (a navigation bar, a tab bar, a
+    /// selection's edit menu), described for a failure; `None` when the
+    /// press reaches the view, a view inside it or one around it, or the
+    /// platform cannot tell. Asked before a step acts on a view, so it fails
+    /// rather than pressing what covers it.
     fn covered(&self, id: NodeId, at: Point<Points>) -> Option<String> {
         let _ = (id, at);
         None
@@ -1201,10 +1252,17 @@ pub trait Native: Send + Sync {
     /// towards the content's end), as a trackpad or a finger does.
     fn scroll(&self, at: Point<Points>, delta: Point<Points>);
     /// Drags from `from` to `to`: a finger (on a desktop, the mouse's
-    /// button) down at `from`, resting there for [`LANDING`], moving along
-    /// [`drag_path`] a display frame at a time and lifting at `to` at once,
-    /// still moving, as a quick drag does.
-    fn drag(&self, from: Point<Points>, to: Point<Points>);
+    /// button) down at `from`, resting there for `options.hold` ([`LANDING`]
+    /// by default), moving along [`drag_path`] a display frame at a time and
+    /// lifting at `to` at once, still moving, as a quick drag does. An agent
+    /// that cannot honour `options` refuses them before putting a pointer
+    /// down ([`refuse_custom_drag`]).
+    fn drag(
+        &self,
+        from: Point<Points>,
+        to: Point<Points>,
+        options: DragOptions,
+    ) -> Result<(), String>;
     /// The platform has a mouse ([`Native::hover`]): the desktops and the
     /// web; not the phones.
     fn mouse(&self) -> bool {
@@ -1257,7 +1315,8 @@ pub trait Native: Send + Sync {
     }
     /// Whether a menu the system draws for one of the app's views is open
     /// (on iOS: a `MenuButton`'s, a `ContextMenu`'s or a header button's
-    /// `UIMenu`), one the app's model does not hold: then
+    /// `UIMenu`; on Android: a `MenuButton`'s or a `ContextMenu`'s popup
+    /// window), one the app's model does not hold: then
     /// [`Native::choose_menu_item`] chooses from it and
     /// [`Native::close_menu`] closes it.
     fn system_menu_open(&self) -> bool {
@@ -1266,7 +1325,8 @@ pub trait Native: Send + Sync {
     /// Where a control the system draws for the app is on screen, one the
     /// app's views do not press (on iOS: a header button of
     /// `ios.headerRightItems`, by its `key` or its label; a `MenuButton`'s
-    /// `UIButton`, by the `testID` of the view it covers or its label), in
+    /// `UIButton`, by the `testID` of the view it covers or its label; on
+    /// Android: a `MenuButton`'s button, named the same ways), in
     /// the window's content as [`Native::bounds`]: a press there reaches it
     /// as the user's does. `None` when the platform shows none so named.
     fn system_control(&self, name: SystemName<'_>) -> Option<Bounds<Points>> {
@@ -1284,9 +1344,14 @@ pub trait Native: Send + Sync {
     }
     /// Drags from `from` to `to` as [`Native::drag`] does, keeping the
     /// button down until [`Native::drop_at`].
-    fn drag_and_hold(&self, from: Point<Points>, to: Point<Points>) -> Result<(), String> {
-        let _ = (from, to);
-        Err("`dragAndHold` runs headless and on Linux for now".into())
+    fn drag_and_hold(
+        &self,
+        from: Point<Points>,
+        to: Point<Points>,
+        options: DragOptions,
+    ) -> Result<(), String> {
+        let _ = (from, to, options);
+        Err("`dragAndHold` runs headless, on Linux and on iOS for now".into())
     }
     /// Drops local files (`file:` URLs) at `at`, as a file manager's drag
     /// does.
@@ -1297,7 +1362,7 @@ pub trait Native: Send + Sync {
     /// Lets go of the button [`Native::drag_and_hold`] holds, at `at`.
     fn drop_at(&self, at: Point<Points>) -> Result<(), String> {
         let _ = at;
-        Err("`drop` runs headless and on Linux for now".into())
+        Err("`drop` runs headless, on Linux and on iOS for now".into())
     }
     /// Holds modifier keys down (`down`) or lets go of them: the presses,
     /// drags and hovers until then carry them. One that cannot refuses it.
@@ -1673,13 +1738,21 @@ impl Agent {
         }
         match step {
             TestStep::Ready { timeout_ms } => done(self.ready(Duration::from_millis(timeout_ms))),
-            TestStep::Press { selector } => done(self.press(&selector)),
+            TestStep::Press { selector } => done(self.press(&selector, None)),
+            TestStep::PressAt { selector, x, y } => {
+                done(self.press(&selector, Some(point(px(x), px(y)))))
+            }
             TestStep::LongPress { selector } => done(self.long_press(&selector)),
             TestStep::Type { selector, text } => done(self.type_text(&selector, &text)),
             TestStep::Submit { selector } => done(self.submit(&selector)),
             TestStep::Clear { selector } => done(self.clear(&selector)),
             TestStep::Scroll { selector, distance } => done(self.scroll(&selector, distance)),
-            TestStep::Drag { selector, x, y } => done(self.drag(&selector, x, y)),
+            TestStep::Drag {
+                selector,
+                x,
+                y,
+                hold_ms,
+            } => done(self.drag(&selector, x, y, DragOptions::from_ms(hold_ms)?)),
             TestStep::Hover { selector } => done(self.hover(&selector)),
             TestStep::RightClick { selector } => done(self.right_click(&selector)),
             TestStep::Paste {
@@ -1712,7 +1785,12 @@ impl Agent {
                     .and_then(|()| self.settled()),
             ),
             TestStep::OpenedUrls => self.scene.opened_urls().map(Value::from),
-            TestStep::DragAndHold { selector, x, y } => done(self.drag_and_hold(&selector, x, y)),
+            TestStep::DragAndHold {
+                selector,
+                x,
+                y,
+                hold_ms,
+            } => done(self.drag_and_hold(&selector, x, y, DragOptions::from_ms(hold_ms)?)),
             TestStep::Drop => done(self.drop_held()),
             TestStep::Compose { selector, text } => done(self.compose(&selector, &text)),
             TestStep::DropFiles { selector, uris } => done(
@@ -1771,6 +1849,13 @@ impl Agent {
             TestStep::ViewStyle { selector } => {
                 serde_json::to_value(self.scene.view_style(&selector)?).map_err(|e| e.to_string())
             }
+            TestStep::Layout { selector } => {
+                serde_json::to_value(self.scene.layout(&selector)?).map_err(|e| e.to_string())
+            }
+            TestStep::Accessibility { selector } => {
+                serde_json::to_value(self.scene.accessibility(selector.as_deref())?)
+                    .map_err(|e| e.to_string())
+            }
             TestStep::Value { selector } => {
                 if let Some(text) = self.scene.input_value_text(&selector)? {
                     return Ok(Value::from(text));
@@ -1803,8 +1888,9 @@ impl Agent {
                 done(self.native.set_dark(dark).and_then(|()| self.settled()))
             }
             TestStep::Quit => {
+                let released = self.release_held().map(|_| ());
                 self.native.quit();
-                Ok(Value::Null)
+                done(released)
             }
             TestStep::WindowIds => Ok(serde_json::json!(self.scene.window_ids()?)),
             TestStep::WindowState { id } => match self.scene.window_root(&id)? {
@@ -1984,6 +2070,18 @@ impl Agent {
         what: &str,
         target: PickTarget,
     ) -> Result<(NodeId, Point<Points>), String> {
+        self.find_at(selector, what, target, None)
+    }
+
+    /// [`Agent::find`] for a press at `position` in the view `selector`
+    /// names (its top left corner), else where a tap lands.
+    fn find_at(
+        &self,
+        selector: &str,
+        what: &str,
+        target: PickTarget,
+        position: Option<Point<Points>>,
+    ) -> Result<(NodeId, Point<Points>), String> {
         Selector::parse(selector)?;
         self.settled_unless_still()?;
         let picked = self.scene.pick(selector, target)?;
@@ -1991,6 +2089,42 @@ impl Agent {
         // The pointer acts in the window the view is in.
         self.native.target_window(self.scene.window_of(id)?)?;
         let (view, at) = self.locate(id, selector, target)?;
+        let at = match position {
+            None => at,
+            Some(position) => {
+                // The point is in the view the selector names, as the
+                // headless driver places it; a span of a text is placed in
+                // its text view, as the platform draws it.
+                let named = match target {
+                    PickTarget::View => id,
+                    _ => match self.scene.pick(selector, PickTarget::View)? {
+                        Pick::One(named) => named,
+                        _ => id,
+                    },
+                };
+                let origin = self
+                    .native
+                    .bounds(named)
+                    .map(|b| b.origin)
+                    .or_else(|| {
+                        self.scene
+                            .layout(selector)
+                            .ok()
+                            .flatten()
+                            .map(|l| point(px(l.x), px(l.y)))
+                    })
+                    .or_else(|| self.native.bounds(view).map(|b| b.origin))
+                    .ok_or_else(|| {
+                        format!(
+                            "`{selector}` has no bounds to place a press at {}, {}; {}",
+                            position.x.0,
+                            position.y.0,
+                            self.on_screen()
+                        )
+                    })?;
+                origin + position
+            }
+        };
         // What the system draws over the app (a header it scrolls under)
         // would take the press: the step fails rather than pressing it.
         if let Some(cover) = self.native.covered(view, at) {
@@ -2318,21 +2452,27 @@ impl Agent {
         Ok(clear_spot(start, extent, along, &covered).unwrap_or(along))
     }
 
-    fn press(&self, selector: &str) -> Result<(), String> {
-        let at = match self.find(selector, "pressable view", PickTarget::Pressable) {
+    fn press(&self, selector: &str, position: Option<Point<Points>>) -> Result<(), String> {
+        let at = match self.find_at(selector, "pressable view", PickTarget::Pressable, position) {
             Ok((_, at)) => at,
             // Not one of the app's views on screen: a control the system
             // draws for it (a header button) may carry the name.
-            Err(error) => self.system_control(selector).ok_or(error)?,
+            Err(error) => self
+                .system_control(selector)
+                .map(|bounds| match position {
+                    Some(position) => bounds.origin + position,
+                    None => bounds.center(),
+                })
+                .ok_or(error)?,
         };
         self.native.press(at);
         self.settled()
     }
 
-    /// The middle of the control the system draws for the app that
+    /// The bounds of the control the system draws for the app that
     /// `selector` names alone (`id:<key>`, `label:<label>` or a bare name,
     /// as a test id, else a label), when the platform shows one.
-    fn system_control(&self, selector: &str) -> Option<Point<Points>> {
+    fn system_control(&self, selector: &str) -> Option<Bounds<Points>> {
         use crate::selector::{Matcher, TextMatch};
         let parsed = Selector::parse(selector).ok()?;
         let [part] = parsed.parts.as_slice() else {
@@ -2352,7 +2492,7 @@ impl Agent {
                 .or_else(|| self.native.system_control(SystemName::Label(name))),
             _ => None,
         }?;
-        Some(bounds.center())
+        Some(bounds)
     }
 
     fn long_press(&self, selector: &str) -> Result<(), String> {
@@ -2517,30 +2657,42 @@ impl Agent {
         self.settled()
     }
 
-    fn drag_and_hold(&self, selector: &str, x: f32, y: f32) -> Result<(), String> {
-        self.drop_held().ok();
+    fn drag_and_hold(
+        &self,
+        selector: &str,
+        x: f32,
+        y: f32,
+        options: DragOptions,
+    ) -> Result<(), String> {
+        self.release_held()?;
         let (_, at) = self.find(selector, "view", PickTarget::View)?;
         let to = Point::new(at.x + Points(x), at.y + Points(y));
-        self.native.drag_and_hold(at, to)?;
+        self.native.drag_and_hold(at, to, options)?;
         *self.held.lock().unwrap() = Some(to);
         self.settled()
     }
 
-    fn drop_held(&self) -> Result<(), String> {
-        let at = self
-            .held
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or("`drop()` comes after `dragAndHold`: no pointer is down")?;
+    /// Clearing the owner follows a successful Up; a failed release can be retried.
+    fn release_held(&self) -> Result<bool, String> {
+        let mut held = self.held.lock().unwrap();
+        let Some(at) = *held else { return Ok(false) };
         self.native.drop_at(at)?;
+        *held = None;
+        Ok(true)
+    }
+
+    fn drop_held(&self) -> Result<(), String> {
+        if !self.release_held()? {
+            return Err("`drop()` comes after `dragAndHold`: no pointer is down".into());
+        }
         self.settled()
     }
 
-    fn drag(&self, selector: &str, x: f32, y: f32) -> Result<(), String> {
+    fn drag(&self, selector: &str, x: f32, y: f32, options: DragOptions) -> Result<(), String> {
+        self.release_held()?;
         let (_, at) = self.find(selector, "view", PickTarget::View)?;
         let to = Point::new(at.x + Points(x), at.y + Points(y));
-        self.native.drag(at, to);
+        self.native.drag(at, to, options)?;
         self.settled()
     }
 
@@ -2778,7 +2930,9 @@ mod tests {
         }
         fn long_press(&self, _: Point<Points>, _: Duration) {}
         fn scroll(&self, _: Point<Points>, _: Point<Points>) {}
-        fn drag(&self, _: Point<Points>, _: Point<Points>) {}
+        fn drag(&self, _: Point<Points>, _: Point<Points>, _: DragOptions) -> Result<(), String> {
+            Ok(())
+        }
         fn type_text(&self, text: &str) {
             self.1.lock().unwrap().push(format!("type {text}"));
         }
@@ -2906,7 +3060,9 @@ mod tests {
                 *offset = (*offset + delta.y.0).clamp(0.0, self.end());
             }
         }
-        fn drag(&self, _: Point<Points>, _: Point<Points>) {}
+        fn drag(&self, _: Point<Points>, _: Point<Points>, _: DragOptions) -> Result<(), String> {
+            Ok(())
+        }
         fn type_text(&self, _: &str) {}
         fn key(&self, _: Key) {}
         fn input_text(&self, _: NodeId) -> Option<String> {
@@ -3191,6 +3347,49 @@ mod tests {
     }
 
     #[test]
+    fn a_press_at_a_position_lands_there_and_fails_when_that_point_is_covered() {
+        let press = |page: Page, position: Point<Points>| {
+            let pressed = page.pressed.clone();
+            let agent = Agent::new(page_model(), Box::new(page));
+            let outcome = agent.take(TestStep::PressAt {
+                selector: "view:4".into(),
+                x: position.x.0,
+                y: position.y.0,
+            });
+            (outcome, pressed.lock().unwrap().clone())
+        };
+        let (outcome, pressed) = press(
+            Page {
+                target: 200.0,
+                ..Page::default()
+            },
+            point(px(10.0), px(5.0)),
+        );
+        assert_eq!(
+            outcome,
+            StepOutcome::Done {
+                value: serde_json::Value::Null
+            }
+        );
+        assert_eq!(pressed, [205.0]);
+        // What draws over that point takes the press: the step fails
+        // instead of pressing the view.
+        let (outcome, pressed) = press(
+            Page {
+                target: 50.0,
+                bar: 103.0,
+                ..Page::default()
+            },
+            point(px(10.0), px(5.0)),
+        );
+        assert!(
+            matches!(&outcome, StepOutcome::Failed { message } if message.starts_with("`view:4` is covered: a press there reaches a navigation bar")),
+            "{outcome:?}"
+        );
+        assert!(pressed.is_empty());
+    }
+
+    #[test]
     fn canvas_nodes_keep_their_centers_in_local_and_remote_scenes() {
         use nsh_core::{
             EventMask, MountItem, ViewKind,
@@ -3284,7 +3483,9 @@ mod tests {
         }
         fn long_press(&self, _: Point<Points>, _: Duration) {}
         fn scroll(&self, _: Point<Points>, _: Point<Points>) {}
-        fn drag(&self, _: Point<Points>, _: Point<Points>) {}
+        fn drag(&self, _: Point<Points>, _: Point<Points>, _: DragOptions) -> Result<(), String> {
+            Ok(())
+        }
         fn type_text(&self, _: &str) {}
         fn key(&self, _: Key) {}
         fn input_text(&self, _: NodeId) -> Option<String> {
@@ -3606,7 +3807,9 @@ mod tests {
         }
         fn long_press(&self, _: Point<Points>, _: Duration) {}
         fn scroll(&self, _: Point<Points>, _: Point<Points>) {}
-        fn drag(&self, _: Point<Points>, _: Point<Points>) {}
+        fn drag(&self, _: Point<Points>, _: Point<Points>, _: DragOptions) -> Result<(), String> {
+            Ok(())
+        }
         fn type_text(&self, text: &str) {
             self.did.lock().unwrap().push(format!("type {text}"));
         }
@@ -3753,6 +3956,15 @@ mod tests {
         }
         fn view_style(&self, selector: &str) -> Result<Option<ViewStyle>, String> {
             self.inner.view_style(selector)
+        }
+        fn layout(&self, selector: &str) -> Result<Option<ViewLayout>, String> {
+            self.inner.layout(selector)
+        }
+        fn accessibility(
+            &self,
+            selector: Option<&str>,
+        ) -> Result<Option<AccessibilityNode>, String> {
+            self.inner.accessibility(selector)
         }
         fn input_id(&self, selector: &str) -> Result<Option<NodeId>, String> {
             self.inner.input_id(selector)
@@ -4003,7 +4215,9 @@ mod tests {
         }
         fn long_press(&self, _: Point<Points>, _: Duration) {}
         fn scroll(&self, _: Point<Points>, _: Point<Points>) {}
-        fn drag(&self, _: Point<Points>, _: Point<Points>) {}
+        fn drag(&self, _: Point<Points>, _: Point<Points>, _: DragOptions) -> Result<(), String> {
+            Ok(())
+        }
         fn type_text(&self, _: &str) {}
         fn key(&self, _: Key) {}
         fn input_text(&self, _: NodeId) -> Option<String> {
@@ -4100,3 +4314,7 @@ mod tests {
         drop(engine);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/drag_agent.rs"]
+mod drag_tests;

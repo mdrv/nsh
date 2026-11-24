@@ -140,6 +140,8 @@ fn content(rv: Rv) -> impl IntoElement {
     let (down, tap, mov, up, end) = (rv.clone(), rv.clone(), rv.clone(), rv.clone(), rv.clone());
     let (long, lift, armed, sweep) = (rv.clone(), rv.clone(), rv.clone(), rv.clone());
     let over = rv.clone();
+    let hovered = rv.hovered_table_cell;
+    let dropped = rv.clone();
     let claim = rv.clone();
     let placed = rv.clone();
     let height = rv.content_height;
@@ -170,10 +172,23 @@ fn content(rv: Rv) -> impl IntoElement {
             _ => {}
         }
     })
+    // Text dragged in from another app or view goes in where it is let go
+    // (backends that deliver text drops: iOS).
+    .on(EventKind::TextDrop, move |p: &EventPayload| {
+        if let EventPayload::TextDrop(drop) = p {
+            dropped.drop_text(&drop.text, &drop.html, drop.page_position);
+        }
+    })
     // Where the pointer is, for drags the app starts from a page point.
     .on(EventKind::MouseMove, move |p: &EventPayload| {
         if let EventPayload::Mouse(e) = p {
             over.note_pointer(e.position, e.page_position);
+            over.clear_table_hover_outside(e.position);
+        }
+    })
+    .on_mouse_leave(move |_: &MouseEvent| {
+        if hovered.get_untracked().is_some() {
+            hovered.set(None);
         }
     })
     .on(EventKind::Press, move |p: &EventPayload| {
@@ -249,9 +264,10 @@ fn content(rv: Rv) -> impl IntoElement {
                     }
                 }
             })
-            .child(blocks(rv.clone(), DOC)),
+            .children(doc_blocks(rv.clone())),
     )
     .child(table::controls(rv.clone()))
+    .child(table::drop_line(rv.clone()))
     .child(gap_cursor(rv.clone()))
     .child(drop_cursor(rv.clone()))
     .child(caret(rv.clone()))
@@ -342,6 +358,178 @@ fn blocks(rv: Rv, parent: u64) -> AnyElement {
     )
 }
 
+/// Documents with more top-level blocks than this mount only those near
+/// the viewport (the code `Editor` and `List` do the same); shorter ones
+/// mount every block.
+const WINDOWED_BLOCKS: usize = 300;
+
+/// The viewport heights mounted above and below the visible part.
+const OVERSCAN: f32 = 1.5;
+
+/// Top-level blocks are mounted in steps of this many, so scrolling within
+/// a step changes nothing.
+const WINDOW_STEP: usize = 16;
+
+/// The top-level blocks' window: the blocks mounted, and the heights of
+/// the spacers standing for those before and after them.
+#[derive(Clone, PartialEq, Default)]
+struct Window {
+    start: usize,
+    end: usize,
+    above: f32,
+    below: f32,
+}
+
+/// Where the top-level blocks are, from their last measured frames
+/// (estimated from the measured ones where never mounted): the window of
+/// those within [`OVERSCAN`] viewports of the visible part, and the
+/// selection's blocks, so the caret's geometry is always there.
+fn doc_window(rv: &Rv, items: &[BlockItem]) -> Window {
+    let n = items.len();
+    if n <= WINDOWED_BLOCKS {
+        return Window {
+            start: 0,
+            end: n,
+            above: 0.0,
+            below: 0.0,
+        };
+    }
+    let geo = rv.geo.borrow();
+    let frame = |i: usize| {
+        geo.frames
+            .get(&items[i].id)
+            .filter(|(parent, _)| *parent == Some(DOC))
+            .map(|(_, b)| b)
+    };
+    // The gap between blocks (their margins, the box's gap), from
+    // neighbours measured in one layout.
+    let (mut sum, mut count, mut gaps, mut gap_count) = (0.0f32, 0usize, 0.0f32, 0usize);
+    for i in 0..n {
+        if let Some(b) = frame(i) {
+            sum += b.size.height.0;
+            count += 1;
+            if let Some(next) = (i + 1 < n).then(|| frame(i + 1)).flatten() {
+                let gap = next.origin.y.0 - (b.origin.y.0 + b.size.height.0);
+                if (0.0..200.0).contains(&gap) {
+                    gaps += gap;
+                    gap_count += 1;
+                }
+            }
+        }
+    }
+    let average = if count > 0 { sum / count as f32 } else { 24.0 };
+    let gap = if gap_count > 0 {
+        gaps / gap_count as f32
+    } else {
+        0.0
+    };
+    let pitch = |i: usize| frame(i).map_or(average, |b| b.size.height.0) + gap;
+    let viewport = rv.viewport.get().height.0;
+    let viewport = if viewport > 0.0 { viewport } else { 1000.0 };
+    let top = rv.scroll_y.get().0 - viewport * OVERSCAN;
+    let bottom = rv.scroll_y.get().0 + viewport * (1.0 + OVERSCAN);
+    let (mut y, mut start, mut end) = (0.0f32, n, n);
+    for i in 0..n {
+        let h = pitch(i);
+        if start == n && y + h >= top {
+            start = i;
+        }
+        if y > bottom {
+            end = i;
+            break;
+        }
+        y += h;
+    }
+    let mut start = start.min(n.saturating_sub(1)) / WINDOW_STEP * WINDOW_STEP;
+    let mut end = end.div_ceil(WINDOW_STEP) * WINDOW_STEP;
+    // The selection's blocks stay mounted: the caret, the keys and the
+    // input method need their text. A selection far from the viewport
+    // widens the window to it only when it is near; otherwise scrolling to
+    // the caret (which every edit does) brings it in.
+    let selection = rv.st.borrow().selection().clone();
+    let tree = rv.tree.borrow();
+    for pos in [selection.from(), selection.to()] {
+        let at = items.iter().position(|it| {
+            tree.pos(it.id)
+                .is_some_and(|p| p <= pos && pos <= p + it.node.node_size())
+        });
+        if let Some(i) = at
+            && i + WINDOW_STEP * 4 >= start
+            && i <= end + WINDOW_STEP * 4
+        {
+            start = start.min(i / WINDOW_STEP * WINDOW_STEP);
+            end = end.max((i + 1).div_ceil(WINDOW_STEP) * WINDOW_STEP);
+        }
+    }
+    let end = end.min(n);
+    let above = (0..start).map(pitch).sum();
+    let below = (end..n).map(pitch).sum();
+    Window {
+        start,
+        end,
+        above,
+        below,
+    }
+}
+
+/// The document's blocks: every one, or, in a long document, those near
+/// the viewport between two spacers ([`doc_window`]).
+fn doc_blocks(rv: Rv) -> Vec<AnyElement> {
+    let window_rv = rv.clone();
+    let window = computed(move || {
+        window_rv.doc_rev.get();
+        window_rv.layout_rev.get();
+        window_rv.sel_rev.get();
+        let tree = window_rv.tree.borrow();
+        let items = tree
+            .children
+            .get(&DOC)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let items = items.to_vec();
+        drop(tree);
+        doc_window(&window_rv, &items)
+    });
+    let list_rv = rv.clone();
+    let list = computed(move || {
+        list_rv.doc_rev.get();
+        let w = window.get();
+        let tree = list_rv.tree.borrow();
+        let items = tree
+            .children
+            .get(&DOC)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        items[w.start.min(items.len())..w.end.min(items.len())].to_vec()
+    });
+    // A spacer is there only while it stands for blocks, so a short
+    // document's box has its blocks alone, as before.
+    let spacer = move |above: bool| {
+        let height = move || {
+            let w = window.get();
+            if above { w.above } else { w.below }
+        };
+        let shown = computed(move || height() > 0.0);
+        dynamic(move || {
+            shown.get().then(|| {
+                view()
+                    .flex_shrink_0()
+                    .h(move || Length::from(px(height())))
+                    .into_element()
+            })
+        })
+    };
+    vec![
+        spacer(true),
+        each(
+            list,
+            |b: &BlockItem| b.id,
+            move |item, _| block(rv.clone(), item),
+        ),
+        spacer(false),
+    ]
+}
+
 /// What the block's view is.
 enum Kind {
     View(Arc<dyn NodeView>),
@@ -387,13 +575,27 @@ fn block(rv: Rv, item: ReadSignal<BlockItem>) -> AnyElement {
         }
         _ => None,
     };
+    let scroll_table =
+        table_role(first.node.ty()) == Some(TableRole::Table) && !matches!(kind, Kind::View(_));
+    let scroll_frame = scroll_table.then(|| {
+        signal((
+            Bounds::<Points>::default(),
+            Bounds::<Points>::default(),
+            px(0.),
+        ))
+    });
     let wrapper = match slotted {
         Some((block_ref, _)) => view().element_ref(&block_ref),
         None => view(),
     };
     let wrapper = wrapper
         .on_layout(move |b: &Bounds<Points>| {
-            layout_rv.set_frame(id, Some(parent), *b);
+            if let Some(frame) = scroll_frame {
+                frame.update(|parts| parts.1 = *b);
+                update_scrolled_table(&layout_rv, id, parent, frame);
+            } else {
+                layout_rv.set_frame(id, Some(parent), *b);
+            }
             if let Some((_, size)) = slotted
                 && size.get_untracked() != b.size
             {
@@ -491,7 +693,58 @@ fn block(rv: Rv, item: ReadSignal<BlockItem>) -> AnyElement {
     if marked && terminal {
         return wrapper.child(holder(content)).into_element();
     }
-    wrapper.children(content).into_element()
+    let block = wrapper.children(content);
+    if let Some(frame) = scroll_frame {
+        let layout_rv = rv.clone();
+        let geo = rv.geo.clone();
+        let handle = element_ref();
+        geo.borrow_mut().table_scroll_handles.insert(id, handle);
+        cleanup(move || {
+            let mut geo = geo.borrow_mut();
+            geo.table_scroll.remove(&id);
+            geo.table_scroll_handles.remove(&id);
+        });
+        return scroll()
+            .element_ref(&handle)
+            .horizontal()
+            .w_full()
+            .flex_shrink_0()
+            .keyboard_taps(KeyboardTaps::Always)
+            .test_id("rich-editor-table-scroll")
+            .on_layout(move |b: &Bounds<Points>| {
+                frame.update(|parts| parts.0 = *b);
+                update_scrolled_table(&layout_rv, id, parent, frame);
+            })
+            .on_scroll(move |e: &ScrollEvent| {
+                if frame.with_untracked(|parts| parts.2 == e.offset.x) {
+                    return;
+                }
+                frame.update(|parts| parts.2 = e.offset.x);
+                update_scrolled_table(&rv, id, parent, frame);
+                rv.cx.emit(super::RichEditorEvent::TableScroll);
+            })
+            .child(block)
+            .into_element();
+    }
+    block.into_element()
+}
+
+fn update_scrolled_table(
+    rv: &Rv,
+    id: u64,
+    parent: u64,
+    frame: Signal<(Bounds<Points>, Bounds<Points>, Points)>,
+) {
+    let (viewport, grid, offset) = frame.get_untracked();
+    let visible = (offset, viewport.size.width);
+    if rv.geo.borrow_mut().table_scroll.insert(id, visible) != Some(visible) {
+        rv.table_moved(id, Some(parent));
+    }
+    let origin = Point::new(
+        viewport.origin.x + grid.origin.x - offset,
+        viewport.origin.y + grid.origin.y,
+    );
+    rv.set_frame(id, Some(parent), Bounds::new(origin, grid.size));
 }
 
 /// The tag of the element the node's spec renders as (`to_dom`), when it
@@ -1620,6 +1873,13 @@ fn caret(rv: Rv) -> impl IntoElement {
             return None;
         }
         let b = rv.caret_glyph_rect()?;
+        if let Some(table) =
+            crate::rich_editor::tables::find_table(rv.st.borrow().selection().resolved_head())
+            && let Some(visible) = rv.session.table_viewport(table.pos)
+            && (b.origin.x < visible.origin.x || b.origin.x > visible.origin.x + visible.size.width)
+        {
+            return None;
+        }
         // On whole device pixels: a caret between pixels is drawn smeared
         // over two, wider or narrower as it moves (gpui-kit's fix).
         let snap = nsh_core::element::round_to_nearest_pixel;
@@ -1629,6 +1889,7 @@ fn caret(rv: Rv) -> impl IntoElement {
                 Point::new(snap(b.origin.x - width * 0.5), snap(b.origin.y)),
                 Size::new(width, snap(b.size.height)),
             ))
+            .test_id("rich-editor-caret")
             .bg(move || theme().foreground)
             .opacity(visible),
             &rv,
@@ -1706,6 +1967,13 @@ fn sink(rv: Rv) -> impl IntoElement {
         .paste_behavior(PasteBehavior::Report)
         .value(move || value.get())
         .label(move || props.accessibility_label.get().unwrap_or_default())
+        // The keyboard is the sink's, so the editor's accessory is too;
+        // unset, the empty id (as the label's).
+        .input_accessory(move || {
+            props
+                .input_accessory
+                .with(|id| id.as_deref().unwrap_or_default().to_owned())
+        })
         .on_change(move |text: &str| change.sink_changed(text))
         .on_composition_change(move |c: &Composition| {
             composition.composition_changed(c.composing, &c.text)
@@ -1748,6 +2016,7 @@ impl Rv {
         }
         geo.frames.insert(id, (parent, frame));
         drop(geo);
+        self.table_moved(id, parent);
         self.layout_rev.update(|r| *r += 1);
     }
 
@@ -1760,6 +2029,7 @@ impl Rv {
         }
         geo.insets.insert(id, origin);
         drop(geo);
+        self.table_moved(id, None);
         self.layout_rev.update(|r| *r += 1);
     }
 

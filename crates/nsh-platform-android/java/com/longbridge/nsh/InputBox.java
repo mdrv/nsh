@@ -31,6 +31,13 @@ final class InputBox extends FrameLayout implements Node {
     final int id;
     final Decor decor = new Decor();
 
+    // `clipPath`: what it draws shows, and touches reach it and its
+    // children, only inside it (`Decor.drawClipped`, `Decor.clipsOut`).
+    @Override
+    public void draw(android.graphics.Canvas canvas) {
+        decor.drawClipped(canvas, this, () -> super.draw(canvas));
+    }
+
     /** An outer box shadow draws outside the bounds, and compositing the
      * view at alpha < 1 into the bounds-clipped offscreen buffer would cut
      * it; such a view reports no overlapping rendering, so the alpha
@@ -69,15 +76,19 @@ final class InputBox extends FrameLayout implements Node {
     private boolean watching;
     /** `pasteBehavior` is `"insert"`: a paste inserts its text. */
     boolean pasteInserts = true;
+    /** `pasteMaxSize`: the largest pasted file read, in bytes (-1: any the heap holds). */
+    int pasteMaxSize = -1;
+    /** The EditText's own floating text toolbar (its selection or insertion action mode), while it is open. */
+    private android.view.ActionMode textActions;
     /** Whether the EditText shows a vertical scroll bar of its own by default. */
     private final boolean defaultVerticalBar;
     /** Platform hint colors before any explicit `placeholderTextColor` override. */
     private final android.content.res.ColorStateList defaultHintColors;
     /**
-     * A built-in bar replaces the scroll indicator (`InputConfig::replaced`):
+     * A bar of the app's follows the text (`InputConfig::report_scroll`):
      * how far the text scrolled is reported to the engine.
      */
-    private boolean replaced;
+    private boolean reportsScroll;
     /** What was last reported (px): offset, text height, viewport width and height; -1 for nothing. */
     private int reportedY = -1, reportedContent = -1, reportedWidth = -1, reportedHeight = -1;
     /** `pointerEvents` (`Box`'s codes): `none` and `box-none` let touches through to the views below. */
@@ -89,6 +100,8 @@ final class InputBox extends FrameLayout implements Node {
         // selection's handles): the touch goes to the views below. It
         // still takes focus and typed text.
         if (pointerEvents == 1 || pointerEvents == 2) return false;
+        // Where its clip path cuts it away, the touch goes to the views below.
+        if (e.getActionMasked() == MotionEvent.ACTION_DOWN && decor.clipsOut(this, e.getX(), e.getY())) return false;
         return super.dispatchTouchEvent(e);
     }
 
@@ -132,6 +145,11 @@ final class InputBox extends FrameLayout implements Node {
                 // TextView hides the action key of multiline inputs; one that
                 // submits shows it, as React Native does.
                 if (multiline && submit != NEWLINE) info.imeOptions &= ~EditorInfo.IME_FLAG_NO_ENTER_ACTION;
+                // In landscape an input method may otherwise go full screen,
+                // its own edit box covering the app (its layout, accessory
+                // view and action key with it), as Compose's and Flutter's
+                // fields keep it from doing.
+                info.imeOptions |= EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_NO_FULLSCREEN;
                 return connection == null ? null : new KeyConnection(connection);
             }
 
@@ -147,24 +165,45 @@ final class InputBox extends FrameLayout implements Node {
             }
 
             @Override
+            public boolean onDragEvent(android.view.DragEvent event) {
+                // Files go to the file drop destination around the input
+                // (`FileDrops`), never in as their content URIs' text.
+                if (event.getAction() == android.view.DragEvent.ACTION_DRAG_STARTED
+                        && FileDrops.offersFiles(event.getClipDescription())) {
+                    return false;
+                }
+                return super.onDragEvent(event);
+            }
+
+            @Override
             public boolean onTextContextMenuItem(int item) {
+                if (item != android.R.id.paste && item != android.R.id.pasteAsPlainText) {
+                    return super.onTextContextMenuItem(item);
+                }
                 // Before Android 12 a paste comes here (the menu, Ctrl+V);
                 // from then on `receiveContent` hears it.
-                if (Build.VERSION.SDK_INT < 31
-                        && (item == android.R.id.paste || item == android.R.id.pasteAsPlainText)) {
+                boolean done = false;
+                if (Build.VERSION.SDK_INT < 31) {
                     android.content.ClipboardManager board = (android.content.ClipboardManager)
                             getContext().getSystemService(Context.CLIPBOARD_SERVICE);
                     android.content.ClipData clip = board == null ? null : board.getPrimaryClip();
-                    if (clip != null && pasted(clip) && !pasteInserts) return true;
+                    done = clip != null && pasted(clip) && !pasteInserts;
                 }
-                return super.onTextContextMenuItem(item);
+                if (!done) done = super.onTextContextMenuItem(item);
+                // TextView ends its toolbar when an edit changes the text, so
+                // a paste of text closes it; one whose content was taken
+                // without inserting anything (an image `onPaste` received,
+                // `pasteBehavior="report"`) leaves the text, and the toolbar
+                // with Paste on it, as they were. A paste ends it either way.
+                finishTextActions();
+                return done;
             }
 
             @Override
             protected void onScrollChanged(int left, int top, int oldLeft, int oldTop) {
                 super.onScrollChanged(left, top, oldLeft, oldTop);
                 reportCaret(this);
-                if (replaced) reportScroll();
+                if (reportsScroll) reportScroll();
             }
 
             @Override
@@ -173,21 +212,21 @@ final class InputBox extends FrameLayout implements Node {
                 // The text wraps again once laid out at the new size.
                 post(() -> {
                     reportCaret(this);
-                    if (replaced) reportScroll();
+                    if (reportsScroll) reportScroll();
                 });
             }
 
             @Override
             protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
                 super.onLayout(changed, left, top, right, bottom);
-                if (replaced) reportScroll();
+                if (reportsScroll) reportScroll();
             }
 
             @Override
             protected void onTextChanged(CharSequence text, int start, int before, int after) {
                 super.onTextChanged(text, start, before, after);
                 // The text's height is known once it is laid out again.
-                if (replaced) post(InputBox.this::reportScroll);
+                if (reportsScroll) post(InputBox.this::reportScroll);
             }
         };
         edit.setBackground(new ColorDrawable(0));
@@ -251,6 +290,8 @@ final class InputBox extends FrameLayout implements Node {
                 edit.clearComposingText();
                 syncComposition();
             }
+            // Moving to the activity made again: the field keeps the focus for the app.
+            if (mounter != null && mounter.moving) return;
             mounter.inputFocused(this, focused);
             mounter.reportState(id, Mounter.STATE_FOCUSED, focused);
             if (mounter.wants(id, focused ? Native.FOCUS : Native.BLUR)) {
@@ -258,6 +299,32 @@ final class InputBox extends FrameLayout implements Node {
             }
         });
         addView(edit, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+        // Keeps the EditText's toolbar at hand for a paste to end
+        // (`finishTextActions`); its items and their handling stay TextView's.
+        android.view.ActionMode.Callback textActionsTracker = new android.view.ActionMode.Callback() {
+            @Override
+            public boolean onCreateActionMode(android.view.ActionMode m, android.view.Menu menu) {
+                textActions = m;
+                return true;
+            }
+
+            @Override
+            public boolean onPrepareActionMode(android.view.ActionMode m, android.view.Menu menu) {
+                return true;
+            }
+
+            @Override
+            public boolean onActionItemClicked(android.view.ActionMode m, android.view.MenuItem item) {
+                return false;
+            }
+
+            @Override
+            public void onDestroyActionMode(android.view.ActionMode m) {
+                if (textActions == m) textActions = null;
+            }
+        };
+        edit.setCustomSelectionActionModeCallback(textActionsTracker);
+        edit.setCustomInsertionActionModeCallback(textActionsTracker);
         if (Build.VERSION.SDK_INT >= 31) {
             InputContent.install(edit, this);
         }
@@ -265,14 +332,20 @@ final class InputBox extends FrameLayout implements Node {
 
     /**
      * Reports what {@code clip} holds (`onPaste`), if the app listens: its text,
-     * its images' bytes (read from their content URIs as the user pastes) and local
-     * files' URLs. True when it reported.
+     * its images' bytes (read from their content URIs as the user pastes; one
+     * larger than {@link #pasteMaxSize} or the Java heap holds is not read, only
+     * its name, type and size reported) and local files' URLs. True when it
+     * reported.
      */
     boolean pasted(android.content.ClipData clip) {
         if (!mounter.wants(id, Native.PASTE)) return false;
         StringBuilder text = new StringBuilder();
         java.util.ArrayList<byte[]> images = new java.util.ArrayList<>();
         java.util.ArrayList<String> uris = new java.util.ArrayList<>();
+        java.util.ArrayList<String> largeNames = new java.util.ArrayList<>();
+        java.util.ArrayList<String> largeTypes = new java.util.ArrayList<>();
+        java.util.ArrayList<Long> largeLengths = new java.util.ArrayList<>();
+        int maxBytes = pasteMaxSize < 0 ? Integer.MAX_VALUE : pasteMaxSize;
         android.content.ContentResolver resolver = getContext().getContentResolver();
         for (int i = 0; i < clip.getItemCount(); i++) {
             android.content.ClipData.Item item = clip.getItemAt(i);
@@ -288,9 +361,16 @@ final class InputBox extends FrameLayout implements Node {
             }
             String type = resolver.getType(uri);
             if (type != null && type.startsWith("image/")) {
-                try (java.io.InputStream in = resolver.openInputStream(uri)) {
-                    if (in != null) images.add(readAll(in));
-                } catch (java.io.IOException | SecurityException e) {
+                try {
+                    Picker.Picked file = Picker.readFile(resolver, uri, maxBytes);
+                    if (file.bytes != null) {
+                        images.add(file.bytes);
+                    } else {
+                        largeNames.add(file.name);
+                        largeTypes.add(file.type);
+                        largeLengths.add(file.length);
+                    }
+                } catch (Exception e) {
                     android.util.Log.w("nsh", "a pasted image could not be read: " + e);
                 }
             } else {
@@ -298,15 +378,11 @@ final class InputBox extends FrameLayout implements Node {
                 if (t != null) text.append(t);
             }
         }
-        mounter.paste(id, text.toString(), images.toArray(new byte[0][]), uris.toArray(new String[0]));
+        long[] lengths = new long[largeLengths.size()];
+        for (int i = 0; i < lengths.length; i++) lengths[i] = largeLengths.get(i);
+        mounter.paste(id, text.toString(), images.toArray(new byte[0][]), uris.toArray(new String[0]),
+                largeNames.toArray(new String[0]), largeTypes.toArray(new String[0]), lengths);
         return true;
-    }
-
-    private static byte[] readAll(java.io.InputStream in) throws java.io.IOException {
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-        byte[] buffer = new byte[64 * 1024];
-        for (int n; (n = in.read(buffer)) > 0; ) out.write(buffer, 0, n);
-        return out.toByteArray();
     }
 
     void configure(float fontSizeDp, int weight, boolean italic, int color, String family, float letterSpacingDp,
@@ -743,6 +819,13 @@ final class InputBox extends FrameLayout implements Node {
         if (m != null) m.finish();
     }
 
+    /** Ends the EditText's own toolbar, if it is open. */
+    private void finishTextActions() {
+        android.view.ActionMode m = textActions;
+        textActions = null;
+        if (m != null) m.finish();
+    }
+
     /** Selects {@code start..end} (clamped to the text). */
     void select(int start, int end) {
         int length = edit.length();
@@ -787,14 +870,14 @@ final class InputBox extends FrameLayout implements Node {
 
     /**
      * `InputConfig`'s `scrollbarVisible` (whether the text's own scroll bar
-     * shows; the text scrolls either way) and `replaced` (a built-in bar takes
-     * its place: how far the text scrolled is reported, at once and on every
-     * change).
+     * shows; the text scrolls either way) and `reportScroll` (a bar of the
+     * app's follows the text: how far it scrolled is reported, at once and on
+     * every change).
      */
-    void setScrollbar(boolean visible, boolean replaced) {
+    void setScrollbar(boolean visible, boolean reportScroll) {
         edit.setVerticalScrollBarEnabled(visible && defaultVerticalBar);
-        this.replaced = replaced;
-        if (!replaced) return;
+        this.reportsScroll = reportScroll;
+        if (!reportScroll) return;
         reportedY = reportedContent = reportedWidth = reportedHeight = -1;
         // After the rest of the config (multiline, font) is applied.
         post(this::reportScroll);
@@ -809,7 +892,7 @@ final class InputBox extends FrameLayout implements Node {
 
     /** Reports how far the text scrolled when that, its height or the viewport changed. */
     private void reportScroll() {
-        if (!replaced || mounter == null) return;
+        if (!reportsScroll || mounter == null) return;
         int y = edit.getScrollY(), content = textHeight(), width = edit.getWidth(), height = edit.getHeight();
         if (y == reportedY && content == reportedContent && width == reportedWidth && height == reportedHeight) {
             return;

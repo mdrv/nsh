@@ -89,6 +89,8 @@ pub(crate) struct Shared {
     /// Measures one line of text for `measureText` (the engine's text
     /// engine).
     pub(crate) measurer: RefCell<Option<TextMeasurer>>,
+    /// Lays one line out for `measureText`'s font extent.
+    pub(crate) line_measurer: RefCell<Option<LineExtentMeasurer>>,
     /// The VM's limits.
     pub(crate) limits: Limits,
     /// Why the VM was stopped (out of memory, over a quota): no JS runs
@@ -108,6 +110,15 @@ impl Shared {
 /// Measures the width of one line of `text` in `font`, in points.
 pub type TextMeasurer =
     Box<dyn Fn(&nsh_core::canvas::CanvasFont, &str) -> nsh_core::geometry::Points>;
+
+/// Lays one line of `text` in `font` out: the font's ascent and descent on
+/// it, in points.
+pub type LineExtentMeasurer = Box<
+    dyn Fn(
+        &nsh_core::canvas::CanvasFont,
+        &str,
+    ) -> (nsh_core::geometry::Points, nsh_core::geometry::Points),
+>;
 
 /// One QuickJS runtime + context with the nsh host APIs installed.
 pub struct Host {
@@ -315,6 +326,12 @@ impl Host {
     /// Sets what canvas `measureText` measures with.
     pub fn set_text_measurer(&mut self, measurer: TextMeasurer) {
         *self.shared.measurer.borrow_mut() = Some(measurer);
+    }
+
+    /// Sets what canvas `measureText`'s `fontBoundingBoxAscent` /
+    /// `fontBoundingBoxDescent` lay the line out with (without it they are 0).
+    pub fn set_line_extent_measurer(&mut self, measurer: LineExtentMeasurer) {
+        *self.shared.line_measurer.borrow_mut() = Some(measurer);
     }
 
     /// Sets the handler for uncaught exceptions (in event handlers, timers and
@@ -552,6 +569,7 @@ impl Host {
 
     /// Delivers a native event (and its data) to the node's JS handler.
     pub fn dispatch_event(&self, id: NodeId, event: EventKind, payload: &EventPayload) {
+        let payload_in = payload;
         self.guarded(Phase::Call, || {
             self.cx.with(|cx| {
                 // Touches: the responder system is native.
@@ -612,6 +630,7 @@ impl Host {
                     let Some(handler) = crate::dom::handler(raw, id, event) else {
                         return Ok(());
                     };
+                    grant_user_files(raw, event, payload_in);
                     // SAFETY: an owned function value of this context.
                     let handler = unsafe { Value::from_raw(cx.clone(), handler) };
                     match handler.into_function() {
@@ -1263,6 +1282,21 @@ fn video_load<'js>(
     Ok(obj.into_value())
 }
 
+/// Lets the app read the files the user pasted or dropped, as its handler
+/// gets them (`fs/promises` at their exact paths): not a drag that only
+/// entered.
+fn grant_user_files(raw: *mut qjs::JSContext, event: EventKind, payload: &EventPayload) {
+    let uris = match (event, payload) {
+        (EventKind::Paste, EventPayload::Paste(paste)) => &paste.uris,
+        (
+            EventKind::FileDrop,
+            EventPayload::FileDrop(uris) | EventPayload::FileDropAt { uris, .. },
+        ) => uris,
+        _ => return,
+    };
+    nsh_core::runtime::grant_user_files(&crate::dom::shared(raw).system_locals, uris);
+}
+
 /// The JS object handed to event handlers.
 fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Result<Value<'js>> {
     let obj = rquickjs::Object::new(cx.clone())?;
@@ -1350,9 +1384,58 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
             }
             obj.set("uris", list)?;
             obj.set("mimeTypes", types)?;
+            // Contents come only where there are no paths (the Web, macOS file promises).
+            obj.set("files", rquickjs::Array::new(cx.clone())?)?;
             if let EventPayload::FileDropAt { page_position, .. } = payload {
                 obj.set("pagePosition", point_object(cx, *page_position)?)?;
             }
+        }
+        // `PickedFile`s: each read one's `File` shares the dropped bytes.
+        EventPayload::FileContents(drop) => {
+            obj.set("uris", rquickjs::Array::new(cx.clone())?)?;
+            let types = rquickjs::Array::new(cx.clone())?;
+            for (index, mime) in drop.mime_types.iter().enumerate() {
+                types.set(index, mime.as_str())?;
+            }
+            obj.set("mimeTypes", types)?;
+            let files = rquickjs::Array::new(cx.clone())?;
+            for (index, file) in drop.files.iter().enumerate() {
+                let entry = rquickjs::Object::new(cx.clone())?;
+                if file.status == nsh_core::picker::PickedStatus::TooLarge {
+                    entry.set("file", Value::new_null(cx.clone()))?;
+                    entry.set("status", "tooLarge")?;
+                } else {
+                    let blob = crate::web::blob::Blob::shared(file.data.clone(), file.mime.clone());
+                    let modified = file
+                        .last_modified
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or_else(crate::web::blob::now_ms, |d| d.as_millis() as f64);
+                    let made = crate::web::blob::new_file(
+                        cx.as_raw().as_ptr(),
+                        blob,
+                        file.name.clone(),
+                        modified,
+                    )
+                    .map_err(|_| rquickjs::Error::Exception)?;
+                    // SAFETY: an owned value of this context, handed over.
+                    let value = unsafe { Value::from_raw(cx.clone(), made.take()) };
+                    entry.set("file", value)?;
+                    entry.set("status", "read")?;
+                }
+                entry.set("name", file.name.as_str())?;
+                entry.set("type", file.mime.as_str())?;
+                entry.set("size", file.len as f64)?;
+                files.set(index, entry)?;
+            }
+            obj.set("files", files)?;
+            if let Some(at) = drop.page_position {
+                obj.set("pagePosition", point_object(cx, at)?)?;
+            }
+        }
+        EventPayload::TextDrop(drop) => {
+            obj.set("text", drop.text.as_str())?;
+            obj.set("html", drop.html.as_str())?;
+            obj.set("pagePosition", point_object(cx, drop.page_position)?)?;
         }
         // The bytes cross natively: each file is a `File` over them.
         EventPayload::Paste(paste) => {
@@ -1373,6 +1456,15 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
                 files.set(index, value)?;
             }
             obj.set("files", files)?;
+            let too_large = rquickjs::Array::new(cx.clone())?;
+            for (index, file) in paste.too_large.iter().enumerate() {
+                let unread = rquickjs::Object::new(cx.clone())?;
+                unread.set("name", file.name.as_str())?;
+                unread.set("type", file.mime.as_str())?;
+                unread.set("size", file.len as f64)?;
+                too_large.set(index, unread)?;
+            }
+            obj.set("tooLarge", too_large)?;
             let uris = rquickjs::Array::new(cx.clone())?;
             for (index, uri) in paste.uris.iter().enumerate() {
                 uris.set(index, uri.as_str())?;
@@ -1385,8 +1477,6 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
         EventPayload::FileRequest { id, .. } => obj.set("id", *id)?,
         // And offscreen canvas renders.
         EventPayload::CanvasImage { id, .. } => obj.set("id", *id)?,
-        // And speech sessions' events (`Speech`'s listeners get them).
-        EventPayload::Speech { id, .. } => obj.set("id", *id)?,
         // And sounds' and players' events (their objects' listeners).
         EventPayload::Audio { id, .. } => obj.set("id", *id)?,
         // Handled natively (`crate::window`).
@@ -1416,6 +1506,7 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
         }
         EventPayload::Layout(frame) => obj.set("bounds", bounds_object(cx, *frame)?)?,
         EventPayload::Pan {
+            origin,
             translation,
             velocity_x,
             velocity_y,
@@ -1423,6 +1514,7 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
             value_y,
         }
         | EventPayload::PanCancelled {
+            origin,
             translation,
             velocity_x,
             velocity_y,
@@ -1433,6 +1525,7 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
                 "cancelled",
                 matches!(payload, EventPayload::PanCancelled { .. }),
             )?;
+            obj.set("origin", point_object(cx, *origin)?)?;
             obj.set("translation", point_object(cx, *translation)?)?;
             let velocity = rquickjs::Object::new(cx.clone())?;
             velocity.set("x", *velocity_x)?;
@@ -1568,7 +1661,7 @@ fn bounds_object<'js>(
     Ok(obj)
 }
 
-/// `Modifiers` (`{ control, alt, shift, platform }`, GPUI's names).
+/// `Modifiers` (`{ control, alt, shift, platform, altGraph }`, GPUI's names).
 fn modifiers_object<'js>(
     cx: &Ctx<'js>,
     m: &nsh_core::keymap::Modifiers,
@@ -1578,6 +1671,7 @@ fn modifiers_object<'js>(
     obj.set("alt", m.alt)?;
     obj.set("shift", m.shift)?;
     obj.set("platform", m.cmd)?;
+    obj.set("altGraph", m.alt_graph)?;
     Ok(obj)
 }
 
@@ -2190,6 +2284,7 @@ const report = (v) => text(String(v));
             let modifiers: rquickjs::Object = obj.get("modifiers").unwrap();
             assert!(modifiers.get::<_, bool>("control").unwrap());
             assert!(!modifiers.get::<_, bool>("shift").unwrap());
+            assert!(!modifiers.get::<_, bool>("altGraph").unwrap());
             assert_eq!(obj.get::<_, u32>("clickCount").unwrap(), 2);
         });
     }
@@ -2744,6 +2839,32 @@ const report = (v) => text(String(v));
             .count();
         assert_eq!(created, 1);
         assert!(host.fatal().is_none());
+    }
+
+    #[test]
+    fn an_event_for_a_components_node_never_reaches_the_js_node_below_its_id() {
+        // A Rust component's nodes have odd ids; once the component let go
+        // of one (a sheet closed), its late `Dismiss` comes to JS. Node 3 is
+        // not JS's node 2: a closed sheet's dismissal ran the handler of the
+        // page under it and popped that page.
+        let host = Host::new().unwrap();
+        host.eval_source(
+            r#"import { element, prop } from "nsh:rt";
+            globalThis.view = element("view");
+            prop(globalThis.view, "onPress", () => element("view"));"#,
+        )
+        .unwrap();
+        ops(&host);
+        host.dispatch_event(3, EventKind::Press, &EventPayload::None);
+        host.dispatch_event(3, EventKind::Dismiss, &EventPayload::None);
+        assert!(ops(&host).is_empty());
+        // Its own id still reaches it.
+        host.dispatch_event(2, EventKind::Press, &EventPayload::None);
+        let created = ops(&host)
+            .into_iter()
+            .filter(|op| matches!(op, Op::Create { .. }))
+            .count();
+        assert_eq!(created, 1);
     }
 
     #[test]

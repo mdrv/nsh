@@ -21,7 +21,7 @@ It assumes `nsh` is installed and on your `PATH` ([Installation](./installation.
 
 ## Create an app
 
-On a terminal, `nsh init` asks what the app is written in: `rust`, `ts` or `mixed` (TSX with a Rust crate of its own).
+On a terminal, `nsh init` asks what the app is written in: `rust`, `ts` or `mixed` (TSX extended with Rust in `ext/`).
 `--template` chooses without asking.
 
 ### In Rust
@@ -68,8 +68,8 @@ a new directory.
 
 For both, the display name defaults to the directory's name; pass `--name "My App"` to choose another. The id becomes
 `com.example.<name>`: change it in `nsh.json` before you ship. `nsh init my-app --template mixed` creates a TSX app
-that is also a Rust crate (`Cargo.toml` and `src/lib.rs` beside `App.tsx`), whose component, module and class
-`App.tsx` imports ([Building with Rust](./rust.md)).
+extended with Rust: an nshm crate of its own in `ext/<name>-native/`, whose component, module and class `App.tsx`
+imports ([An app's own Rust: ext/](./nshm.md#an-apps-own-rust-ext)).
 
 ### The root component
 
@@ -215,7 +215,6 @@ GTK window on Linux. Pick another platform with `--target`:
 | Windows | `nsh run my-app` | Windows (the default) |
 | Linux (GTK 4) | `nsh run my-app` | Linux (the default) |
 | Web | `nsh run my-app --target web` | macOS, Windows, Linux |
-| Mac Catalyst | `nsh run my-app --target catalyst` | macOS |
 
 #### iOS simulator
 
@@ -272,16 +271,6 @@ nsh run my-app --target web
 
 `nsh` prints the page's address; open it in a browser. A Rust app runs as WebAssembly with your crate, and the open
 page loads the new build by itself after a change; see [Web](./web.md).
-
-#### Mac Catalyst
-
-```sh
-nsh run my-app --target catalyst
-```
-
-The app opens in an iPhone-sized window (390×844 points) on your Mac. This is the quickest way to see an app as a phone
-shows it: no simulator to boot. It uses UIKit like iOS, so what you see is what an iPhone shows, apart from Mac-specific
-behavior such as scrolling with a mouse wheel. For the Mac app itself, use `--target macos`.
 
 ### Edit it
 
@@ -344,6 +333,18 @@ TSX build error is printed in the terminal and shown on the device as a red over
 column; the app keeps running the last good build. The overlay disappears with the next successful build (tap it to
 dismiss it earlier). An exception thrown at run time is shown the same way, with its stack mapped back to your `.tsx`
 source.
+
+### Development tools
+
+#### Mac Catalyst
+
+```sh
+nsh run my-app --target catalyst
+```
+
+The app opens with the iOS (UIKit) backend in an iPhone-sized window (390×844 points) on your Mac. Use it only when
+you need it: to check behavior specific to Catalyst, or an app that embeds NSH in a Mac Catalyst app. For the Mac app,
+use the default `macos`; to see an app as a phone shows it, use `--target ios`.
 
 ## Host it in your app
 

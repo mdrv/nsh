@@ -482,7 +482,6 @@ impl AppView {
             clipboard: None,
             host: options.host.clone(),
             picker: None,
-            speech: None,
             audio: None,
             // The app's windows of its own are this backend's.
             windows: None,
@@ -611,11 +610,12 @@ fn initial_environment() -> Environment {
         os: Os::MacOs,
         idiom: Idiom::Desktop,
         screen_color: true,
+        // `setString:forType:` says whether the pasteboard took the write.
+        clipboard_write_result: true,
         canvas_render: true,
         // `NSSharingServicePicker` (`crate::share`).
         share: true,
         file_requests: true,
-        speech: true,
         notifications: true,
         audio: true,
         web_input: true,
@@ -859,7 +859,8 @@ define_class!(
         }
 
         // An address continued from another device (Handoff,
-        // `AppOptions::handoff`): a link like the others.
+        // `AppOptions::handoff`), or a Universal Link: a link like the
+        // others, which the core checks.
         #[unsafe(method(application:continueUserActivity:restorationHandler:))]
         fn continue_user_activity(
             &self,
@@ -867,7 +868,9 @@ define_class!(
             activity: &objc2_foundation::NSUserActivity,
             _restoration: &block2::DynBlock<dyn Fn(std::ptr::NonNull<AnyObject>)>,
         ) -> bool {
-            match nsh_platform_apple::handoff::continued_url(activity) {
+            match nsh_platform_apple::handoff::continued_url(activity)
+                .or_else(|| nsh_platform_apple::handoff::web_link(activity))
+            {
                 Some(url) => {
                     url_scheme(url);
                     true

@@ -19,7 +19,7 @@ use nsh_core::{
     prelude::*,
 };
 use nsh_engine::EngineConfig;
-use nsh_testing::Headless;
+use nsh_testing::{DragOptions, Headless};
 
 /// A layout as text: a split is `h(..)` / `v(..)` of its children, each
 /// with its slot size when it has one (`:300`), a tab group `[a *b]`, the
@@ -340,6 +340,51 @@ fn a_layout_shows_each_group_s_tabs_and_displayed_panel() {
     assert_eq!(app.screen().count("role:tablist").unwrap(), 2);
 }
 
+/// The panel tab `tab` (`role:tab[<name>]`) controls, which must be a
+/// tab panel.
+fn controlled_panel(app: &Headless, tab: &str) -> nsh_core::NodeId {
+    let screen = app.screen();
+    let panel = screen
+        .accessibility_controls(&format!("role:tab[{tab}]"))
+        .unwrap()
+        .unwrap_or_else(|| panic!("{tab} controls a view"));
+    let panels = (0..screen.count("role:tabpanel").unwrap())
+        .map(|n| screen.id(&format!("role:tabpanel >> nth={n}")).unwrap())
+        .collect::<Vec<_>>();
+    assert!(panels.contains(&panel), "{tab} controls a tab panel");
+    panel
+}
+
+/// Whether view `panel` holds the text `text`.
+fn holds(app: &Headless, panel: nsh_core::NodeId, text: &str) -> bool {
+    app.screen()
+        .id(&format!("view:{panel} >> text:{text}"))
+        .is_ok()
+}
+
+/// As WAI-ARIA's tabs pattern: each group's content frame is a tab panel
+/// holding the displayed panel, and every tab of the group names it as
+/// the element it controls.
+#[test]
+fn each_group_s_tabs_control_its_tab_panel() {
+    let mut app = start(two_groups(), 1000.0);
+    assert_eq!(app.screen().count("role:tabpanel").unwrap(), 2);
+    let (a, b, c) = (
+        controlled_panel(&app, "Tab a"),
+        controlled_panel(&app, "Tab b"),
+        controlled_panel(&app, "Tab c"),
+    );
+    assert_eq!(a, b, "the tabs of a group control one panel");
+    assert_ne!(a, c, "another group's tabs control its own");
+    assert!(holds(&app, a, "Panel a"));
+    assert!(holds(&app, c, "Panel c"));
+    // Selecting another tab shows its panel in the same tab panel.
+    app.press("id:tab-b").unwrap();
+    app.wait_for("Panel b").unwrap();
+    assert!(holds(&app, a, "Panel b"));
+    assert_eq!(controlled_panel(&app, "Tab a"), a);
+}
+
 #[test]
 fn a_press_on_a_tab_selects_it() {
     let mut app = start(two_groups(), 1000.0);
@@ -369,7 +414,12 @@ fn closing_a_panel_removes_it_unless_it_is_the_last_of_its_group_alone() {
 fn dragging_a_tab_to_the_edge_of_a_group_splits_it() {
     let mut app = start(two_groups(), 1000.0);
     // From the middle of tab a (40, 12) to the right of c's content.
-    app.drag("id:tab-a", point(px(720.0), px(288.0))).unwrap();
+    app.drag(
+        "id:tab-a",
+        point(px(720.0), px(288.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*b]:400 [*c] [*a])").unwrap();
     // Moved, not removed.
     assert!(app.shows("Removed none"));
@@ -379,7 +429,12 @@ fn dragging_a_tab_to_the_edge_of_a_group_splits_it() {
 #[test]
 fn dragging_a_tab_into_the_middle_of_a_group_merges_it() {
     let mut app = start(two_groups(), 1000.0);
-    app.drag("id:tab-a", point(px(560.0), px(288.0))).unwrap();
+    app.drag(
+        "id:tab-a",
+        point(px(560.0), px(288.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*b]:400 [c *a])").unwrap();
 }
 
@@ -387,10 +442,20 @@ fn dragging_a_tab_into_the_middle_of_a_group_merges_it() {
 fn dragging_a_tab_onto_a_tab_bar_inserts_it_at_the_slot() {
     let mut app = start(two_groups(), 1000.0);
     // Past the middle of c's tab (440): after it.
-    app.drag("id:tab-a", point(px(450.0), px(0.0))).unwrap();
+    app.drag(
+        "id:tab-a",
+        point(px(450.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*b]:400 [c *a])").unwrap();
     // Before it.
-    app.drag("id:tab-b", point(px(380.0), px(0.0))).unwrap();
+    app.drag(
+        "id:tab-b",
+        point(px(380.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*b c a])").unwrap();
 }
 
@@ -398,7 +463,12 @@ fn dragging_a_tab_onto_a_tab_bar_inserts_it_at_the_slot() {
 fn a_locked_area_moves_nothing() {
     let mut app = start(two_groups(), 1000.0);
     app.press("id:lock").unwrap();
-    app.drag("id:tab-a", point(px(560.0), px(288.0))).unwrap();
+    app.drag(
+        "id:tab-a",
+        point(px(560.0), px(288.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait(std::time::Duration::from_millis(200)).unwrap();
     assert!(app.shows("Layout h([*a b]:400 [*c])"));
     // Its split's boundary is still a handle the user resizes it by (only
@@ -412,8 +482,12 @@ fn a_locked_area_moves_nothing() {
 #[test]
 fn dragging_a_split_s_handle_resizes_it() {
     let mut app = start(two_groups(), 1000.0);
-    app.drag("role:adjustable", point(px(100.0), px(0.0)))
-        .unwrap();
+    app.drag(
+        "role:adjustable",
+        point(px(100.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*a b]:500 [*c]:300)").unwrap();
 }
 
@@ -553,7 +627,12 @@ fn a_panel_hears_each_change_of_being_displayed() {
 fn a_tab_dragged_into_a_dock_moves_there() {
     let mut app = start(with_files(), 1000.0);
     // The dock is 200 wide: c's tab is at 600 to 680.
-    app.drag("id:tab-c", point(px(-540.0), px(288.0))).unwrap();
+    app.drag(
+        "id:tab-c",
+        point(px(-540.0), px(288.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*a b]:400) left [files *c] open 200")
         .unwrap();
     assert!(app.shows("Removed none"));
@@ -564,18 +643,30 @@ fn a_tab_dragged_into_a_dock_moves_there() {
 fn dragging_a_dock_s_handle_resizes_it_and_past_its_minimum_closes_it() {
     let mut app = start(with_files(), 1000.0);
     // The dock's handle comes first, then the split's.
-    app.drag("role:adjustable >> nth=0", point(px(50.0), px(0.0)))
-        .unwrap();
+    app.drag(
+        "role:adjustable >> nth=0",
+        point(px(50.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*a b]:400 [*c]) left [*files] open 250")
         .unwrap();
     // Not below its minimum, 100.
-    app.drag("role:adjustable >> nth=0", point(px(-180.0), px(0.0)))
-        .unwrap();
+    app.drag(
+        "role:adjustable >> nth=0",
+        point(px(-180.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*a b]:400 [*c]) left [*files] open 100")
         .unwrap();
     // Nearer closed than its minimum: it closes and keeps its size.
-    app.drag("role:adjustable >> nth=0", point(px(-60.0), px(0.0)))
-        .unwrap();
+    app.drag(
+        "role:adjustable >> nth=0",
+        point(px(-60.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*a b]:400 [*c]) left [*files] closed 100")
         .unwrap();
 }
@@ -584,7 +675,12 @@ fn dragging_a_dock_s_handle_resizes_it_and_past_its_minimum_closes_it() {
 fn at_compact_width_a_drag_reorders_the_tabs() {
     let mut app = start(two_groups(), 400.0);
     // The strip lists a, b and c, 80 wide each: c before a.
-    app.drag("id:tab-c", point(px(-170.0), px(0.0))).unwrap();
+    app.drag(
+        "id:tab-c",
+        point(px(-170.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*c a b]:400)").unwrap();
     assert!(app.shows("Panel c"));
 }
@@ -644,6 +740,11 @@ fn a_narrow_area_in_a_wide_window_is_compact() {
     assert!(app.shows("Tab c"));
     assert!(app.shows("Panel a"));
     assert!(!app.shows("Panel c"));
+    // Its tabs, every group's, control the one tab panel.
+    assert_eq!(app.screen().count("role:tabpanel").unwrap(), 1);
+    let panel = controlled_panel(&app, "Tab a");
+    assert_eq!(controlled_panel(&app, "Tab c"), panel);
+    assert!(holds(&app, panel, "Panel a"));
 }
 
 #[test]
@@ -724,12 +825,22 @@ fn start_web_phone(layout: DockAreaLayout) -> Headless {
 fn a_finger_s_drag_waits_for_a_long_press_and_a_pointer_s_does_not() {
     let mut app = start_web_phone(two_groups());
     // A finger: no hover before it, so the swipe drags nothing.
-    app.drag("id:tab-c", point(px(-170.0), px(0.0))).unwrap();
+    app.drag(
+        "id:tab-c",
+        point(px(-170.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait(std::time::Duration::from_millis(200)).unwrap();
     assert!(app.shows("Layout h([*a b]:400 [*c])"));
     // A mouse hovers the tab before it presses it: it drags at once.
     app.hover("id:tab-c").unwrap();
-    app.drag("id:tab-c", point(px(-170.0), px(0.0))).unwrap();
+    app.drag(
+        "id:tab-c",
+        point(px(-170.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Layout h([*c a b]:400)").unwrap();
 }
 
@@ -927,8 +1038,12 @@ fn a_split_s_handles_show_what_render_handle_draws() {
     app.wait_for("Grip 0 Horizontal Idle").unwrap();
     assert_eq!(app.screen().count("text:Grip 0 Horizontal Idle"), Ok(1));
     // The band still resizes the split.
-    app.drag("role:adjustable", point(px(100.0), px(0.0)))
-        .unwrap();
+    app.drag(
+        "role:adjustable",
+        point(px(100.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("Grip 0 Horizontal Idle").unwrap();
 
     // The docks' handles keep their own indicator: still one grip, the

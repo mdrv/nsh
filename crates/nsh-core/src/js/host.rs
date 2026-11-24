@@ -189,7 +189,7 @@ pub trait HostValue: Sized {
     fn ts_type(types: &mut TsTypes) -> String;
 }
 
-/// Decodes a view's `captureKeys` (`"none"`, `"all"`, or an array of
+/// Decodes a view's `captureKeys` (`"none"`, `"all"`, `"text"`, or an array of
 /// keystroke strings) with the platform's `mod` convention: `apple` says
 /// `mod` is Command ([`crate::keymap::apple_keys`]).
 ///
@@ -209,9 +209,10 @@ pub fn decode_capture_keys<I: HostInput>(
         return match text.as_str() {
             "none" => Some(KeyCapture::None),
             "all" => Some(KeyCapture::All),
+            "text" => Some(KeyCapture::Text),
             other => {
                 cx.warn(format!(
-                    "captureKeys: expected \"none\", \"all\" or keystrokes, got {other:?}"
+                    "captureKeys: expected \"none\", \"all\", \"text\" or keystrokes, got {other:?}"
                 ));
                 None
             }
@@ -399,6 +400,17 @@ impl HostValue for u32 {
     }
 }
 
+impl HostValue for u64 {
+    /// Negative numbers are 0, fractions are cut (a size in bytes).
+    fn decode<I: HostInput>(input: &I, _: &mut HostCx) -> Option<Self> {
+        input.as_number().map(|n| n.max(0.0) as u64)
+    }
+
+    fn ts_type(_: &mut TsTypes) -> String {
+        "number".into()
+    }
+}
+
 impl HostValue for String {
     /// Anything but a string is the empty string's default.
     fn decode<I: HostInput>(input: &I, _: &mut HostCx) -> Option<Self> {
@@ -538,6 +550,8 @@ export interface Modifiers {
   shift: boolean;
   /** Command on Apple platforms, the Windows / Super key elsewhere. */
   platform: boolean;
+  /** AltGr (the DOM's `getModifierState("AltGraph")`): the key's character came from the layout's AltGr level, so `control` and `alt` are held to type text, not for a shortcut. Set by key events on Windows; `false` elsewhere. */
+  altGraph: boolean;
 }
 
 /** A hardware key transition on the focused view: the payload of `onKeyDown` and `onKeyUp` (`nsh_core::KeyEvent`). */
@@ -563,10 +577,12 @@ export interface OverlayPosition {
   available: Size;
 }
 
-/** A drag: translation since the start and velocity (points / second). */
+/** A drag: where it started, translation since then and velocity (points / second). */
 export interface PanEvent {
   /** The system cancelled the drag rather than releasing it. */
   cancelled: boolean;
+  /** Where the finger (or the pointer) went down, in the surface (as a touch's `pageX` / `pageY`). */
+  origin: Point;
   /** How far the finger moved since the drag started. */
   translation: Point;
   /** How fast it moves, in points per second. */
@@ -677,8 +693,20 @@ export interface PasteEvent {
   html: string;
   /** Files with their bytes: images (a screenshot, an image copied from a page or an app), as `File`s an app can upload. */
   files: File[];
+  /** Files larger than the input's `pasteMaxSize`, whose bytes were not read: their names, types and sizes, so the app can tell the user. */
+  tooLarge: UnreadFile[];
   /** `file:` URLs of local files copied in a file manager (as `onFileDrop`'s). */
   uris: string[];
+}
+
+/** A pasted file whose bytes were not read (`PasteEvent.tooLarge`). */
+export interface UnreadFile {
+  /** Its name. */
+  name: string;
+  /** Its media type (`application/pdf`; `application/octet-stream` when unknown). */
+  type: string;
+  /** Its size in bytes. */
+  size: number;
 }
 
 /** A line of a laid-out text (in the text's content box). */
@@ -795,19 +823,19 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
         EventKind::FileDragEnter,
         on::ALL,
         "(e: { uris: string[]; mimeTypes: string[] }) => void",
-        "A local file drag entered this destination (desktops and iOS) with its offered file URLs and each one's MIME type by its name (`\"\"` when the name says none); no file is read. GTK waits for its file-list preload; iOS reads files only on drop, so it offers no URLs.",
+        "A local file drag entered this destination (desktops, iOS and Android) with its offered file URLs and each one's MIME type by its name (`\"\"` when the name says none); no file is read. GTK waits for its file-list preload; iOS and Android read files only on drop, so they offer no URLs; the Web offers no URLs, only the types the browser shows.",
     ),
     (
         EventKind::FileDragLeave,
         on::ALL,
         "() => void",
-        "A local file drag left this destination (desktops and iOS).",
+        "A local file drag left this destination (desktops, iOS, Android and the Web).",
     ),
     (
         EventKind::FileDrop,
         on::ALL,
-        "(e: { uris: string[]; mimeTypes: string[]; pagePosition?: { x: number; y: number } }) => void",
-        "Local file URLs dropped on this destination (desktops and iOS), with each one's MIME type by its name (`\"\"` when the name says none); `pagePosition`: where, in the window's coordinates, on backends that know it (Linux, iOS).",
+        "(e: { uris: string[]; mimeTypes: string[]; pagePosition?: { x: number; y: number }; files: { file: File | null; name: string; type: string; size: number; status: \"read\" | \"tooLarge\" }[] }) => void",
+        "Local file URLs dropped on this destination (desktops, iOS, Android and the Web), with each one's MIME type by its name (`\"\"` when the name says none); `pagePosition`: where, in the window's coordinates, on backends that know it (Linux, iOS, Android, Web). On the Web `uris` is empty and `files` holds the dropped regular files with their contents (`status` `\"tooLarge\"` past 512 MiB a drop; at most 100); elsewhere `files` is empty.",
     ),
     (
         EventKind::Layout,
@@ -1014,7 +1042,7 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
         EventKind::Paste,
         on::INPUT,
         "(e: PasteEvent) => void",
-        "The user pasted (the keyboard's shortcut, a menu's Paste, a keyboard's image): the text, images as `File`s, local files' `file:` URLs. It comes before the `onChange` of the text it inserts; `pasteBehavior` decides whether the input inserts the text (images and files never are).",
+        "The user pasted (the keyboard's shortcut, a menu's Paste, a keyboard's image): the text, images as `File`s (files larger than `pasteMaxSize` in `tooLarge`, unread), local files' `file:` URLs. It comes before the `onChange` of the text it inserts; `pasteBehavior` decides whether the input inserts the text (images and files never are).",
     ),
     (
         EventKind::CaretMove,
@@ -1103,7 +1131,7 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     ),
 ];
 
-/// The events no element's props declare: the root's (`BackHandler`,
+/// The events no element's props declare: the root's (`BackHandler`'s,
 /// `nsh/keymap`, dialogs, `Image.getSize`, clipboard reads, menus, `nsh/host`'s replies and events, links), the runtime's own (touches, insets, native
 /// components' events) and those whose payload a module makes
 /// (`List`'s viewable items, with the app's items).
@@ -1113,6 +1141,7 @@ pub const INTERNAL_EVENTS: &[EventKind] = &[
     EventKind::NativeEvent,
     EventKind::Dialog,
     EventKind::BackPress,
+    EventKind::BackProgress,
     EventKind::ImageInfo,
     EventKind::WebEvaluation,
     EventKind::WebViewReply,
@@ -1124,12 +1153,13 @@ pub const INTERNAL_EVENTS: &[EventKind] = &[
     EventKind::Host,
     EventKind::Pick,
     EventKind::OpenUrl,
+    EventKind::OpenAppSettings,
+    EventKind::ClipboardWrite,
     EventKind::ScreenColor,
     EventKind::Share,
     EventKind::AuthSession,
     EventKind::CanvasImage,
     EventKind::FileRequest,
-    EventKind::Speech,
     EventKind::Notification,
     EventKind::UrlScheme,
     EventKind::SecondInstance,
@@ -1139,6 +1169,8 @@ pub const INTERNAL_EVENTS: &[EventKind] = &[
     EventKind::KeyCommand,
     EventKind::Menu,
     EventKind::ViewableItemsChange,
+    // Text dropped on a Rust component (`RichEditor` inserts it).
+    EventKind::TextDrop,
     // `NavPage`'s `onDismiss` / `onBackPress` and `Dialog`'s `onClose` /
     // `onCancel` / `onOpenChange` / `onOpen`: the navigation's handlers
     // (`nsh-js` `navigation.rs`), declared with its components.

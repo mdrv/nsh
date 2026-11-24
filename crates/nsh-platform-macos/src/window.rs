@@ -451,6 +451,45 @@ pub(crate) struct AppWindow {
     /// The app called `focus()` while it waited for its first frame
     /// (`Window.open(..).focus()`): it shows focused.
     focus_requested: Cell<bool>,
+    /// When it opened (a count): the oldest normal window still open is
+    /// the app's primary one ([`primary`]).
+    opened: u64,
+}
+
+thread_local! {
+    /// How many of the app's own windows opened so far.
+    static OPENED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The size and scale of the app's primary window: the oldest of its own
+/// normal windows still open that was given a size. What the app sees as
+/// `windowSize()` and `pixelRatio()`; `None` while it shows none.
+pub(crate) fn primary(surface: &Surface) -> Option<(Size<Points>, f32)> {
+    let windows = surface.windows.try_borrow().ok()?;
+    windows
+        .values()
+        .filter(|w| w.kind == WindowKind::Normal)
+        .filter_map(|w| w.reported.get().map(|size| (w, size)))
+        .min_by_key(|(w, _)| w.opened)
+        .map(|(w, size)| (size, w.window.backingScaleFactor() as f32))
+}
+
+/// The container for surface-wide UI. Among visible windows, prefer the
+/// key normal window, then the main normal window, then another normal
+/// window. An embedded surface may have no app window of its own.
+pub(crate) fn visible_container(surface: &Surface) -> Option<Retained<NSView>> {
+    let windows = surface.windows.borrow();
+    let normal = || {
+        windows
+            .values()
+            .filter(|w| w.kind == WindowKind::Normal && w.window.isVisible())
+    };
+    normal()
+        .find(|w| is_key(&w.window))
+        .or_else(|| normal().find(|w| w.window.isMainWindow()))
+        .or_else(|| normal().next())
+        .or_else(|| windows.values().find(|w| w.window.isVisible()))
+        .map(|w| w.container.clone())
 }
 
 /// The state of window `id` (the main window's for the root) as it is now;
@@ -1483,6 +1522,10 @@ fn open_window(surface: &Rc<Surface>, view: &NshView, open: &OpenWindow) {
             title_bar_area: Cell::new(None),
             showing: Cell::new(Showing::Waiting(0)),
             focus_requested: Cell::new(false),
+            opened: OPENED.with(|n| {
+                n.set(n.get() + 1);
+                n.get()
+            }),
         },
     );
     {
@@ -1522,6 +1565,7 @@ fn open_window(surface: &Rc<Surface>, view: &NshView, open: &OpenWindow) {
         crate::file_drop::register(view.ns());
     }
     resized(surface, view);
+    crate::fps::attach_for_surface(surface);
     // Shown with its first frame, or late.
     let key = surface.key();
     crate::surface::after(FIRST_FRAME_MS, move || {
@@ -1839,6 +1883,8 @@ pub(crate) fn resized(surface: &Surface, view: &NshView) {
     view.state_mut().frame = Bounds::new(point(Points(0.0), Points(0.0)), size);
     surface.control(|c| c.set_root_size(id, size, EdgeInsets::default()));
     crate::navigation::window_resized(surface, view);
+    // The primary window's size is the app's `windowSize()`.
+    surface.window_environment();
 }
 
 /// The displays changed: the windows of the app's own read their state
@@ -1852,6 +1898,8 @@ pub(crate) fn screens_changed(surface: &Surface) {
     for id in ids {
         state_changed(surface, id);
     }
+    // The primary window may be on a display of another scale now.
+    surface.window_environment();
 }
 
 // --- The key window in the background -----------------------------------------------------
@@ -2163,6 +2211,8 @@ pub(crate) fn removed(surface: &Surface, view: &NshView) -> bool {
     lost_key(surface, &window);
     // A link made from its root would neither fire nor let the root go.
     surface.follow_windows();
+    // Another window may be the primary one now.
+    surface.window_environment();
     true
 }
 
@@ -2177,6 +2227,7 @@ pub(crate) fn close_all(surface: &Surface) {
     dock::set(surface.key(), ROOT_ID, None);
     surface.main_window.reset();
     surface.follow_windows();
+    surface.window_environment();
 }
 
 fn close(w: AppWindow) {
@@ -2277,13 +2328,13 @@ pub(crate) fn root_in(surface: &Surface, window: &NSWindow) -> Option<NshView> {
 /// window of the app's own; `None` for another surface's view (or one in
 /// no window's tree).
 pub(crate) fn root_containing(surface: &Surface, view: &NshView) -> Option<NshView> {
-    if view.ns().isDescendantOf(surface.root.ns()) {
+    if view.is_within(surface.root.ns()) {
         return Some(surface.root.clone());
     }
     let windows = surface.windows.try_borrow().ok()?;
     windows
         .values()
-        .find(|w| view.ns().isDescendantOf(w.view.ns()))
+        .find(|w| view.is_within(w.view.ns()))
         .map(|w| w.view.clone())
 }
 

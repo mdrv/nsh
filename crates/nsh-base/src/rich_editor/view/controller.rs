@@ -42,7 +42,7 @@ use crate::{
             Affinity, ClickEvent, Decoration, EditorState, EditorStateConfig, GapCursor, KeyEvent,
             NodeSelection, Plugin, Selection, TextSelection, Transaction, TransactionOrigin,
         },
-        tables::{CellSelection, is_table, table_role},
+        tables::{CellSelection, cell_around, is_table, table_role},
         transform::drop_point,
     },
 };
@@ -50,6 +50,10 @@ use crate::{
 /// The sink is emptied once it holds this many bytes (and no composition
 /// is in progress).
 const SINK_LIMIT: usize = 256;
+
+/// The meta prosemirror-view sets on a selection the pointer made (a
+/// press, a drag, a touch), which plugins tell it from the keyboard's by.
+const POINTER_META: &str = "pointer";
 
 /// How much nearer a drop place that takes a block as it is counts than
 /// one that takes it wrapped, between blocks.
@@ -81,6 +85,12 @@ pub(crate) struct Tree {
     pub(crate) positions: rustc_hash::FxHashMap<u64, usize>,
     pub(crate) by_pos: rustc_hash::FxHashMap<usize, u64>,
     pub(crate) tables: Vec<(u64, Node)>,
+    /// The tables in each box around a table (the blocks and node views'
+    /// slots it is in, and the document's box, [`DOC`]): what a move of
+    /// the box moves.
+    pub(crate) table_holders: rustc_hash::FxHashMap<u64, Vec<u64>>,
+    /// The boxes the walk is in, outermost first.
+    path: Vec<u64>,
     next: u64,
 }
 
@@ -228,12 +238,16 @@ pub(crate) struct Rv {
     pub(crate) table_gesture: Rc<RefCell<Option<TableGesture>>>,
     /// What that drag shows: a column's or row's new size, a drop line.
     pub(crate) table_preview: Signal<Option<TablePreview>>,
+    pub(crate) hovered_table_cell: Signal<Option<u64>>,
     /// The selection a touch made, its handles and edit menu.
     pub(crate) touch: super::touch::Touch,
     /// Per-block `(selected, focused)` state, notified only for changed blocks.
     active_blocks: Rc<RefCell<ActiveBlocks>>,
     /// Per-textblock range selection rectangles, notified only for overlapped blocks.
     sel_rects: Rc<RefCell<SelRects>>,
+    /// Per-table layout revisions, of the tables whose controls are drawn
+    /// (`Rv::watch_table`), moved only for the tables a layout changes.
+    pub(crate) table_revs: Rc<RefCell<rustc_hash::FxHashMap<u64, Signal<u64>>>>,
     /// Position of the current `NodeSelection`, `None` for any other selection.
     pub(crate) node_sel_pos: Signal<Option<usize>>,
 }
@@ -290,9 +304,11 @@ impl Rv {
             base_keymap: Rc::new(base_keymap),
             table_gesture: Rc::default(),
             table_preview: signal(None),
+            hovered_table_cell: signal(None),
             touch: super::touch::Touch::new(),
             active_blocks: Rc::default(),
             sel_rects: Rc::default(),
+            table_revs: Rc::default(),
             node_sel_pos: signal(None),
         };
         rv.sync_tree(&state);
@@ -487,6 +503,9 @@ impl Rv {
         tree.positions.clear();
         tree.by_pos.clear();
         tree.tables.clear();
+        tree.table_holders.clear();
+        tree.path.clear();
+        tree.path.push(DOC);
         geo.text_order.clear();
         let mut alive = HashSet::with_capacity(prev_blocks);
         let mut texts = HashMap::with_capacity(prev_texts);
@@ -503,6 +522,7 @@ impl Rv {
             &mut geo.text_order,
             &mut atoms,
         );
+        tree.path.clear();
         tree.children
             .retain(|id, _| *id == DOC || alive.contains(id));
         geo.frames
@@ -1482,11 +1502,24 @@ impl Rv {
 
     /// Selects `selection` (a move: it scrolls into view).
     pub(crate) fn set_selection(&self, selection: Selection, scroll: bool) {
+        self.select(selection, scroll, false);
+    }
+
+    /// Selects `selection`, which the pointer made: with the `pointer`
+    /// meta.
+    pub(crate) fn set_pointer_selection(&self, selection: Selection, scroll: bool) {
+        self.select(selection, scroll, true);
+    }
+
+    fn select(&self, selection: Selection, scroll: bool, pointer: bool) {
         let state = self.session.state();
         let mut tr = state.tr();
         tr.set_selection(selection);
         if scroll {
             tr.scroll_into_view();
+        }
+        if pointer {
+            tr.set_meta(POINTER_META, Value::Bool(true));
         }
         self.dispatch(tr);
         self.empty_sink();
@@ -1564,7 +1597,7 @@ impl Rv {
         item.text = text;
         item.html =
             Some(DomSerializer::from_schema(state.schema()).serialize_for_clipboard(&slice));
-        set_clipboard_item(item);
+        drop(set_clipboard_item(item));
     }
 
     /// A paste of `text` and, when the clipboard had it, the same content as
@@ -1624,6 +1657,24 @@ impl Rv {
             return;
         }
         self.insert_paste(&state, slice);
+    }
+
+    /// Text dropped on the editor at `page` (the root view's coordinates):
+    /// the caret goes where it was let go, then the text goes in as a paste
+    /// of it would (the paste hooks see it), one undo step, as editors such
+    /// as ProseMirror insert dropped text.
+    pub(crate) fn drop_text(&self, text: &str, html: &str, page: Point<Points>) {
+        if !self.editable() || (text.is_empty() && html.is_empty()) {
+            return;
+        }
+        let state = self.session.state();
+        if let Some(pos) = self.session.pos_at_page_coords(page)
+            && let Ok(at) = state.doc().resolve(pos)
+        {
+            self.set_selection(Selection::near(&at, 1), false);
+        }
+        self.focus();
+        self.paste(text, html);
     }
 
     /// Replaces the selection of `state` (the current one) with `slice`.
@@ -1810,7 +1861,7 @@ impl Rv {
             && let Some((selection, click_sel)) = self.drag_source(&state, hit)
         {
             if !selection.eq(state.selection()) {
-                self.set_selection(selection.clone(), false);
+                self.set_pointer_selection(selection.clone(), false);
             }
             let copy = if apple_keys() {
                 modifiers.alt
@@ -1840,7 +1891,7 @@ impl Rv {
             && NodeSelection::is_selectable(&node)
             && table_role(node.ty()).is_none()
         {
-            self.set_selection(NodeSelection::create(&doc, p), false);
+            self.set_pointer_selection(NodeSelection::create(&doc, p), false);
             return;
         }
         let selection = match (hit, clicks) {
@@ -1875,7 +1926,7 @@ impl Rv {
             }
         };
         let anchor = selection.anchor();
-        self.set_selection(selection, false);
+        self.set_pointer_selection(selection, false);
         *self.drag.borrow_mut() = Some(Drag {
             anchor,
             shift,
@@ -2124,7 +2175,7 @@ impl Rv {
         // The handle owns the pointer: a table's grip under it (a row's,
         // on the table's left border) does not drag along.
         self.table_gesture.borrow_mut().take();
-        self.set_selection(selection.clone(), false);
+        self.set_pointer_selection(selection.clone(), false);
         // The press is where the pointer is now; the scroll since the
         // offset was noted moves the content under it.
         let scrolled = self.scroll_y.get_untracked() - scroll;
@@ -2250,6 +2301,7 @@ impl Rv {
         }
         let mut tr = state.tr();
         tr.set_selection(selection);
+        tr.set_meta(POINTER_META, Value::Bool(true));
         self.dispatch(tr);
     }
 
@@ -2358,7 +2410,7 @@ impl Rv {
             Some(target) => self.drop(&moving.slice, target, moving.moved, moving.source),
             None => {
                 if let Some(click) = moving.click {
-                    self.set_selection(click, false);
+                    self.set_pointer_selection(click, false);
                 }
             }
         }
@@ -2370,6 +2422,7 @@ impl Rv {
         if let Some(selection) = blocks_selection(state.doc(), state.selection()) {
             let mut tr = state.tr();
             tr.set_selection(selection);
+            tr.set_meta(POINTER_META, Value::Bool(true));
             self.dispatch(tr);
         }
     }
@@ -2618,6 +2671,55 @@ impl Rv {
         self.node_box(pos)
     }
 
+    fn scroll_selected_cell(&self, state: &EditorState, caret: Bounds<Points>) {
+        let Some(cell) = cell_around(state.selection().resolved_head()) else {
+            return;
+        };
+        let tree = self.tree.borrow();
+        let geo = self.geo.borrow();
+        let Some(table_id) = tree.id_at(cell.before(cell.depth - 1)) else {
+            return;
+        };
+        let (Some(viewport), Some((offset, _)), Some(handle)) = (
+            geo.table_viewport(table_id),
+            geo.table_scroll.get(&table_id),
+            geo.table_scroll_handles.get(&table_id),
+        ) else {
+            return;
+        };
+        let selection = state.selection();
+        let mut visible = caret;
+        if !selection.empty()
+            && selection
+                .resolved_anchor()
+                .same_parent(selection.resolved_head())
+            && let Some(anchor) = geo.caret_rect(selection.anchor(), Affinity::Downstream)
+        {
+            let both = anchor.union(&caret);
+            if both.size.width <= viewport.size.width {
+                visible = both;
+            }
+        }
+        if visible.origin.x >= viewport.origin.x
+            && visible.origin.x + visible.size.width <= viewport.origin.x + viewport.size.width
+        {
+            return;
+        }
+        let target = node_box(&tree, &geo, state, cell.pos)
+            .filter(|cell| cell.size.width <= viewport.size.width)
+            .unwrap_or(visible);
+        let left = target.origin.x - viewport.origin.x;
+        let right = left + target.size.width - viewport.size.width;
+        let delta = if left < px(0.) {
+            left
+        } else if right > px(0.) {
+            right
+        } else {
+            return;
+        };
+        handle.scroll_to(Point::new((*offset + delta).max(px(0.)), px(0.)), false);
+    }
+
     /// Scrolls the head into view, once it is laid out: a selected node
     /// whole, as ProseMirror scrolls its DOM node, else the caret.
     fn scroll_into_view(&self) {
@@ -2634,6 +2736,7 @@ impl Rv {
             return;
         };
         self.scroll_pending.set(false);
+        self.scroll_selected_cell(&state, caret);
         let top = self.scroll_y.get_untracked();
         let height = self.viewport.get_untracked().height;
         if height <= px(0.0) {
@@ -2750,6 +2853,14 @@ fn walk(
         let view = views.get(child.ty().name());
         if is_table(child) && view.is_none() {
             tree.tables.push((child_id, child.clone()));
+            let Tree {
+                path,
+                table_holders,
+                ..
+            } = &mut *tree;
+            for holder in path.iter() {
+                table_holders.entry(*holder).or_default().push(child_id);
+            }
         }
         let atom = match view {
             Some(v) => !v.editable_content_slot(),
@@ -2766,6 +2877,11 @@ fn walk(
             } else {
                 child_id
             };
+            let depth = tree.path.len();
+            tree.path.push(child_id);
+            if box_id != child_id {
+                tree.path.push(box_id);
+            }
             walk(
                 tree,
                 views,
@@ -2778,6 +2894,7 @@ fn walk(
                 text_order,
                 atoms,
             );
+            tree.path.truncate(depth);
         }
     }
     tree.children.insert(id, items);
@@ -3213,6 +3330,64 @@ mod tests {
         let first = &tree.children[&cells[0].id][0];
         assert_eq!(texts[&first.id], cell_pos(&d, "a") + 2);
     }
+
+    #[test]
+    fn the_boxes_around_a_table_hold_it() {
+        use crate::rich_editor::{
+            model::Fragment,
+            tables::test_util::{doc, grid, p, schema, table, tr},
+        };
+        let s = schema();
+        let cell = s
+            .node(
+                "tableCell",
+                None,
+                Fragment::from(vec![grid(&[&["inner"]])]),
+                vec![],
+            )
+            .unwrap();
+        let quote = s
+            .node(
+                "blockquote",
+                None,
+                Fragment::from(vec![table(vec![tr(vec![cell])])]),
+                vec![],
+            )
+            .unwrap();
+        let d = doc(vec![p("x"), grid(&[&["top"]]), quote]);
+        let mut tree = Tree::default();
+        let (mut alive, mut texts, mut text_order, mut atoms) =
+            (HashSet::new(), HashMap::new(), Vec::new(), HashMap::new());
+        // As `sync_tree` starts it: in the document's box.
+        tree.path.push(DOC);
+        walk(
+            &mut tree,
+            &NodeViews::default(),
+            DOC,
+            DOC,
+            &d,
+            0,
+            &mut alive,
+            &mut texts,
+            &mut text_order,
+            &mut atoms,
+        );
+        let ids: Vec<u64> = tree.tables.iter().map(|(id, _)| *id).collect();
+        let [top, outer, inner] = ids[..] else {
+            panic!("three tables: {ids:?}")
+        };
+        let quote = tree.children[&DOC][2].id;
+        let cell = tree.children[&outer][0].id;
+        // A box's move moves the tables in it, however deep, and nothing
+        // else: a table holds only the tables in its cells.
+        assert_eq!(tree.table_holders[&DOC], [top, outer, inner]);
+        assert_eq!(tree.table_holders[&quote], [outer, inner]);
+        assert_eq!(tree.table_holders[&outer], [inner]);
+        assert_eq!(tree.table_holders[&cell], [inner]);
+        assert!(!tree.table_holders.contains_key(&top));
+        assert!(!tree.table_holders.contains_key(&inner));
+        assert_eq!(tree.table_holders.len(), 4);
+    }
 }
 
 /// A wake-up that any thread or call may signal and one task awaits:
@@ -3327,6 +3502,14 @@ impl ViewGeometry for GeometryHandle {
             return None;
         }
         GeometryHandle::page_shift(self)
+    }
+
+    fn table_viewport(&self, pos: usize) -> Option<Bounds<Points>> {
+        if !self.here() {
+            return None;
+        }
+        let id = self.tree.borrow().id_at(pos)?;
+        self.geo.borrow().table_viewport(id)
     }
 
     fn node_rect(&self, pos: usize) -> Option<Bounds<Points>> {

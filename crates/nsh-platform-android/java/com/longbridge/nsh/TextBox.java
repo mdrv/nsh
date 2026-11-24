@@ -16,6 +16,21 @@ import android.view.accessibility.AccessibilityNodeInfo;
 final class TextBox extends android.view.ViewGroup implements Node {
     final Decor decor = new Decor();
 
+    // `clipPath`: what it draws shows, and touches reach it and its
+    // children, only inside it (`Decor.drawClipped`, `Decor.clipsOut`).
+    @Override
+    public void draw(android.graphics.Canvas canvas) {
+        decor.drawClipped(canvas, this, () -> super.draw(canvas));
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(android.view.MotionEvent e) {
+        if (e.getActionMasked() == android.view.MotionEvent.ACTION_DOWN && decor.clipsOut(this, e.getX(), e.getY())) {
+            return false;
+        }
+        return super.dispatchTouchEvent(e);
+    }
+
     /** An outer box shadow draws outside the bounds, and compositing the
      * view at alpha < 1 into the bounds-clipped offscreen buffer would cut
      * it; such a view reports no overlapping rendering, so the alpha
@@ -180,8 +195,9 @@ final class TextBox extends android.view.ViewGroup implements Node {
                 downX = e.getX();
                 downY = e.getY();
                 extending = false;
-                // A tap on the text ends its selection (a long press makes a new one).
-                clearSelection();
+                // A long press makes a new selection; a tap ends this one
+                // (`Mounter.touchUp`), a scroll keeps it.
+                removeCallbacks(longPress);
                 postDelayed(longPress, android.view.ViewConfiguration.getLongPressTimeout());
                 break;
             case android.view.MotionEvent.ACTION_MOVE: {
@@ -284,6 +300,7 @@ final class TextBox extends android.view.ViewGroup implements Node {
             // One selection per surface.
             if (mounter.selectedArea != null) mounter.selectedArea.clear();
             mounter.selectedText = this;
+            mounter.keepSelection();
         }
         placeHandles();
         if (toolbar) showToolbar();
@@ -388,7 +405,7 @@ final class TextBox extends android.view.ViewGroup implements Node {
                             .setType("text/plain")
                             .putExtra(android.content.Intent.EXTRA_TEXT, selectedText());
                     android.content.Intent chooser = android.content.Intent.createChooser(send, null);
-                    if (!(getContext() instanceof android.app.Activity)) {
+                    if (SystemUi.activity(getContext()) == null) {
                         chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
                     }
                     try {

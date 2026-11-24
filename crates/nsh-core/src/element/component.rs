@@ -530,7 +530,7 @@ pub(crate) fn name_of<C: Component>() -> &'static str {
 
 /// A type's own name, its JS export: the last segment of its path, without
 /// a generic type's arguments (the test `components_are_named_after_their_types`).
-fn export_name(type_name: &str) -> &str {
+pub(crate) fn export_name(type_name: &str) -> &str {
     let path = type_name.split('<').next().unwrap_or(type_name);
     path.rsplit("::").next().unwrap_or(path)
 }
@@ -574,7 +574,7 @@ pub struct Root {
     fonts: Vec<Arc<[u8]>>,
     appearance: Option<crate::platform::Appearance>,
     app_id: Option<String>,
-    url_schemes: Vec<String>,
+    links: crate::url_scheme::AppLinks,
     capabilities: Option<crate::access::Capabilities>,
     status_bar: Option<crate::StatusBarSetting>,
     main_window: Option<crate::desktop::MainWindowOptions>,
@@ -592,7 +592,7 @@ impl Root {
             fonts: Vec::new(),
             appearance: None,
             app_id: None,
-            url_schemes: Vec::new(),
+            links: crate::url_scheme::AppLinks::default(),
             capabilities: None,
             status_bar: None,
             main_window: None,
@@ -668,17 +668,54 @@ impl Root {
         self.app_info.as_ref()
     }
 
-    /// The URL schemes the app claims (`nsh.json` `schemes`,
-    /// which nsh's generated code sets): the links the core lets
-    /// through ([`crate::url_scheme`], [`crate::element::next_url_scheme_open`]).
+    /// The URL schemes the app claims (`nsh.json` `schemes`): the links the
+    /// core lets through ([`crate::url_scheme`],
+    /// [`crate::element::next_url_scheme_open`]). Replaces the schemes of
+    /// [`Root::links`], keeping its web links.
     pub fn url_schemes(mut self, schemes: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.url_schemes = schemes.into_iter().map(Into::into).collect();
+        self.links.set_schemes(schemes);
         self
     }
 
     /// The schemes the app claims ([`Root::url_schemes`]).
     pub fn url_schemes_ref(&self) -> &[String] {
-        &self.url_schemes
+        self.links.schemes()
+    }
+
+    /// The links the app claims (`nsh.json` `schemes` and `links`, which
+    /// nsh's generated code sets): URLs of its schemes and `https` URLs of
+    /// its web links, the links the core lets through ([`crate::url_scheme`],
+    /// [`crate::element::next_url_scheme_open`]).
+    pub fn links(mut self, links: crate::url_scheme::AppLinks) -> Self {
+        self.links = links;
+        self
+    }
+
+    /// [`Root::links`] from `nsh.json`'s `schemes` and `links` as JSON text
+    /// (`{"schemes": [...], "links": [...]}`), which nsh's generated code
+    /// compiles in (checked when it was generated). Read as a package's
+    /// `app.json` is: what this runtime cannot claim is left out (logged).
+    #[doc(hidden)]
+    pub fn links_json(self, json: &str) -> Self {
+        let links = match serde_json::from_str::<serde_json::Value>(json) {
+            Ok(config) => {
+                let (links, ignored) = crate::url_scheme::AppLinks::from_json_lenient(&config);
+                for what in ignored {
+                    log::warn!("nsh.json: {what}, ignored");
+                }
+                links
+            }
+            Err(e) => {
+                log::warn!("nsh.json: links: {e}; none claimed");
+                crate::url_scheme::AppLinks::default()
+            }
+        };
+        self.links(links)
+    }
+
+    /// The links the app claims ([`Root::links`]).
+    pub fn links_ref(&self) -> &crate::url_scheme::AppLinks {
+        &self.links
     }
 
     /// What the app declares it may reach (`nsh.json` `capabilities`, which
@@ -857,6 +894,17 @@ impl fmt::Debug for Root {
     }
 }
 
+/// What a component element made by name ([`super::ComponentElement::by_name`])
+/// has for its `make`: never called, the registry makes it.
+pub(crate) fn missing_instance() -> Box<dyn AnyInstance> {
+    unreachable!("a component made by name is made by its registry")
+}
+
+/// What a component element made by name has for its `spec`: never called.
+pub(crate) fn missing_spec() -> ComponentSpec {
+    unreachable!("a component made by name is made by its registry")
+}
+
 /// A new instance of `C`, its props not set yet.
 pub(crate) fn make_instance<C: Component>() -> Box<dyn AnyInstance> {
     Box::new(super::once::OnceInstance::<C>::new())
@@ -893,9 +941,13 @@ pub struct BuiltInScrollbar {
     pub target: crate::NodeId,
     /// Whether that view scrolls sideways.
     pub horizontal: bool,
-    /// The view's own theme (its `scrollbar` object, as JSON); `None`: the
-    /// app's.
+    /// The view's own theme (its `scrollbar` object, as JSON); `None`
+    /// with no [`Self::theme_value`]: the app's.
     pub theme: Option<Arc<crate::JsonValue>>,
+    /// The view's own theme as Rust gave it
+    /// ([`ScrollbarSetting::ThemeValue`](crate::ScrollbarSetting::ThemeValue)),
+    /// a value of the set's theme type.
+    pub theme_value: Option<super::AnyValue>,
     /// The app's theme, as the set gave it
     /// ([`set_builtin_scrollbars`](super::set_builtin_scrollbars)).
     pub app_theme: Option<super::AnyValue>,
@@ -906,6 +958,50 @@ pub struct BuiltInScrollbar {
 /// it scrolls; `None` leaves the view the platform's indicator
 /// ([`Registry::scrollbars_from`]).
 pub type ScrollbarSource = fn(&BuiltInScrollbar) -> Option<super::AnyElement>;
+
+/// A theme of one view's own given in Rust
+/// ([`ScrollbarSetting::ThemeValue`](crate::ScrollbarSetting::ThemeValue)):
+/// a value of the theme type of the UI set that makes bars, with the set's
+/// maker, so a Rust app that never registered the set gets the bar too (as
+/// with [`set_builtin_scrollbars`](super::set_builtin_scrollbars)). Two are
+/// equal when they hold the same value.
+#[derive(Clone)]
+pub struct ScrollbarThemeValue {
+    source: ScrollbarSource,
+    theme: super::AnyValue,
+}
+
+impl ScrollbarThemeValue {
+    /// `theme`, drawn by `source` (which reads it as
+    /// [`BuiltInScrollbar::theme_value`]).
+    pub fn new(source: ScrollbarSource, theme: super::AnyValue) -> Self {
+        Self { source, theme }
+    }
+
+    /// What makes the bar.
+    pub fn source(&self) -> ScrollbarSource {
+        self.source
+    }
+
+    /// The theme.
+    pub fn theme(&self) -> &super::AnyValue {
+        &self.theme
+    }
+}
+
+impl PartialEq for ScrollbarThemeValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.theme == other.theme
+    }
+}
+
+impl std::fmt::Debug for ScrollbarThemeValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ScrollbarThemeValue")
+            .field(&self.theme)
+            .finish()
+    }
+}
 
 /// What a UI set exports to JS: its components and modules, and what it
 /// passes on from the runtime. Cheap to clone.
@@ -937,6 +1033,9 @@ pub struct Registry {
     submodules: Arc<Vec<Registry>>,
     /// What each engine serving the set runs once ([`Registry::setup`]).
     setups: Arc<Vec<Setup>>,
+    /// The stand-ins its modules give headless runs, by name
+    /// ([`Registry::fake`]).
+    fakes: Arc<Vec<(&'static str, Arc<dyn crate::fake::Fake>)>>,
 }
 
 /// A function each engine serving a set runs once ([`Registry::setup`]).
@@ -1135,8 +1234,8 @@ impl Registry {
     ///
     /// # Panics
     ///
-    /// When two sets register the same component or two types of the same
-    /// name.
+    /// When two sets register the same component, two types of the same
+    /// name or two fakes of the same name ([`Registry::fake`]).
     #[track_caller]
     pub fn merged(sets: &[Registry]) -> Self {
         let mut out = Self::default();
@@ -1144,6 +1243,14 @@ impl Registry {
             out.tokens = out.tokens.or(set.tokens);
             out.scrollbars = out.scrollbars.or(set.scrollbars);
             Arc::make_mut(&mut out.setups).extend(set.setups.iter().cloned());
+            let fakes = Arc::make_mut(&mut out.fakes);
+            for (name, fake) in set.fakes.iter() {
+                assert!(
+                    fakes.iter().all(|(n, _)| n != name),
+                    "two fakes are named `{name}`, by two UI sets"
+                );
+                fakes.push((name, fake.clone()));
+            }
             let types = Arc::make_mut(&mut out.types);
             for (name, ty) in set.types.iter() {
                 if let Some(old) = types.insert(name, ty.clone()) {
@@ -1263,6 +1370,38 @@ impl Registry {
     pub fn setup(&mut self, f: impl Fn() + Send + Sync + 'static) -> &mut Self {
         Arc::make_mut(&mut self.setups).push(Arc::new(f));
         self
+    }
+
+    /// Gives headless runs `fake` in place of what a module of the set asks
+    /// of the platform, under `name` (`"nsh-extra/speech"`: the set's
+    /// specifier and the module), which tests call it by
+    /// ([`crate::fake`]). Apps never use it; the headless driver installs
+    /// it before the app starts. An app's crate calls it from its
+    /// `#[native_module]` function.
+    ///
+    /// # Panics
+    ///
+    /// When the set has a fake of that name already. Names are unique
+    /// across the sets an app is served, too ([`Registry::merged`]).
+    #[track_caller]
+    pub fn fake(&mut self, name: &'static str, fake: Arc<dyn crate::fake::Fake>) -> &mut Self {
+        assert!(
+            self.fakes.iter().all(|(n, _)| *n != name),
+            "two fakes are named `{name}`{}",
+            of_set(self.ui_set.or(self.namespace))
+        );
+        Arc::make_mut(&mut self.fakes).push((name, fake));
+        self
+    }
+
+    /// The fakes [`Registry::fake`] gave the set and the sets served under
+    /// it, by name, in order: what the headless driver installs.
+    #[doc(hidden)]
+    pub fn fakes(&self) -> Vec<(&'static str, Arc<dyn crate::fake::Fake>)> {
+        self.sets()
+            .into_iter()
+            .flat_map(|set| set.fakes.iter().cloned())
+            .collect()
     }
 
     /// Runs the functions [`Registry::setup`] gave the set (a merged set's:
@@ -1426,6 +1565,18 @@ impl Registry {
             }
         }
         out
+    }
+
+    /// A new instance of the component of type `id`, and its registered
+    /// name (a component element made by name).
+    pub(crate) fn make_type(
+        &self,
+        id: TypeId,
+    ) -> Option<(Arc<ComponentSpec>, Box<dyn AnyInstance>)> {
+        self.types
+            .values()
+            .find(|t| t.id == id)
+            .map(|t| (t.spec.clone(), (t.make)()))
     }
 
     /// A new instance of component `name`.
@@ -2237,6 +2388,37 @@ mod tests {
             message,
             "component `nsh_core::element::component::tests::Stepper` is registered twice, by two UI sets"
         );
+    }
+
+    struct NoFake;
+
+    impl crate::fake::Fake for NoFake {
+        fn install(&self) {}
+
+        fn call(&self, _: &str, _: &[crate::JsonValue]) -> Result<crate::JsonValue, String> {
+            Ok(crate::JsonValue::Null)
+        }
+    }
+
+    /// A test calls a fake by its name alone: two sets cannot give one name.
+    #[test]
+    fn fake_names_are_unique_across_sets() {
+        let mut a = Registry::ui_set("test/a");
+        a.fake("test/mic", Arc::new(NoFake));
+        let mut b = Registry::ui_set("test/b");
+        b.fake("test/camera", Arc::new(NoFake));
+        let names: Vec<_> = Registry::merged(&[a.clone(), b])
+            .fakes()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["test/mic", "test/camera"]);
+        let mut c = Registry::ui_set("test/c");
+        c.fake("test/mic", Arc::new(NoFake));
+        let twice =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Registry::merged(&[a, c])));
+        let message = *twice.unwrap_err().downcast::<String>().unwrap();
+        assert_eq!(message, "two fakes are named `test/mic`, by two UI sets");
     }
 }
 

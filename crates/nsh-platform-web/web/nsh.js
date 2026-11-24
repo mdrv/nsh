@@ -61,6 +61,11 @@ const FOCUSED = 4;
  * modality as it is (`inputWith`). */
 const MODALITY_KEYS_SKIPPED = new Set(["Shift", "Control", "Alt", "AltGraph", "Meta", "CapsLock", "Fn", "Hyper", "Super", "OS"]);
 const PRESS_EVENTS = ["onPress", "onLongPress", "onPressIn", "onPressOut"];
+/** A view listening to one of these receives files dragged in from the system. */
+const FILE_DROP_EVENTS = ["onFileDrop", "onFileDragEnter", "onFileDragLeave"];
+/** The most files one drop reads, and the most bytes it reads in all (as `Picker.pickFiles`). */
+const FILE_DROP_LIMIT = 100;
+const FILE_DROP_MAX_BYTES = 512 * 1024 * 1024;
 /** The press listeners other than `onLongPress`, which alone leaves the taps to the views around. */
 const TAP_EVENTS = ["onPress", "onPressIn", "onPressOut"];
 const MOUSE_EVENTS = ["onMouseEnter", "onMouseLeave", "onMouseMove"];
@@ -72,6 +77,22 @@ const MOUSE_BUTTON_NAMES = ["left", "middle", "right", "back", "forward"];
 const MOUSE_BUTTON_BITS = [1, 4, 2, 8, 16];
 /** The keys whose press or release is reported as a mouse move. */
 const MOUSE_MODIFIER_KEYS = new Set(["Control", "Alt", "Shift", "Meta"]);
+/** A link the browser can open itself, drawn as an `a`: a `Link` with an
+ * `href`, and a link of text that goes somewhere (`fillRun`). */
+const LINK_SELECTOR = "a.nsh-v[href], a.nsh-link[href]";
+/** The schemes of the addresses a link of text is drawn as an `a` for
+ * (`textLinkAddress`): what a browser opens from a page. */
+const TEXT_LINK_SCHEMES = new Set(["http:", "https:", "mailto:", "tel:"]);
+
+/**
+ * Whether pointer event `e` holds a modifier key. A click with one on a link
+ * (`LINK_SELECTOR`) is the browser's, which opens the link in a new tab (Cmd
+ * or Ctrl), a new window (Shift) or downloads it (Alt); a plain one is the
+ * app's (`installInput`, `pointerDown`).
+ */
+function heldModifier(e) {
+  return e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
+}
 // What lays out a field's text, copied to the hidden copy that finds its
 // caret (`caretBounds`).
 const CARET_STYLE = [
@@ -83,7 +104,8 @@ const CARET_STYLE = [
 /** `accessibilityRole`s whose ARIA role has another name; others are the same. */
 const ARIA_ROLES = {
   none: null, header: "heading", image: "img", imagebutton: "button", keyboardkey: "button", adjustable: "slider",
-  search: "searchbox", text: null, summary: "status", togglebutton: "button", dropdownlist: "combobox",
+  search: "searchbox", textbox: "textbox", text: null, summary: "status", togglebutton: "button",
+  dropdownlist: "combobox",
 };
 
 /** Reconcile accessibility props with the element's current attributes. */
@@ -247,6 +269,13 @@ const KEYFRAMES = `
 .nsh-pan { touch-action: none; }
 .nsh-pan-x { touch-action: pan-y; }
 .nsh-pan-y { touch-action: pan-x; }
+/* A pan of one way leaves the other way to the browser where it can tell
+   them apart (CSS's pan-right scrolls right: the finger moves left), else
+   the other axis only. */
+.nsh-pan-right { touch-action: pan-y; touch-action: pan-right pan-y; }
+.nsh-pan-left { touch-action: pan-y; touch-action: pan-left pan-y; }
+.nsh-pan-down { touch-action: pan-x; touch-action: pan-x pan-down; }
+.nsh-pan-up { touch-action: pan-x; touch-action: pan-x pan-up; }
 .nsh-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 /* Scroll indicators: a thin, translucent thumb with no track, as on phones,
    rather than the platform's scrollbar (with arrow buttons on Windows).
@@ -352,6 +381,10 @@ img.nsh-fill { pointer-events: none; }
 .nsh-selectable, .nsh-selectable * { -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }
 .nsh-selectable ::selection { background: var(--nsh-selection, Highlight); }
 .nsh-link { cursor: pointer; }
+/* A link of text drawn as an a (fillRun) looks as the span it would be:
+   its run's color and decoration, none of the browser's link blue,
+   underline or focus ring. */
+a.nsh-link { color: inherit; text-decoration: none; outline: none; }
 /* With the desktop idiom text is selectable as on a web page unless it is
    set off (selectable={false}) or inside something that takes presses
    or touches (nsh-press). */
@@ -548,6 +581,26 @@ function webShareAllowed() {
   return typeof policy?.allowsFeature === "function" ? policy.allowsFeature("web-share") : true;
 }
 
+/** The kinds `network()` names for `navigator.connection.type`'s. */
+const CONNECTION_KINDS = {
+  wifi: "wifi", cellular: "cellular", ethernet: "wired", none: "none",
+  bluetooth: "other", wimax: "other", mixed: "other", other: "other",
+};
+
+/**
+ * How the page reaches the network (`network()`): `none` while the
+ * browser says it is offline (`navigator.onLine`, which is true whenever
+ * the browser has a link, even one without the internet), else the link
+ * `navigator.connection` names (Chromium on Android; desktop browsers name
+ * none: `unknown`). The link is expensive when it is cellular, constrained
+ * when the user asked to save data (`saveData`).
+ */
+function webNetwork(nav = typeof navigator === "undefined" ? undefined : navigator) {
+  const connection = nav?.connection;
+  const kind = nav?.onLine === false ? "none" : CONNECTION_KINDS[connection?.type] ?? "unknown";
+  return { kind, expensive: kind === "cellular", constrained: connection?.saveData === true };
+}
+
 /** The browser's time zone (`Asia/Shanghai`), Intl's default; "" when unknown. */
 function timeZoneName() {
   return new Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
@@ -717,9 +770,6 @@ function swapClass(el, slot, name) {
   el[slot] = name;
 }
 
-/** Fills a run with `text`, the characters of links (`parts`: `[from, to,
- * link]`, UTF-16) in spans inside it that name their link (`links`):
- * inline, they keep the run's shaping and bidi order. */
 /**
  * The one color text view `el` is drawn in (null: several, which its runs
  * carry): on the element, which the runs inherit it from, so a change of it
@@ -745,21 +795,42 @@ function setTextColor(el, color) {
   }
 }
 
+/**
+ * Fills a run with `text`, the characters of links (`parts`: `[from, to,
+ * link]`, UTF-16) in elements inside it that name their link (`links`):
+ * inline, they keep the run's shaping and bidi order. A link that takes
+ * presses and goes somewhere a browser opens (its `address`,
+ * `textLinkAddress`) is an `a`, as a `Link` is: the browser shows where it
+ * goes, a click with a modifier key or the middle button opens it there
+ * (`LINK_SELECTOR`), and its menu is the browser's link menu
+ * (`contextMenu`). Any other link is a span.
+ */
 function fillRun(run, text, parts, links) {
   if (!parts) {
     run.textContent = text;
     return;
   }
   let at = 0;
-  for (const [from, to, link] of parts) {
+  for (const [from, to, index] of parts) {
     if (from > at) run.append(text.slice(at, from));
-    const span = document.createElement("span");
-    span.textContent = text.slice(from, to);
-    span._link = links[link];
+    const link = links[index];
+    const presses = PRESS_EVENTS.some((e) => link.events?.has(e));
+    const el = document.createElement(presses && link.address ? "a" : "span");
+    el.textContent = text.slice(from, to);
+    el._link = link;
+    if (el.localName === "a") {
+      el.setAttribute("href", link.address);
+      // A drag selects its characters, as a span's do. Tab passes it, as
+      // it passes every link of text here: the core's stops of links of
+      // text (`TextLink::focus_stop`) come to the web in a change of their
+      // own (docs/dev/elements.md, "Keyboard focus").
+      el.draggable = false;
+      el.tabIndex = -1;
+    }
     // A link's pointer over the I-beam of selectable text, as a browser's
     // `<a>` and the other desktops' link spans.
-    if (PRESS_EVENTS.some((e) => span._link.events.has(e))) span.classList.add("nsh-link");
-    run.append(span);
+    if (presses) el.classList.add("nsh-link");
+    run.append(el);
     at = to;
   }
   if (at < text.length) run.append(text.slice(at));
@@ -1237,10 +1308,12 @@ class Player {
         font_ascent: (fp, fl) => this.metrics(this.str(fp, fl))[0],
         font_descent: (fp, fl) => this.metrics(this.str(fp, fl))[1],
         font_x_height: (fp, fl) => this.metrics(this.str(fp, fl))[2],
-        register_font: (fp, fl, dp, dl, weight, italic) => {
+        register_font: (fp, fl, dp, dl, weight, maxWeight, italic) => {
           const family = this.str(fp, fl);
           const data = this.bytes(dp, dl).slice();
-          const face = new FontFace(family, data, { weight: String(weight), style: italic ? "italic" : "normal" });
+          // A variable font gets its `wght` range: one value would pin the axis.
+          const range = maxWeight > weight ? `${weight} ${maxWeight}` : String(weight);
+          const face = new FontFace(family, data, { weight: range, style: italic ? "italic" : "normal" });
           document.fonts.add(face);
           this.fontLoading(face.load());
         },
@@ -1930,6 +2003,21 @@ class Player {
    * first: a side module, or an export of a module published whole.
    */
   async loadData(name) {
+    // A part of nsh/base a Rust app made a component of by name: its side
+    // module, or its gate in a module published whole; then the engine
+    // makes what waited for it. Nothing comes back on failure: the
+    // component keeps showing nothing, and the next one mounted asks again.
+    if (name.startsWith("part:")) {
+      const gate = `nsh_part_${name.slice(5)}`;
+      try {
+        if (this.options.sides?.[gate]) await this.loadSide(gate, this.options.sides);
+        else this.wasm[gate]?.();
+        this.call((w) => this.withStrings([gate], (p, l) => w.nsh_after_gate(p, l)));
+      } catch (err) {
+        console.warn("[nsh]", `${err.message ?? err} (${gate})`);
+      }
+      return;
+    }
     const url = this.data?.[name] ?? new URL(`nsh-${name}.bin`, import.meta.url);
     let bytes = null;
     try {
@@ -2181,6 +2269,11 @@ class Player {
     resolution();
     addEventListener("languagechange", changed);
     addEventListener("resize", changed);
+    // `network()`: the browser going on- and offline, and its link where it
+    // names one (`navigator.connection`, Chromium's).
+    addEventListener("online", changed);
+    addEventListener("offline", changed);
+    navigator.connection?.addEventListener?.("change", changed);
     // `lifecycle()`: hidden (another tab, a minimized window) or without
     // the focus. The time zone (`localeSettings()`) is read again then too: browsers tell no
     // change of the system's zone, which the user makes away from the page.
@@ -2270,8 +2363,11 @@ class Player {
       appleKeyboard: APPLE,
       host: Boolean(this.options.host),
       lifecycle: this.lifecycle(),
+      network: webNetwork(),
       timeZone: timeZoneName(),
       screenColor: typeof window.EyeDropper === "function",
+      // `writeClipboard` reports each write's result.
+      clipboardWriteResult: true,
       share: webShareAllowed(),
       notifications: typeof window.Notification === "function",
       audio: typeof (window.AudioContext ?? window.webkitAudioContext) === "function",
@@ -2391,6 +2487,29 @@ class Player {
     if (this.readingHosts?.size) this.orderReading();
     if (this.relating?.size) this.linkRelations();
     if (this.viewportOverlays) this.syncFloats();
+    if (this.autoFocusing?.size) this.focusAppeared();
+  }
+
+  /** The `autoFocus` inputs the batch put in the page take the focus now,
+   * in the turn that applied it: a batch an event's handler made is still
+   * in that event, where iOS Safari raises the keyboard for a focus (and
+   * only there: not from a timer after it). One not in the page yet (its
+   * container comes in a later batch) waits for that batch; one removed
+   * meanwhile is forgotten. Like a focus command's, the focus is this
+   * press's (`pressFocus`): the mouse events the browser makes of a touch
+   * would otherwise take it away, the finger being over the views the
+   * press replaced. */
+  focusAppeared() {
+    for (const el of this.autoFocusing) {
+      if (this.views.get(el._id) !== el) {
+        this.autoFocusing.delete(el);
+        continue;
+      }
+      if (!el.isConnected) continue;
+      this.autoFocusing.delete(el);
+      el._field?.focus();
+      this.pressFocus = el._field ?? null;
+    }
   }
 
   /** The DOM id of view `id`: unique on the page, beside other players. */
@@ -3009,8 +3128,13 @@ class Player {
         `border-radius:${r}px;background:${color}`;
       frag.append(box);
     }
-    // Nested texts that take presses: `[node, events]`, which runs name.
-    const spans = (links ?? []).map(([node, events]) => ({ node, events: new Set(events) }));
+    // Nested texts that take presses: `[node, events, href?]`, which runs
+    // name; one that goes somewhere a browser opens is drawn as an `a`.
+    const spans = (links ?? []).map(([node, events, href]) => ({
+      node,
+      events: new Set(events),
+      address: this.textLinkAddress(href),
+    }));
     runs.forEach(([x, y, text, style, start, parts, after], i) => {
       const span = document.createElement("span");
       const name = this.styleClass(styles[style]);
@@ -3248,6 +3372,7 @@ class Player {
     set("aria-valuetext", text);
     set("aria-live", p.live);
     set("aria-hidden", p.hidden && "true");
+    set("aria-orientation", p.orientation);
     if (p.activeDescendant != null || p.controls != null || p.describedBy != null || el._related) {
       // Linked once the batch is applied (`linkRelations`).
       el._related = p.activeDescendant != null || p.controls != null || p.describedBy != null;
@@ -3367,18 +3492,22 @@ class Player {
 
   /** What touches on `el` leave to the browser: nothing on views with
    * native pans, pinches or rotations; a `panActivation` gate along one
-   * axis leaves scrolling along the other. Views that take presses or
-   * touches are marked: text in them is not selected by default. */
+   * axis leaves scrolling along the other, and one with a way the drags
+   * the other way too, where the browser offers it. Views that take
+   * presses or touches are marked: text in them is not selected by
+   * default. */
   updateTouchAction(el) {
     const pan = el._gestures?.pan || el._events.has("onPanStart") || el._events.has("onPanEnd");
     const pinch = el._gestures?.pinch || el._gestures?.rotation;
     el.classList.toggle("nsh-press", !!(el._pressable || pan || pinch || el._events.has("onTouch")));
     const gate = el._props?.panActivation;
-    const horizontal = gate && gate[0] != null && gate[1] == null;
-    const vertical = gate && gate[1] != null && gate[0] == null;
+    const way = gate ? this.panWay(gate) : undefined;
+    const horizontal = gate && (way ? way === "left" || way === "right" : gate[0] != null && gate[1] == null);
+    const vertical = gate && (way ? way === "up" || way === "down" : gate[1] != null && gate[0] == null);
     el.classList.toggle("nsh-pan", !!(pinch || (pan && !horizontal && !vertical)));
-    el.classList.toggle("nsh-pan-x", !pinch && !!horizontal);
-    el.classList.toggle("nsh-pan-y", !pinch && !!vertical);
+    el.classList.toggle("nsh-pan-x", !pinch && !way && !!horizontal);
+    el.classList.toggle("nsh-pan-y", !pinch && !way && !!vertical);
+    for (const w of ["left", "right", "up", "down"]) el.classList.toggle(`nsh-pan-${w}`, !pinch && way === w);
   }
 
   // Layout animations (`LayoutAnimation`): frames move, new views appear
@@ -5711,7 +5840,8 @@ class Player {
     this.inputScrolled(el, field);
     if (config.autoFocus && !el._autoFocused) {
       el._autoFocused = true;
-      setTimeout(() => field.focus(), 0);
+      // Focused once the batch has put it in the page (`focusAppeared`).
+      (this.autoFocusing ??= new Set()).add(el);
     }
   }
 
@@ -5807,9 +5937,9 @@ class Player {
   }
 
   /** Reports how far `el`'s textarea scrolled, and its text's height and
-   * its viewport's, while a built-in bar takes its indicator's place. */
+   * its viewport's, while a bar of the app's follows it (`reportScroll`). */
   inputScrolled(el, field) {
-    if (!el._config?.replaced || field.tagName !== "TEXTAREA") return;
+    if (!el._config?.reportScroll || field.tagName !== "TEXTAREA") return;
     const now = [field.scrollTop, field.clientWidth, field.scrollHeight, field.clientHeight];
     if (field._scrolled?.every((v, i) => v === now[i])) return;
     field._scrolled = now;
@@ -5889,10 +6019,13 @@ class Player {
     const text = data?.getData("text/plain") ?? "";
     const html = data?.getData("text/html") ?? "";
     const files = [...(data?.files ?? [])];
+    // A file larger than `pasteMaxSize` is not read: its name, type and size.
+    const max = el._config?.pasteMaxSize ?? Infinity;
+    const read = files.filter((f) => f.size <= max);
     // A file manager's files are local paths the page cannot read: their
     // `file:` URLs, when the browser lists them.
     const uris = (data?.getData("text/uri-list") ?? "").split(/\r?\n/).filter((u) => u.startsWith("file:"));
-    Promise.all(files.map((f) => f.arrayBuffer())).then((buffers) => {
+    Promise.all(read.map((f) => f.arrayBuffer())).then((buffers) => {
       const size = buffers.reduce((n, b) => n + b.byteLength, 0);
       const bytes = new Uint8Array(size);
       let at = 0;
@@ -5903,7 +6036,13 @@ class Player {
       const json = JSON.stringify({
         text,
         html,
-        files: files.map((f, i) => ({ name: f.name || "image.png", type: f.type, size: buffers[i].byteLength })),
+        files: files.map((f) => {
+          const i = read.indexOf(f);
+          const name = f.name || "image.png";
+          return i < 0
+            ? { name, type: f.type, size: f.size, read: false }
+            : { name, type: f.type, size: buffers[i].byteLength };
+        }),
         uris,
       });
       this.call(() => this.withStrings([json, bytes], (jp, jl, bp, bl) => this.wasm.nsh_paste(el._id, jp, jl, bp, bl)));
@@ -6314,6 +6453,28 @@ class Player {
     } catch {
       return String(href);
     }
+  }
+
+  /**
+   * The `href` a link of text going to `href` (`TextView`'s links,
+   * `AttributedText::link_hrefs`) is drawn with as an `a` (`fillRun`), as a
+   * `Link`'s is (`linkHref` under the site's base), or null to draw it as a
+   * span: an address a browser opens from a page (`TEXT_LINK_SCHEMES`: a
+   * web page, a path of the site, mail and phone links). An `#anchor` is a
+   * heading of the text's own document, and any other scheme (an app's own
+   * routes, `javascript:`) is the app's to route: a span.
+   */
+  textLinkAddress(href) {
+    href = href?.trim();
+    if (!href || href.startsWith("#")) return null;
+    let url;
+    try {
+      url = new URL(href, this.siteBase ?? document.baseURI);
+    } catch {
+      return null;
+    }
+    if (!TEXT_LINK_SCHEMES.has(url.protocol)) return null;
+    return this.siteBase ? url.href : href;
   }
 
   /** What the app's relative addresses and links resolve against: the
@@ -7439,8 +7600,8 @@ class Player {
       case "playerClose": this.playerClose(args[0]); break;
       case "setBadge": this.setBadge(args[0]); break;
       case "openUrl": this.event(ROOT_ID, "onOpenUrl", { id: args[0], opened: this.openUrl(args[1]) }); break;
-      case "setClipboard": this.writeClipboard(args[0]); break;
-      case "setClipboardItem": this.writeClipboard(args[0], args[1] ?? undefined); break;
+      case "setClipboard": this.writeClipboard(args[0], undefined, (written) => this.event(ROOT_ID, "onClipboardWrite", { written })); break;
+      case "setClipboardItem": this.writeClipboard(args[0], args[1] ?? undefined, (written) => this.event(ROOT_ID, "onClipboardWrite", { written })); break;
       case "readClipboard": this.readClipboard(args[0], args[1]); break;
       case "setClipboardImage": this.writeClipboardImage(args[0]); break;
       case "readClipboardImage": this.readClipboardImage(args[0], args[1]); break;
@@ -7598,8 +7759,8 @@ class Player {
    * context; some browsers want a gesture), then a copy command over a
    * selected offscreen text area.
    */
-  writeClipboard(text, html) {
-    if (navigator.userActivation?.isActive !== false && this.copyCommand(text, html)) return;
+  writeClipboard(text, html, done = () => {}) {
+    if (navigator.userActivation?.isActive !== false && this.copyCommand(text, html)) return done(true);
     const copy = () => {
       const focused = document.activeElement;
       const area = document.createElement("textarea");
@@ -7608,20 +7769,21 @@ class Player {
       document.body.append(area);
       // Safari copies only a selection.
       area.select();
-      this.copyCommand(text, html);
+      const written = this.copyCommand(text, html);
       area.remove();
       // The selection took the focus from the field that had it (a
       // RichEditor's input).
       if (focused && focused !== document.body && focused.isConnected) focused.focus({ preventScroll: true });
+      done(written);
     };
     if (html !== undefined && navigator.clipboard?.write && typeof ClipboardItem === "function") {
       const item = new ClipboardItem({
         "text/plain": new Blob([text], { type: "text/plain" }),
         "text/html": new Blob([html], { type: "text/html" }),
       });
-      navigator.clipboard.write([item]).catch(copy);
+      navigator.clipboard.write([item]).then(() => done(true), copy);
     } else if (html === undefined && navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).catch(copy);
+      navigator.clipboard.writeText(text).then(() => done(true), copy);
     } else {
       copy();
     }
@@ -8960,6 +9122,7 @@ class Player {
 
   installInput() {
     const root = this.root;
+    this.installFileDrop(root);
     // What the user gives input with, told before it acts (the capture
     // phase, ahead of the app's handlers and the browser's focus moves):
     // the core shows the focus by it (`focus-visible:`), as the browser
@@ -8977,14 +9140,22 @@ class Player {
     }, { passive: false });
     // A link (`Link` with an `href`) is the app's to press: a plain click
     // stays in the app (its `onPress`), a click with a modifier or the
-    // middle button opens its `href` as the browser would.
+    // middle button opens its `href` as the browser would, and the link
+    // takes no press then (`pointerDown`).
     root.addEventListener("click", (e) => {
-      const link = e.target instanceof Element ? e.target.closest("a.nsh-v[href]") : null;
-      if (link && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) e.preventDefault();
+      const link = e.target instanceof Element ? e.target.closest(LINK_SELECTOR) : null;
+      if (link && e.button === 0 && !heldModifier(e)) e.preventDefault();
     });
     window.addEventListener("pointermove", (e) => this.pointerMove(e), { passive: false });
     window.addEventListener("pointerup", (e) => this.pointerUp(e, false));
     window.addEventListener("pointercancel", (e) => this.pointerUp(e, true));
+    window.addEventListener("blur", () => {
+      this.hoverButtons = 0;
+      for (const [pointerId, p] of [...this.pointers]) {
+        p.scrolls = null;
+        this.pointerUp({ pointerId, buttons: 0 }, true);
+      }
+    });
     // A drag never drags images or text out of the app.
     root.addEventListener("dragstart", (e) => e.preventDefault());
     root.addEventListener("mousedown", (e) => this.mouseDown(e));
@@ -9040,6 +9211,8 @@ class Player {
   contextMenu(e, keyboard = false) {
     const view = this.viewOf(e.target);
     if (!view) return false;
+    // A link of text drawn as an `a` (`fillRun`), inside `view`.
+    const textLink = e.target?.closest?.("a.nsh-link[href]") ?? null;
     for (const el of this.ancestors(view)) {
       if (el._events?.has("onContextMenu")) {
         e.preventDefault();
@@ -9061,9 +9234,11 @@ class Player {
         });
         return true;
       }
-      // A link (`Link` with an `href`) the app shows no menu for has
-      // the browser's: open in a new tab, copy the link.
+      // A link (`Link` with an `href`, or a link of the text that is `view`)
+      // the app shows no menu for has the browser's: open in a new tab,
+      // copy the link.
       if (el.localName === "a" && el.hasAttribute("href")) return true;
+      if (el === view && textLink) return true;
       if (el.matches(".nsh-field, .nsh-selectable")) return false;
     }
     return false;
@@ -9677,8 +9852,9 @@ class Player {
     const a = el._props?.panActivation;
     if (!a) return true;
     const [ax, ay, fx, fy] = a;
-    const x = ax != null || fy != null;
-    const y = ay != null || fx != null;
+    const way = this.panWay(a);
+    const x = way ? way === "left" || way === "right" : ax != null || fy != null;
+    const y = way ? !x : ay != null || fx != null;
     if (x === y) return true;
     let [dx, dy] = [e.deltaX, e.deltaY];
     if (e.shiftKey && !dx) [dx, dy] = [dy, 0];
@@ -9962,6 +10138,120 @@ class Player {
     return [e.clientX / sx - left, e.clientY / sy - top];
   }
 
+  /**
+   * Files dragged in from the system (`onFileDragEnter`, `onFileDragLeave`,
+   * `onFileDrop`): the nearest view up from the one under the pointer that
+   * listens takes the drag. Only there is the browser's default (opening
+   * the file) cancelled; elsewhere the page behaves as without NSH. Only
+   * file drags count: text and links dragged in are left alone. Moving
+   * between a receiver's children enters and leaves nothing.
+   */
+  installFileDrop(root) {
+    const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes("Files");
+    const receiver = (target) => {
+      for (let el = target; el && el !== root.parentNode; el = el.parentNode) {
+        if (el._events && FILE_DROP_EVENTS.some((n) => el._events.has(n))) return el;
+      }
+      return null;
+    };
+    let current = null;
+    let leaveTimer = 0;
+    const leave = () => {
+      clearTimeout(leaveTimer);
+      leaveTimer = 0;
+      const old = current;
+      current = null;
+      if (old?._events.has("onFileDragLeave")) this.event(old._id, "onFileDragLeave");
+    };
+    const track = (e) => {
+      if (!hasFiles(e)) return;
+      const el = receiver(e.target);
+      clearTimeout(leaveTimer);
+      leaveTimer = 0;
+      if (el !== current) {
+        leave();
+        current = el;
+        if (el?._events.has("onFileDragEnter")) {
+          // Only the types: the browser keeps the files until the drop.
+          const mimeTypes = [...e.dataTransfer.items].filter((i) => i.kind === "file").map((i) => i.type);
+          this.fileDrop(el, 0, { mimeTypes, files: [] }, []);
+        }
+      }
+      if (el?._events.has("onFileDrop")) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+      }
+    };
+    root.addEventListener("dragenter", track);
+    root.addEventListener("dragover", track);
+    // A leave toward a child is followed at once by its enter: leave only
+    // when none comes.
+    root.addEventListener("dragleave", (e) => {
+      if (!hasFiles(e) || !current) return;
+      clearTimeout(leaveTimer);
+      leaveTimer = setTimeout(leave, 50);
+    });
+    root.addEventListener("drop", (e) => {
+      if (!hasFiles(e)) return;
+      const el = receiver(e.target);
+      const target = current;
+      clearTimeout(leaveTimer);
+      leaveTimer = 0;
+      current = null;
+      if (target && target !== el && target._events.has("onFileDragLeave")) this.event(target._id, "onFileDragLeave");
+      if (!el?._events.has("onFileDrop")) return;
+      e.preventDefault();
+      // The items are only readable in this handler: keep the `File`s now.
+      // Directories are left out (their `File` has no bytes to read).
+      const files = [];
+      const mimeTypes = [];
+      for (const item of e.dataTransfer.items) {
+        if (item.kind !== "file") continue;
+        mimeTypes.push(item.type);
+        if (item.webkitGetAsEntry?.()?.isDirectory) continue;
+        const file = item.getAsFile();
+        if (file && files.length < FILE_DROP_LIMIT) files.push(file);
+      }
+      const [x, y] = this.point(e);
+      const app = this.app;
+      let budget = FILE_DROP_MAX_BYTES;
+      Promise.all(files.map(async (f) => {
+        if (f.size > budget) return null;
+        budget -= f.size;
+        try {
+          return new Uint8Array(await f.arrayBuffer());
+        } catch {
+          return undefined;
+        }
+      })).then((buffers) => {
+        if (app !== this.app) return;
+        const parts = [];
+        const meta = [];
+        files.forEach((f, i) => {
+          const b = buffers[i];
+          if (b === undefined) return; // Unreadable: left out.
+          if (b === null) console.warn(`nsh: the dropped ${f.name} is not read: past ${FILE_DROP_MAX_BYTES} bytes a drop`);
+          meta.push({ name: f.name, type: f.type, size: b ? b.byteLength : f.size, read: !!b, lastModified: f.lastModified });
+          if (b) parts.push(b);
+        });
+        this.fileDrop(el, 1, { mimeTypes, x, y, files: meta }, parts);
+      });
+    });
+  }
+
+  /** Sends a file drag (`kind` 0: enter, 1: drop) of `el` to the engine, with the read files' bytes. */
+  fileDrop(el, kind, info, parts) {
+    const size = parts.reduce((n, b) => n + b.byteLength, 0);
+    const bytes = new Uint8Array(size);
+    let at = 0;
+    for (const b of parts) {
+      bytes.set(b, at);
+      at += b.byteLength;
+    }
+    const json = JSON.stringify(info);
+    this.call(() => this.withStrings([json, bytes], (jp, jl, bp, bl) => this.wasm.nsh_file_drop(el._id, kind, jp, jl, bp, bl)));
+  }
+
   /** The scale layer `layer` is drawn at (`scaleLayer`): its points are
    * the window's divided by it. */
   layerScale(layer) {
@@ -10039,6 +10329,11 @@ class Player {
     if (e.pointerType === "mouse") this.hoverButtons = e.buttons;
     Player.active = this;
     if (e.button > 0) return;
+    // A click with a modifier key on a link is the browser's, as a middle
+    // click is: it opens the link in a new tab or window (the click
+    // listener of `installInput` leaves it to the browser), so the link
+    // does not also take the press and open it here.
+    if (heldModifier(e) && e.target?.closest?.(LINK_SELECTOR)) return;
     if (e.pointerType === "mouse" && this.desktopUI && this.grabBar(e)) return;
     // A drag selects in selectable text and fields instead of panning a
     // zoomable view.
@@ -10062,6 +10357,10 @@ class Player {
     // pinch here.
     const scrollView = isField ? null : chain.find((v) => v._kind === "scroll") ?? null;
     const link = isField ? null : this.linkPress(e.target, target);
+    // An edge pan starts only from its edge of the page (of the window for
+    // a dialog over it): away from it, neither of its pans does.
+    const [w, h] = layer ? [innerWidth, innerHeight] : [this.root.clientWidth, this.root.clientHeight];
+    const admits = (v) => this.startsAt(v._props?.panActivation, x, y, w, h);
     const p = {
       x, y, layer, startX: x, startY: y, t: performance.now(), vx: 0, vy: 0,
       pointerType: e.pointerType,
@@ -10071,14 +10370,14 @@ class Player {
       // What presses report: the modifier keys at the press and its clicks.
       modifiers: { control: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, platform: e.metaKey },
       clicks: e.pointerType === "mouse" ? this.clickCount(x, y) : 1,
-      pan: chain.find((v) => v._gestures?.pan || v._events.has("onPanStart") || v._events.has("onPanEnd")) ?? null,
+      pan: chain.find((v) => (v._gestures?.pan || v._events.has("onPanStart") || v._events.has("onPanEnd")) && admits(v)) ?? null,
       scroll: !selects && scrollView && e.pointerType !== "mouse" && this.zooms(scrollView) ? scrollView : null,
       // Touch scrolling is the browser's, reported from here (`touchScroll`).
       scrolls: e.pointerType === "touch" ? chain.filter((v) => v._kind === "scroll") : null,
       zoom: chain.find((v) => this.zooms(v) && v._behavior.pinch) ?? null,
       pinch: chain.find((v) => v._gestures?.pinch || v._gestures?.rotation) ?? null,
       // `panActivation`: decided here as the pointer moves (PanActivation::decide).
-      gate: chain.find((v) => v._props?.panActivation) ?? null,
+      gate: chain.find((v) => v._props?.panActivation && admits(v)) ?? null,
       gateState: 0,
       states: chain.filter((v) => v._tracked & PRESSED),
       mode: null,
@@ -10230,10 +10529,15 @@ class Player {
     const gated = p.gate && p.gateState !== 2;
     if (gated && p.gateState === 1) e.preventDefault();
     if (!p.mode && Math.hypot(tx, ty) > 6) {
-      if (p.pan) {
+      // A pan with a `panActivation` starts when that activates; failed, the
+      // drag is the views' around it.
+      const activation = p.pan?._props?.panActivation;
+      const decision = !p.pan || !activation ? !!p.pan : this.decideActivation(activation, tx, ty);
+      if (decision === false) p.pan = null;
+      if (decision) {
         p.mode = "pan";
-        this.call((w) => w.nsh_pan(p.pan._id, 0, 0, 0, 0, 0));
-      } else if (p.scroll && !gated) {
+        this.call((w) => w.nsh_pan(p.pan._id, 0, 0, 0, 0, 0, p.startX, p.startY));
+      } else if (!p.pan && p.scroll && !gated) {
         p.mode = "scroll";
         p.at = [p.scroll.scrollLeft, p.scroll.scrollTop];
         p.dragged = [0, 0];
@@ -10250,7 +10554,7 @@ class Player {
     if (p.mode === "pan") {
       e.preventDefault();
       const [vx, vy] = this.velocity(p);
-      this.call((w) => w.nsh_pan(p.pan._id, 1, tx, ty, vx, vy));
+      this.call((w) => w.nsh_pan(p.pan._id, 1, tx, ty, vx, vy, p.startX, p.startY));
     } else if (p.mode === "scroll") {
       e.preventDefault();
       const d = [p.dragged[0] - tx, p.dragged[1] - ty];
@@ -10342,17 +10646,56 @@ class Player {
   /** The gate's node id when its pan activates with this move (else undefined). */
   decideGate(p, dx, dy) {
     if (!p.gate || p.gateState !== 0) return undefined;
-    const [ax, ay, fx, fy] = p.gate._props.panActivation;
-    const past = (limit, d) => limit != null && Math.abs(d) > limit;
-    if (past(fx, dx) || past(fy, dy)) {
+    const decision = this.decideActivation(p.gate._props.panActivation, dx, dy);
+    if (decision === false) {
       p.gateState = 2;
       return undefined;
     }
-    const active = ax == null && ay == null ? Math.hypot(dx, dy) > 10 : past(ax, dx) || past(ay, dy);
-    if (!active) return undefined;
+    if (!decision) return undefined;
     p.gateState = 1;
     this.pressOut(p, false);
     return p.gate._id;
+  }
+
+  /** The way `panActivation` `a` (`[activeX, activeY, failX, failY,
+   * direction, edge]`) activates in, if any: away from its edge, else its
+   * direction (`PanActivation::way`). */
+  panWay(a) {
+    const away = { left: "right", right: "left", top: "down", bottom: "up" };
+    return a[5] != null ? away[a[5]] : a[4] ?? undefined;
+  }
+
+  /** `PanActivation::decide` on a drag by (dx, dy): true activates, false
+   * fails, undefined waits. */
+  decideActivation(a, dx, dy) {
+    const [ax, ay, fx, fy] = a;
+    const past = (limit, d) => limit != null && Math.abs(d) > limit;
+    if (past(fx, dx) || past(fy, dy)) return false;
+    const way = this.panWay(a);
+    if (way) {
+      const horizontal = way === "left" || way === "right";
+      const along = (way === "right" || way === "down" ? 1 : -1) * (horizontal ? dx : dy);
+      const across = Math.abs(horizontal ? dy : dx);
+      const limit = (horizontal ? ax : ay) ?? 10;
+      if (along > limit && along >= across) return true;
+      const acrossFails = (horizontal ? fy : fx) == null && across > limit && across > along;
+      return -along > limit || acrossFails ? false : undefined;
+    }
+    const active = ax == null && ay == null ? Math.hypot(dx, dy) > 10 : past(ax, dx) || past(ay, dy);
+    return active ? true : undefined;
+  }
+
+  /** `PanActivation::starts_at`: whether a pointer going down at (x, y) in
+   * an area of `w` × `h` may start the pans of a view with `panActivation`
+   * `a`: anywhere without an edge, else within 20 points of it. */
+  startsAt(a, x, y, w, h) {
+    switch (a?.[5]) {
+      case "left": return x <= 20;
+      case "right": return x >= w - 20;
+      case "top": return y <= 20;
+      case "bottom": return y >= h - 20;
+      default: return true;
+    }
   }
 
   pointerUp(e, cancelled) {
@@ -10382,7 +10725,7 @@ class Player {
       // Released after a pause: no speed left.
       this.track(p, performance.now());
       const [vx, vy] = this.velocity(p);
-      this.call((w) => w.nsh_pan(p.pan._id, cancelled ? 3 : 2, p.x - p.startX, p.y - p.startY, vx, vy));
+      this.call((w) => w.nsh_pan(p.pan._id, cancelled ? 3 : 2, p.x - p.startX, p.y - p.startY, vx, vy, p.startX, p.startY));
     } else if (p.mode === "scroll") {
       this.scrollEvent(p.scroll, "onScrollDragEnd");
       this.track(p, performance.now());

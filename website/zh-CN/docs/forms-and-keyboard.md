@@ -379,7 +379,7 @@ mount(() => (
 | `focus()` | `focus()` | 让输入框获得焦点并弹出键盘。 |
 | `blur()` | `blur()` | 让它失去焦点。 |
 | `set_selection(start, end)` | `setSelection(start, end?)` | 选中 `start..end`（UTF-16 码元）；两者相等时为光标（TSX：不传 `end`）。 |
-| `insert_text(text)` | `insertText(text)` | 以用户编辑的方式用 `text` 替换选区：是输入框撤销历史中的一步，由 `onChange` 报告；目前只在 iOS、macOS、Linux、Web 和无头测试中生效（[粘贴](#粘贴图片和文件)）。 |
+| `insert_text(text)` | `insertText(text)` | 以用户编辑的方式用 `text` 替换选区：是输入框撤销历史中的一步，由 `onChange` 报告；目前只在 iOS、macOS、Linux、Windows、Web 和无头测试中生效（[粘贴](#粘贴图片和文件)）。 |
 
 在 macOS、Web 和 Android 上，可按压视图的 ref 的 `focus()` 和 `blur()` 也会像 Tab 一样移动键盘焦点（[键盘焦点](../elements/index.md#键盘焦点)）；在 Android 上，该视图在这次焦点期间可在触摸模式下获得焦点，默认按钮失去焦点后又恢复为触摸中性。
 
@@ -524,9 +524,9 @@ const caret = signal<Bounds | null>(null);
 
 输入框照常自己插入粘贴的文本：事件在该文本的 `onChange` 之前到达。图片和文件从不插入，因为输入框只容纳文本。`pasteBehavior` 为 `"report"` 时输入框什么都不插入，由应用决定粘贴的效果：把长文本作为附件发送，或插入整理后的版本。由于系统要求当场作答，输入框根据这个属性立即决定。
 
-这时事件在插入任何内容之前到达，应用可以放行、取消或改写这次粘贴。ref 的 `insertText`（Rust 的 `insert_text`）以用户编辑的方式用放行的文本替换选区：遵守 `maxLength` 与单行规则，由 `onChange` 报告，在 Linux 和 Web 上是输入框撤销历史中的一步，Ctrl+Z 一次即可撤回。设置新的 `value` 则是替换整段文本。
+这时事件在插入任何内容之前到达，应用可以放行、取消或改写这次粘贴。ref 的 `insertText`（Rust 的 `insert_text`）以用户编辑的方式用放行的文本替换选区：遵守 `maxLength` 与单行规则，由 `onChange` 报告，在 Linux、Windows 和 Web 上是输入框撤销历史中的一步，Ctrl+Z 一次即可撤回。设置新的 `value` 则是替换整段文本。
 
-`insertText` 在 iOS、macOS、Linux、Web 和无头测试（`nsh test`）中插入文本；在 Windows、Android 和 GPUI 上目前不做任何事，只打印一条警告。请配合 `pasteBehavior="report"` 使用：`"insert"`（默认值）时输入框已经插入了这次粘贴，再调用 `insertText` 会插入第二遍。输入法正在组字时，`insertText` 不插入任何内容。
+`insertText` 在 iOS、macOS、Linux、Windows、Web 和无头测试（`nsh test`）中插入文本；在 Android 和 GPUI 上目前不做任何事，只打印一条警告。请配合 `pasteBehavior="report"` 使用：`"insert"`（默认值）时输入框已经插入了这次粘贴，再调用 `insertText` 会插入第二遍。输入法正在组字时，`insertText` 不插入任何内容。
 
 ```rust tabs
 let field = element_ref();
@@ -589,6 +589,20 @@ const attachments = signal<File[]>([]);
 ```
 
 像上传任何 `File` 一样上传粘贴的文件，使用 `fetch` 和 `FormData`（`form.append("image", file)`）；它的字节在发送前一直留在原生侧。在 Android 上，插入图片的键盘（GIF、贴纸）也以同样方式报告。在 Linux 上剪贴板是异步读取的，因此 `"insert"` 时事件可能在它插入的文本的 `onChange` 之后到达；`"report"` 时它总是先到。macOS 上的密码输入框保留 AppKit 自己的粘贴，不报告任何内容。
+
+在 macOS 的访达中复制的文件，除 URL 外还会把文件名作为文本放进剪贴板，因此 `"insert"` 时输入框会插入文件名，与 AppKit 自带的文本框一致。接收文件的输入框使用 `"report"`，只在这次粘贴不含文件时插入文本：`if (e.uris.length === 0 && e.files.length === 0 && e.tooLarge.length === 0) field?.insertText(e.text)`。`uris` 中的是路径而不是文件内容：处理函数收到它之后，`fs/promises` 可以直接读取这个精确路径，不需要 `capabilities.fs.read` 根目录，与拖放的文件一样（见[文件](../modules/standard-modules.md#文件)）。
+
+粘贴的文件可能很大：在“文件”或“照片”里复制的视频、几百 MB 的文档。用 `pasteMaxSize`（Rust 的 `.paste_max_size(..)`）给输入框指定读取的最大文件，单位为字节：更大的文件不读取，在 `onPaste` 的 `tooLarge` 中只带 `name`、`type` 和 `size` 到达，应用可以据此提示用户。在 iOS、Android 和 Web 上，先检查大小，再把字节复制进应用。不设置这个属性时所有文件都会读取。
+
+```tsx
+<Input
+  pasteMaxSize={20 * 1024 * 1024}
+  onPaste={(e) => {
+    attachments.update((a) => [...a, ...e.files]);
+    if (e.tooLarge.length) notice.set(`${e.tooLarge[0].name} 超过 20 MB`);
+  }}
+/>;
+```
 
 ## 自动增高的多行输入框
 
@@ -736,7 +750,7 @@ function ChatScreen() {
 
 完整的键盘高度适合延伸到 surface 底部的视图，页面内容通常如此。在会为键盘缩小窗口的 Android 宿主上，窗口本身已经变小，该变量为 0。见[键盘](../elements/keyboard.md)。
 
-浮层自己会避开键盘：底部的 [Sheet](../elements/sheet.md#the-software-keyboard)、抽屉，以及手机上以 sheet 呈现的菜单、选择器和日期选择器都贴在键盘上沿，并随键盘移动。
+浮层自己会避开键盘：底部的 [Sheet](../elements/sheet.md#the-software-keyboard)、抽屉，以及手机上以 sheet 呈现的菜单、选择器和日期选择器都贴在键盘上沿，并随键盘移动。[Popover](../elements/popover.md) 以及其他锚在某个元素旁的浮层始终在键盘之上：键盘盖住它那一侧的空间时，它换到触发元素的另一侧，或只用剩下的空间，并随键盘移动重新放置。
 
 ### 键盘访问器
 
@@ -828,6 +842,8 @@ function Note() {
 ```
 
 工具栏与窗口等宽，高度由内容决定。输入附件视图是 iOS 的功能：在 Android 上它是一个空的隐藏视图，所以在那里要为这些控件另找位置，例如放在输入框上方（Rust 中判断 `os() == Os::Android`，TSX 中判断 `platform.os === "android"`）。
+
+[`RichEditor`](../elements/rich-editor.md#键盘上方的工具栏) 也以同样方式显示它，Rust 中用 `.input_accessory(id)`，TSX 中用 `inputAccessoryViewID` 指定。
 
 ## 相关内容
 

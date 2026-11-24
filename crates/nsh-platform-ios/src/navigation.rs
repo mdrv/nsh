@@ -19,7 +19,7 @@ use std::{
 };
 
 use block2::RcBlock;
-use dispatch2::{DispatchQueue, MainThreadBound};
+use dispatch2::{DispatchQueue, DispatchTime, MainThreadBound};
 use nsh_core::{
     Color, EdgeInsets, EventKind, EventPayload, HeaderItem, HeaderItemContent, HeaderSystemItem,
     ModalAnimation, ModalConfig, ModalPresentation, NavShader, NodeId, PayloadValue, Points,
@@ -105,6 +105,9 @@ pub(crate) struct ScreenIvars {
     follow_scroll: Cell<bool>,
     /// The scroll view last given to UIKit as the content scroll view.
     followed: RefCell<Option<Weak<UIScrollView>>>,
+    /// `!headerVisible`: whether the bar is hidden while this screen is on
+    /// top of its stack (`follow_header`).
+    header_hidden: Cell<bool>,
 }
 
 define_class!(
@@ -170,6 +173,7 @@ impl ScreenController {
             insets: Cell::new(None),
             follow_scroll: Cell::new(false),
             followed: RefCell::new(None),
+            header_hidden: Cell::new(false),
         });
         // SAFETY: UIViewController's designated initializer.
         unsafe {
@@ -179,6 +183,52 @@ impl ScreenController {
 
     pub(crate) fn screen_id(&self) -> NodeId {
         self.ivars().id
+    }
+
+    /// Shows or hides the bar of the stack this screen is on top of, as its
+    /// `headerVisible` says. A stack shows the bar for the screen it pushes
+    /// or pops to (`willShow`); a screen already on top that changes
+    /// `headerVisible` brings no transition, and the core already lays its
+    /// content out for the header it asked for. A transition under way
+    /// (the stack's, or a modal's over it) keeps the bar it started with:
+    /// the bar follows once it ends, if this screen is still on top.
+    fn follow_header(&self) {
+        let Some(nav) = self.navigationController() else {
+            return;
+        };
+        let on_top = nav
+            .topViewController()
+            .is_some_and(|top| std::ptr::eq::<UIViewController>(&*top, &**self));
+        let hidden = self.ivars().header_hidden.get();
+        if !on_top || nav.isNavigationBarHidden() == hidden {
+            return;
+        }
+        if let Some(coordinator) = nav.transitionCoordinator() {
+            let pending = Cell::new(Some(self.retain()));
+            let wait = RcBlock::new(
+                move |_: NonNull<
+                    ProtocolObject<dyn UIViewControllerTransitionCoordinatorContext>,
+                >| {
+                    let Some(screen) = pending.take() else {
+                        return;
+                    };
+                    let mtm = screen.mtm();
+                    let bound = MainThreadBound::new(screen, mtm);
+                    // The main queue's next turn: the transition is over by
+                    // then.
+                    DispatchQueue::main().exec_async(move || {
+                        let mtm = MainThreadMarker::new().expect("the main queue");
+                        bound.into_inner(mtm).follow_header();
+                    });
+                },
+            );
+            // Refused when the transition is already ending.
+            if coordinator.animateAlongsideTransition_completion(None, Some(&wait)) {
+                return;
+            }
+        }
+        let animated = self.viewIfLoaded().is_some_and(|v| v.window().is_some());
+        nav.setNavigationBarHidden_animated(hidden, animated);
     }
 
     /// With `headerBackgroundOnScroll`, the header switches to its standard
@@ -282,6 +332,14 @@ pub(crate) struct ModalIvars {
     closed: Cell<bool>,
     /// The app is hiding it (`ModalHost::dismiss`).
     dismissing: Cell<bool>,
+    /// Its dismissal waits for a transition where it is to end
+    /// ([`dismiss_settled`]): a modal presented over it meanwhile would go
+    /// with it once it runs ([`transition_over`]).
+    deferred: Cell<bool>,
+    /// Its dismissal waits for the system UI presented over it (an alert,
+    /// a picker, a share sheet) to close ([`hold_under_system_ui`]): a
+    /// modal presented over it meanwhile would go with it once it runs.
+    held: Cell<bool>,
     /// The identifiers of the sheet's UIKit detents and the detents
     /// (`detents`) they stand for, to report the one the user picks.
     detents: RefCell<Vec<(Retained<NSString>, SheetDetent)>>,
@@ -478,6 +536,8 @@ impl ModalController {
             animated: Cell::new(true),
             closed: Cell::new(false),
             dismissing: Cell::new(false),
+            deferred: Cell::new(false),
+            held: Cell::new(false),
             detents: RefCell::new(Vec::new()),
             screen: Cell::new(0.0),
         });
@@ -747,6 +807,30 @@ pub(crate) fn back_swipes(nav: &UINavigationController) -> Vec<Retained<UIGestur
         .into_iter()
         .chain(content)
         .collect()
+}
+
+/// Whether `other` is the swipe back of a stack `view` is in (or of a stack
+/// around that one): an edge pan waits for it to fail, so a swipe that can
+/// go back does, and the pan takes the swipes of a screen with nothing to
+/// go back to.
+pub(crate) fn is_back_swipe(view: &UIView, other: &UIGestureRecognizer) -> bool {
+    let Some(controller) = controller_of(view) else {
+        return false;
+    };
+    let mut nav = match controller.clone().downcast::<UINavigationController>() {
+        Ok(nav) => Some(nav),
+        Err(_) => controller.navigationController(),
+    };
+    while let Some(n) = nav {
+        if back_swipes(&n)
+            .iter()
+            .any(|r| std::ptr::eq::<UIGestureRecognizer>(&**r, other))
+        {
+            return true;
+        }
+        nav = n.navigationController();
+    }
+    false
 }
 
 /// A drag that starts at the screen's edge belongs to the stack: the top
@@ -1145,9 +1229,11 @@ define_class!(
                 && let Some(view) = controller.view()
                 && editor.isDescendantOfView(&view)
                 && let Some(window) = editor.window()
-                && first_responder(&window).is_none()
+                && first_responder(&window).is_none_or(|r| crate::keyboard::is_root_focus(&r))
             {
-                // The swipe was cancelled. Another control's focus wins.
+                // The swipe was cancelled. Another control's focus wins; the
+                // surface root, which took the keys when the editor
+                // resigned, is no control's focus.
                 editor.becomeFirstResponder();
             }
             // An animated change of screens is deferred to a layout pass of
@@ -2271,6 +2357,9 @@ impl ScreenHost {
         ivars
             .follow_scroll
             .set(c.header_transparent && c.header_background_on_scroll);
+        ivars.header_hidden.set(!c.header_visible);
+        // After `measure`: the safe area the bar changes reports the header.
+        self.controller.follow_header();
         self.controller.report_insets();
         self.controller.follow_content_scroll();
     }
@@ -2394,6 +2483,10 @@ pub(crate) struct ModalHost {
     pub(crate) view: Retained<NshView>,
     pub(crate) config: ModalConfig,
     pub(crate) presented: bool,
+    /// Taken along by the dismissal of a modal under it while the app
+    /// still showed it: presented again once that one is gone, or, hidden
+    /// meanwhile, reported closed then.
+    taken: bool,
 }
 
 impl ModalHost {
@@ -2408,6 +2501,7 @@ impl ModalHost {
             view,
             config: ModalConfig::default(),
             presented: false,
+            taken: false,
         }
     }
 
@@ -2421,14 +2515,83 @@ impl ModalHost {
         }
     }
 
+    /// The modals presented over this one, the lowest first: they go when
+    /// it is dismissed (through its presenter, which dismisses everything
+    /// above).
+    pub(crate) fn modals_above(&self) -> Vec<NodeId> {
+        let mut above = Vec::new();
+        let mut next = self.controller.presentedViewController();
+        while let Some(c) = next {
+            if let Some(modal) = c.downcast_ref::<ModalController>() {
+                above.push(modal.ivars().id);
+            }
+            next = c.presentedViewController();
+        }
+        above
+    }
+
+    /// How many controllers present this one, down to the window's (0
+    /// when it is not presented): a lower modal is dismissed first, and
+    /// takes the ones above it.
+    pub(crate) fn depth(&self) -> usize {
+        let mut depth = 0;
+        let mut next = self.controller.presentingViewController();
+        while let Some(c) = next {
+            depth += 1;
+            next = c.presentingViewController();
+        }
+        depth
+    }
+
+    /// Dismissed with a modal under it, which takes it along: no longer
+    /// presented, and not reported as closed by the user when it goes.
+    /// Whether it was showing (one the user closed is already leaving, and
+    /// reported).
+    pub(crate) fn dismissed_under(&mut self) -> bool {
+        if !self.presented || self.controller.ivars().closed.get() {
+            return false;
+        }
+        self.presented = false;
+        self.taken = true;
+        self.controller.ivars().dismissing.set(true);
+        if let Some(view) = self.controller.view() {
+            view.endEditing(true);
+        }
+        true
+    }
+
+    /// Hidden by the app after a dismissal under it took it along
+    /// ([`ModalHost::dismissed_under`]): `Some(true)` when it is gone
+    /// already, `Some(false)` while that dismissal runs; `None` when it was
+    /// not taken.
+    pub(crate) fn hidden_after_taken(&mut self) -> Option<bool> {
+        if !std::mem::take(&mut self.taken) {
+            return None;
+        }
+        Some(self.gone())
+    }
+
+    /// Out of the presentation (dismissed, or never presented).
+    pub(crate) fn gone(&self) -> bool {
+        self.controller.presentingViewController().is_none()
+    }
+
     /// Presents the modal over the controller showing `from` (at once
-    /// when `at_once`: a shader draws its coming).
+    /// when `at_once`: a shader draws its coming). The caller checks
+    /// [`transition_over`] first. A modal taken along by a dismissal under
+    /// it comes again as it came the first time: `Show` is reported again
+    /// and a sheet opens at its first detent.
     pub(crate) fn present(&mut self, from: &UIView, at_once: bool) {
         if self.presented && !self.controller.ivars().closed.get() {
             return;
         }
+        self.taken = false;
         self.controller.ivars().closed.set(false);
         self.controller.ivars().dismissing.set(false);
+        // Kept under system UI last time it went (`hold_under_system_ui`).
+        if let Some(view) = self.controller.view() {
+            view.setUserInteractionEnabled(true);
+        }
         let Some(mut presenter) = controller_of(from) else {
             return log::warn!("cannot present a modal: no view controller shows the app");
         };
@@ -2515,7 +2678,8 @@ impl ModalHost {
     }
 
     /// Dismisses the modal (at once when `at_once`: a shader draws its
-    /// going); `done` runs when it is gone.
+    /// going), once no transition runs where it is; `done` runs when it is
+    /// gone.
     pub(crate) fn dismiss(&mut self, at_once: bool, done: impl Fn() + 'static) {
         if !self.presented {
             return;
@@ -2537,14 +2701,135 @@ impl ModalHost {
         // screen with its content already gone (closing a sheet and its
         // modal together). The presenter dismisses this modal and every
         // controller above it.
-        match self.controller.presentingViewController() {
-            Some(presenter) => {
-                presenter.dismissViewControllerAnimated_completion(animated, Some(&block))
-            }
-            None => self
-                .controller
-                .dismissViewControllerAnimated_completion(animated, Some(&block)),
+        dismiss_settled(self.controller.clone(), animated, block, false);
+    }
+}
+
+/// The controller in a transition (being presented or dismissed) where
+/// `controller` is: its presenter, itself or one above it. UIKit refuses a
+/// dismissal through the presenter while one runs ("while a presentation
+/// or dismiss is in progress") and never calls its completion.
+fn transition_at(controller: &UIViewController) -> Option<Retained<UIViewController>> {
+    let moving = |c: &UIViewController| {
+        (c.isBeingPresented() || c.isBeingDismissed()) && c.transitionCoordinator().is_some()
+    };
+    if let Some(presenter) = controller.presentingViewController()
+        && moving(&presenter)
+    {
+        return Some(presenter);
+    }
+    let mut next = Some(controller.retain());
+    while let Some(c) = next {
+        if moving(&c) {
+            return Some(c);
         }
+        next = c.presentedViewController();
+    }
+    None
+}
+
+/// Dismisses `controller` through its presenter, once no transition runs
+/// where it is ([`transition_at`]; meanwhile it is `deferred`); `waited`
+/// after such a wait, when it may have left meanwhile (with a dismissal
+/// under it, or by the user's swipe): then only `done` runs.
+fn dismiss_settled(
+    controller: Retained<ModalController>,
+    animated: bool,
+    done: RcBlock<dyn Fn()>,
+    waited: bool,
+) {
+    if let Some(moving) = transition_at(&controller)
+        && let Some(coordinator) = moving.transitionCoordinator()
+    {
+        let pending = Cell::new(Some((controller.clone(), done.clone())));
+        let wait = RcBlock::new(
+            move |_: NonNull<ProtocolObject<dyn UIViewControllerTransitionCoordinatorContext>>| {
+                let Some((controller, done)) = pending.take() else {
+                    return;
+                };
+                let mtm = controller.mtm();
+                let bound = MainThreadBound::new((controller, done), mtm);
+                // The main queue's next turn: the transition is over by
+                // then.
+                DispatchQueue::main().exec_async(move || {
+                    let mtm = MainThreadMarker::new().expect("the main queue");
+                    let (controller, done) = bound.into_inner(mtm);
+                    controller.ivars().deferred.set(false);
+                    dismiss_settled(controller, animated, done, true);
+                });
+            },
+        );
+        // Refused when the transition is already ending.
+        if coordinator.animateAlongsideTransition_completion(None, Some(&wait)) {
+            controller.ivars().deferred.set(true);
+            return;
+        }
+    }
+    if system_ui_over(&controller) {
+        return hold_under_system_ui(controller, animated, done);
+    }
+    match controller.presentingViewController() {
+        Some(presenter) => {
+            presenter.dismissViewControllerAnimated_completion(animated, Some(&done))
+        }
+        None if waited => done.call(()),
+        None => controller.dismissViewControllerAnimated_completion(animated, Some(&done)),
+    }
+}
+
+/// Whether system UI, and only that, is presented over `controller`: an
+/// alert, a picker, a share sheet or what else is not one of NSH's modals
+/// (those over it are dismissed with it, and come back if the app still
+/// shows them).
+fn system_ui_over(controller: &UIViewController) -> bool {
+    let mut next = controller.presentedViewController();
+    let mut any = false;
+    while let Some(c) = next {
+        if c.isKindOfClass(ModalController::class()) {
+            return false;
+        }
+        any = true;
+        next = c.presentedViewController();
+    }
+    any
+}
+
+/// How often a modal kept under system UI looks whether it closed, in
+/// milliseconds.
+const HELD_LOOK_MS: u64 = 250;
+
+/// Keeps `controller` presented, its content gone and taking no touches,
+/// until the system UI over it closes, then dismisses it. Dismissed through
+/// its presenter now, it would take that UI along, and UIKit tells no one:
+/// an alert's actions, a picker's delegate, a share sheet's completion
+/// never run, and what the app awaits never settles. That happens when the
+/// app shows system UI as it closes a modal: over a sheet drawn by the app,
+/// whose motion out ends after the UI came, or over a modal the app closes
+/// on a later turn. The modal's close is reported once it is gone, as
+/// always.
+fn hold_under_system_ui(
+    controller: Retained<ModalController>,
+    animated: bool,
+    done: RcBlock<dyn Fn()>,
+) {
+    controller.ivars().held.set(true);
+    if let Some(view) = controller.view() {
+        view.setUserInteractionEnabled(false);
+    }
+    let mtm = controller.mtm();
+    let bound = MainThreadBound::new((controller, done), mtm);
+    let when = DispatchTime::NOW.time((HELD_LOOK_MS * 1_000_000) as i64);
+    let scheduled = DispatchQueue::main().after(when, move || {
+        let mtm = MainThreadMarker::new().expect("the main queue");
+        let (controller, done) = bound.into_inner(mtm);
+        if system_ui_over(&controller) {
+            return hold_under_system_ui(controller, animated, done);
+        }
+        controller.ivars().held.set(false);
+        dismiss_settled(controller, animated, done, true);
+    });
+    if let Err(err) = scheduled {
+        log::warn!("cannot wait for the system UI over a modal: {err:?}");
     }
 }
 
@@ -2709,6 +2994,52 @@ pub(crate) fn presented_sheet(window: &objc2_ui_kit::UIWindow) -> Option<Retaine
         top = next;
     }
     sheet
+}
+
+/// The controller a modal presented now over the one showing `from` waits
+/// for: the lowest of those presented over it that is in a transition
+/// (coming, or leaving: NSH's dismissal, a swipe, Escape), that NSH just
+/// dismissed (`dismissed`, the modals dismissed in this pass, whose
+/// transition may not have started yet), or whose dismissal waits for a
+/// transition to end ([`dismiss_settled`], from an earlier pass): for that
+/// one, the transition it waits for, or itself once that has ended and its
+/// dismissal is about to run; or whose dismissal waits for the system UI
+/// over it to close ([`hold_under_system_ui`]). Presented over a leaving
+/// one, the modal
+/// would go with it (UIKit dismisses everything above the controller it
+/// dismisses); over a moving one UIKit refuses it. A dismissal UIKit
+/// refused leaves its modal in place, with no transition: no longer
+/// awaited after its pass.
+pub(crate) fn transition_over(
+    from: &UIView,
+    dismissed: &[NodeId],
+) -> Option<Retained<UIViewController>> {
+    let mut next = controller_of(from)?.presentedViewController();
+    while let Some(c) = next {
+        let modal = c.downcast_ref::<ModalController>().map(|m| m.ivars());
+        let just = modal.is_some_and(|m| m.dismissing.get() && dismissed.contains(&m.id));
+        let moving =
+            (c.isBeingPresented() || c.isBeingDismissed()) && c.transitionCoordinator().is_some();
+        if just || moving {
+            return Some(c);
+        }
+        if modal.is_some_and(|m| m.deferred.get()) {
+            return Some(transition_at(&c).unwrap_or(c));
+        }
+        if modal.is_some_and(|m| m.held.get()) {
+            return Some(c);
+        }
+        next = c.presentedViewController();
+    }
+    None
+}
+
+/// Whether `controller` is a modal whose dismissal waits for the system UI
+/// over it to close ([`hold_under_system_ui`]).
+pub(crate) fn held_under_system_ui(controller: &UIViewController) -> bool {
+    controller
+        .downcast_ref::<ModalController>()
+        .is_some_and(|m| m.ivars().held.get())
 }
 
 /// The view controller whose view contains `view`.

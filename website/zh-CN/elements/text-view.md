@@ -87,7 +87,7 @@ mount(() => (
 
 `TextView` 由 [`Text`](./text.md) 元素组成，其中的文本行为与 Text 页面描述的完全一致。每个段落、标题、表格单元格和代码块都是一个原生 `Text`：一个独立排版、换行、跟随字体缩放的文本块，设置 `selectable` 后可以选择和复制。加粗、强调、删除线等行内标记是它的[片段](./text.md#片段)；行内代码是带[片段背景](./text.md#片段背景)的片段，因此 `code: "rounded bg-neutral-100"` 会给它一个圆角背景；链接是[可点击的片段](./text.md#链接)；图片和行内自定义节点是[行内附件](./text.md#行内视图和图片)。根节点上的文本样式会传给每个部件，就像[文本样式](./text.md#文本样式)从 `Text` 传给它的片段一样。
 
-设置 `selectable` 后，整个文档作为一体选择，就像网页一样：拖动（在触摸屏上是长按后拖动选择手柄）可以从一个段落、列表项、单元格或代码块延伸到下一个，复制会取得它们全部的文字。设置了 `selectable` 的 `TextView` 自己作为一体选择；放在[可选择视图](./text-selection.md)里时，它的选区还会延伸到周围的文字和其他 `TextView`。
+设置 `selectable` 后，整个文档作为一体选择，就像网页一样：拖动（在触摸屏上是长按后拖动选择手柄）可以从一个段落、列表项、单元格或代码块延伸到下一个，复制会取得它们全部的正文内容，列表项目符号与序号、任务勾选符号、提示图标、折叠三角以及操作按钮等装饰与控件文字不会混入选区。部件的类名或样式可以把它们重新纳入选区：设置 `classes={{ listMarker: "select-text" }}` 后，项目符号与序号会随列表项一起被选中和复制。设置了 `selectable` 的 `TextView` 自己作为一体选择；放在[可选择视图](./text-selection.md)里时，它的选区还会延伸到周围的文字和其他 `TextView`。
 
 `TextView` 增加的是其余部分：把 Markdown、HTML 或文档读成文档块，文本周围的视图（列表、引用、表格、代码块、折叠块、脚注），流式输出，按部件设定样式，渲染函数和扩展。
 
@@ -336,6 +336,8 @@ text_view().markdown(doc).links(TextViewLinks::Open)
 
 在桌面平台和桌面形态的 Web 上，指针停在链接上会在指针下方显示它去往哪里：链接有标题时先显示标题（`[docs](https://example.com/docs "The guide")`，或 HTML 链接的 `title`），下面一行是用主题 `muted-foreground` 颜色显示的目的地。URL 按解析后的样子显示，协议、主机和端口始终完整（国际化域名显示为 ASCII 形式，冒充的字母会显示出本来面目），过长的路径从中间截断；路径和文档内的锚点（`#…`）按原样显示。链接里的图片也以同样方式在图片下方显示链接的目的地和标题。这与 [Link](./link.md#去往哪里) 的核对相同。
 
+在 Web 上，指向网页、站内路径、邮件地址或电话号码的链接（`https:`、`http:`、路径、`mailto:`、`tel:`）在页面中是一个 `<a href>`，与带 `href` 的 [Link](./link.md#平台说明) 相同：爬虫会跟随它，浏览器会显示它去往哪里，按住修饰键点击或用鼠标中键点击时由浏览器在新标签页或新窗口中打开，不触发 `onLinkPress`；右键点击显示浏览器的链接菜单。普通点击由应用处理，由 `onLinkPress` 报告。路径与 `Link` 的 `href` 一样，放在站点的基础地址下。文档内的锚点（`#…`）和指向应用自身路由的链接（应用自己的 scheme，如 `myapp:`）是可点击的文字，每次点击都会连同修饰键一起报告。
+
 <a id="render-functions"></a>
 
 ## 渲染函数
@@ -568,6 +570,8 @@ function Custom(props: { node: TextViewCustomNode }) {
 | `math` | `boolean` | `true` | 公式：文本中的 `$…$` 和 `\(…\)`，`$$…$$` 和 `\[…\]` 公式块。转义方括号里是引用编号或中日韩文字时（`\[1\]\[3\]`、`\[注\]`）按文字显示。 |
 | `html` | `boolean` | `true` | Markdown 中的 HTML 按 `html` 属性的方式读取；`false` 时显示为文本。 |
 | `alerts` | `boolean` | `true` | GitHub 的提示块：`> [!NOTE]`、`[!TIP]`、`[!IMPORTANT]`、`[!WARNING]`、`[!CAUTION]`。 |
+| `links` | `boolean` | `true` | 链接：`[text](url)`、裸 URL 和 `<a href>`；`false` 时显示其文字，不显示为链接。 |
+| `images` | `boolean` | `true` | 图片：`![alt](src)` 和 `<img>`；`false` 时显示其 `alt` 文字。 |
 | `frontmatter` | `boolean` | `false` | 开头的 YAML front matter（`---` … `---`）成为名为 `frontmatter` 的自定义节点，其 `text` 是 YAML。 |
 | `mdx` | `boolean` | `false` | MDX：JSX 元素成为以标签命名的自定义节点，`{expressions}` 成为名为 `expression` 的自定义节点；此时原始 HTML 按文本读取。 |
 | `streaming` | `boolean` | `false` | 文本仍在到达：末尾未闭合的语法显示成闭合后的样子。 |

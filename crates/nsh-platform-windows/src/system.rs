@@ -242,6 +242,7 @@ pub(crate) fn watch_environment(surface: &Rc<Surface>) {
 /// A system setting changed (`WM_SETTINGCHANGE`, `WM_THEMECHANGED`,
 /// `WM_SYSCOLORCHANGE`, `WM_DWMCOLORIZATIONCOLORCHANGED`).
 pub(crate) fn settings_changed(surface: &Rc<Surface>) {
+    crate::text::invalidate_rendering_params();
     refresh_accent();
     update(surface, settings());
     // The taskbar's colors may have changed: a template tray icon follows.
@@ -721,14 +722,25 @@ pub(crate) fn open_url(url: &str) -> bool {
     instance.0 as isize > 32
 }
 
+/// Reports a clipboard write's result (`clipboard_write_result`).
+fn clipboard_written(surface: &Rc<Surface>, written: bool) {
+    surface.event(
+        ROOT_ID,
+        EventKind::ClipboardWrite,
+        EventPayload::Map(vec![("written", PayloadValue::Bool(written))]),
+    );
+}
+
 /// A command not addressed to a kind of view.
 pub(crate) fn command(surface: &Rc<Surface>, _id: NodeId, command: &Command) {
     match command {
         Command::CloseDialog(dialog) => close_dialog(surface, *dialog),
         Command::SetClipboard(text) => {
-            if !set_clipboard_text(text) {
+            let written = set_clipboard_text(text);
+            if !written {
                 log::debug!("windows: cannot set the clipboard");
             }
+            clipboard_written(surface, written);
         }
         Command::ReadClipboard { id, has_only } => {
             let has = clipboard_has_text();
@@ -757,9 +769,11 @@ pub(crate) fn command(surface: &Rc<Surface>, _id: NodeId, command: &Command) {
                 .iter()
                 .map(|(kind, bytes)| (*kind, bytes.as_slice()))
                 .collect();
-            if !set_clipboard_formats(&formats) {
+            let written = set_clipboard_formats(&formats);
+            if !written {
                 log::debug!("windows: cannot set the clipboard");
             }
+            clipboard_written(surface, written);
         }
         Command::SetClipboardImage(uri) => match clipboard::decode_data_uri(uri) {
             Some(("image/png", bytes)) => {
@@ -1878,7 +1892,7 @@ impl Hosted for DialogItem {
         }
         if let (Some(footer), Some(card)) = (g.footer, g.cards.first()) {
             // The footer's band, its bottom corners the card's.
-            cx.push_clip_rounded(*card, [RADIUS; 4]);
+            cx.push_clip_rounded_shapes(*card, [RADIUS; 4]);
             // SAFETY: a COM call between BeginDraw and EndDraw.
             unsafe {
                 cx.dc.FillRectangle(

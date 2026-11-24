@@ -64,7 +64,8 @@ Things that were found the hard way. Read the section of the area you change bef
   (`pixel`, `span`): `round(to) - round(from)` in points differs in its last bits with where the edges are, and a 28 point
   row at 2.625 (73.5 pixels) has every other edge on a half pixel, which an `f32`'s hair rounds either way. As a scroll
   moved DataTable's body a pixel, every frame in it was sent again (460–1000 mount items a frame on a Pixel 10 Pro instead
-  of 3); a half pixel is snapped first, so it always rounds up.
+  of 3); a half pixel is snapped first, so it always rounds up. A box thinner than a pixel never rounds to nothing
+  (`edges`): a 0.5 point rule at one pixel per point keeps a pixel inside its parent, and its neighbours still meet.
 - **The core keeps its own layout tree** (`core/layout_tree.rs`: Taffy's algorithms over the core's nodes through Taffy's low-level
   traits, as `TaffyTree` runs them, call for call). `TaffyTree::mark_dirty` stops at the first node whose cache is already empty, taking
   its ancestors for dirty too; nodes of a `display: none` subtree and absolutely positioned ones always have empty caches while the nodes
@@ -168,6 +169,15 @@ Things that were found the hard way. Read the section of the area you change bef
 
 - **UIFont and CTFont are toll-free bridged**: the text engine gets system fonts with `UIFont::systemFontOfSize_weight` and uses them as
   CTFonts (verified by rendering). CoreText attributes must use CT keys (colors are CGColors), not UIKit's NSForegroundColor.
+- **CoreText synthesizes no italic** (macOS too; verified on macOS 26 and the iOS 26 simulator): a family without an italic face (PingFang,
+  Hiragino, a family shipped without its italic files) has no italic copy (`CTFontCreateCopyWithSymbolicTraits` returns
+  NULL), and the fonts an italic face falls back to stay upright (CJK in SF's italic). A shear in a font's matrix leans
+  it, and CoreText draws the fonts it falls back to from it with the same matrix; a matrix on a cascade list's
+  descriptors (`kCTFontMatrixAttribute`) is ignored. So such a family's italic is the font leaning
+  (`core_text::italic`), and `core_text::slant_fallbacks` typesets an italic span that has characters its font lacks
+  and sets each run in an upright fallback font to that font leaning. `CTLineDraw` draws each run in its font's matrix,
+  `CTRunDraw` in the context's text matrix alone: macOS, which draws run by run (`draw_glyphs`), sets each run's
+  (`CTRunGetTextMatrix`) first.
 - **Catalyst's Mac idiom does not support `UIRefreshControl`** (attaching one throws `_UICatalystUnsupportedMacIdiomBehavior`): in the Mac
   idiom the pull is detected in the scroll delegate and shown with a spinner + contentInset; iOS uses the native control unless the
   app draws its own indicator (`refreshIndicator`), which `UIRefreshControl` cannot give way to: then it takes the Mac idiom's way,
@@ -289,6 +299,11 @@ Things that were found the hard way. Read the section of the area you change bef
   itself presenting one (a `Sheet` is a transparent modal over the modal it is in) dismisses only that one, and the outer
   modal stays on screen with its content already gone: a blank screen when a sheet and its modal close together.
   `ModalHost::dismiss` dismisses through `presentingViewController`, which takes the modal and everything above it.
+  So a modal shown while another leaves (one closed and one opened in the same batch) must not be presented over the
+  leaving one: the mounter dismisses first and presents the new modal once the old one is gone, and presents again
+  the modals the app still shows that went along. A dismissal still waiting for another transition to end counts as
+  leaving too. A modal also leaves with the subtree it is in, not only when its own node is removed, and reports its
+  close (`onClose`) once gone, also when its node was released in the same batch (as JS does when the app closes it).
 
 - **iOS, presses near the top of the window**: UIKit attaches tap recognizers to the window that skip `UIControl`s, and a
   press is a gesture recognizer, not a control. On iOS 26+ the window's `_UIDoubleTapInteraction` (a single-tap
@@ -358,6 +373,13 @@ Things that were found the hard way. Read the section of the area you change bef
   content rect within the view that started it: started from an editor's sink (a sliver at the caret) it sat on the
   caret whatever the rect said, over the selection's start handle, and took that handle's touches; it starts from the
   root view (`InputBox.openEditMenu`).
+- **Android, activities made again for a configuration change**: a change the manifest cannot declare (an overlay
+  changing resource paths: the navigation mode, the wallpaper's colors) destroys and recreates the activity in the
+  same process. `AppActivity` and `DevActivity` keep the running `NshView` across it
+  (`onRetainNonConfigurationInstance`): its views are made with a `MutableContextWrapper` of the activity, which moves
+  to the new one, so nothing keeps the old activity. Windows of the activity's own (modal dialogs, alerts, menus,
+  date pickers) must leave the old activity before it is destroyed, or they leak with it (`WindowLeaked`); code that
+  needs the `Activity` unwraps the context (`SystemUi.activity`), never tests `instanceof Activity`.
 - **Android, API levels and lint**: hosts that compile the Java runtime run Android Lint over it (NewApi,
   WrongConstant), while NSH's own build runs only javac. A class or helper reached only behind `SDK_INT >= N` carries
   `@TargetApi(N)`, as `Backdrop` does; a guard lint cannot see through (a helper that returns the check) is written at
@@ -448,6 +470,13 @@ Things that were found the hard way. Read the section of the area you change bef
   added there or it is dropped silently.
 - **Android, inputs' `pointerEvents`**: `InputBox` is a `FrameLayout`, not a `Box`: it keeps `pointerEvents` itself and
   refuses touches in `dispatchTouchEvent` for `none` / `box-none`, and `TouchTracker.deepest` reads it as a `Box`'s.
+- **Android, hovers and `pointerEvents`**: a hover goes to the topmost view under the pointer that handles it, and a
+  clickable view handles it whatever its `pointerEvents`, so `Box` routes hovers as it routes touches
+  (`dispatchHoverEvent`, `onInterceptHoverEvent`, `onHoverEvent`). TalkBack's touch exploration is hovers too: an inert
+  overlay that took them kept the screen reader from the views under it. `ViewGroup` keeps its own hover state
+  (hover targets, whether it is hovered itself) and sends no exit or enter when only `pointerEvents` changes, so `Box`
+  sends itself the exit when it turns inert while hovered, and the enter when it stops being `box-none` under the
+  pointer. `tests/hover-routing/run.py` checks the routing on a device or emulator.
 - **Android, inputs**: `EditText` reconfiguration (input type, filters, single line) sets the same text again and fires
   `afterTextChanged`: only text that differs from the last known one counts as an edit, or JS values are rejected as stale.
   Soft keyboards edit through the input connection (`KeyConnection`: composing text, commits, deletes), hardware keys arrive
@@ -527,7 +556,9 @@ Things that were found the hard way. Read the section of the area you change bef
   callback, the up marked cancelled; Android 16 QPR2's `predictiveBackStopKeycodeBackForwarding` flag keeps both from the
   views again. `KeyDispatch` reports the release at the callback, from the down it saw, and not again for that key-up
   (`BackRelease`); `NshView` taking the key never doubles its callback, as the cancelled up does not go back (seen on an
-  Android 16 emulator, both settings; the version boundaries are AOSP's source).
+  Android 16 emulator, both settings; the version boundaries are AOSP's source). A modal's dialog, whose key listener
+  takes Back, follows the same rule (`ModalHost`): a key-up that is cancelled, or whose down it did not see, does not go
+  back, or one press would close it (or ask it to) twice.
 - **Android 8 (API 26 and 27) lacks three things the runtime uses from API 28**, and gets each another way, checked with
   `Build.VERSION.SDK_INT` so Android 9 and later draw as before:
   - Weights: `Typeface.create(family, weight, italic)` is API 28. The default family takes the nearest of Roboto's
@@ -744,9 +775,15 @@ Things that were found the hard way. Read the section of the area you change bef
 - **From macOS 26 a window with a toolbar has larger corners than one with only a title bar** (seen on 26.6), even an
   empty `NSToolbar` in `UnifiedCompact`; the radius is the system's and no API sets it. A hidden title bar of the app's
   height therefore centers the traffic lights itself instead of selecting a toolbar style (`chrome::TrafficLights`).
-  AppKit lays the buttons out again whenever the title bar does (each live-resize frame, a screen change, leaving full
-  screen), so they are placed again from their `NSViewFrameDidChangeNotification`s, which arrive inside that layout,
-  before anything is drawn.
+  AppKit lays the buttons out again whenever the title bar does (each live-resize frame, `setTitle:`, a screen change,
+  leaving full screen), calling `-[_NSThemeWidget setFrameOrigin:ignoreRentry:]` for Close, Miniaturize and Zoom in
+  order. That method's re-entrancy guard silently ignores `setFrameOrigin:` calls on the notifying button from inside
+  its own `NSViewFrameDidChangeNotification` (verified on macOS 27.0.1), so synchronous placement inside frame-change
+  notifications left the last button (`ZoomButton`) stuck at AppKit's default `y` on every live-resize frame (and after
+  `setTitle:`). `TrafficLights` therefore always coalesces `NSViewFrameDidChangeNotification`s (on the container, title
+  bar view and buttons) onto the main queue so placement runs after `_updateButtonPositions` exits `ignoreRentry:`, and
+  places synchronously on `NSWindowDidResizeNotification` (which fires after `_updateButtonPositions` returns and before
+  AppKit displays the resized frame) so live-resize frames stay aligned without flicker.
 
 - **`contentLayoutRect` lags the frame while a window resizes**: read in the resize (the root view's new size), it is
   still laid out for the old frame, so the frame's height minus its top is the bar plus the change in height (a

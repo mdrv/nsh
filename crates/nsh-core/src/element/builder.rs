@@ -12,9 +12,9 @@ use super::{
 use crate::{
     AccessibilityProp, AccessibilityRole, AccessibilityState, AccessibilityValue, Bounds,
     ContextMenuEvent, EdgeInsets, EventKind, EventPayload, Hsla, ImageSource, KeyCapture, KeyEvent,
-    ListContentStyle, MouseEvent, NativeProp, NodeId, PinchEvent, PointerEvents, Points,
-    PressEvent, Prop, Size, Tag, TouchEvent, WheelEvent,
-    geometry::{DevicePixels, Radians},
+    ListContentStyle, LiveRegion, MouseEvent, NativeProp, NodeId, PanActivation, PinchEvent,
+    PointerEvents, Points, PressEvent, Prop, Size, Tag, TouchEvent, WheelEvent,
+    geometry::{Axis, DevicePixels, Radians},
     style::Color,
 };
 
@@ -249,6 +249,9 @@ pub(crate) struct RareAttrs {
     /// A window of the app's own: the dialog root it shows
     /// ([`super::desktop::window`]).
     pub(crate) window: Option<Box<crate::desktop::WindowOptions>>,
+    /// What its ref was asked for before it was mounted: sent after the
+    /// window opens.
+    pub(crate) window_commands: Vec<crate::desktop::DesktopCommand>,
 }
 
 impl RareAttrs {
@@ -497,6 +500,10 @@ pub(crate) struct ComponentEl {
     pub(crate) props: Box<dyn AnyProps>,
     /// The handlers of its events in the view that has it, in order.
     pub(crate) on_event: Vec<Listener<dyn Any>>,
+    /// Made by its registered type, not by `make` and `spec`
+    /// ([`ComponentElement::by_name`]): the code of the component is only
+    /// what registers it (a web runtime's side module).
+    pub(crate) by_name: Option<std::any::TypeId>,
 }
 
 impl Clone for ComponentEl {
@@ -507,6 +514,7 @@ impl Clone for ComponentEl {
             spec: self.spec,
             props: self.props.clone_box(),
             on_event: self.on_event.clone(),
+            by_name: self.by_name,
         }
     }
 }
@@ -1536,6 +1544,17 @@ pub trait Accessible: Element {
         self
     }
 
+    /// [`Accessible::hint`] while it is set (`None`: none), for a
+    /// component that hands the app's optional hint on to its element.
+    fn optional_hint(mut self, hint: impl IntoReactive<Option<SharedString>>) -> Self {
+        self.node().bind_attr(hint, |a, hint| {
+            if hint.is_some() || a.rare.is_some() {
+                a.rare_mut().hint = hint;
+            }
+        });
+        self
+    }
+
     /// More about it than its name, which screen readers read after it
     /// (TS: `accessibilityDescription`; `gpui-base`'s `aria_description`):
     /// a dialog's message, what a field expects.
@@ -1587,6 +1606,34 @@ pub trait Accessible: Element {
             super::host::set_in(
                 &mut a.props,
                 Prop::Accessibility(AccessibilityProp::Level((level > 0).then_some(level))),
+            )
+        });
+        self
+    }
+
+    /// The list's orientation for screen readers (ARIA's
+    /// `aria-orientation`, reported on the web): `"horizontal"` or
+    /// `"vertical"`, for a tab list or toolbar laid out along that axis;
+    /// `None` has none.
+    fn accessibility_orientation(mut self, orientation: impl IntoReactive<Option<Axis>>) -> Self {
+        self.node().bind_attr(orientation, |a, orientation| {
+            super::host::set_in(
+                &mut a.props,
+                Prop::Accessibility(AccessibilityProp::Orientation(orientation)),
+            )
+        });
+        self
+    }
+
+    /// How changes of it the screen reader announces by itself (TS:
+    /// `accessibilityLiveRegion`): TalkBack on Android, VoiceOver on macOS,
+    /// the web's `aria-live`, a live region on Windows; `"polite"` when the
+    /// user is idle, `"assertive"` right away.
+    fn accessibility_live_region(mut self, region: impl IntoReactive<LiveRegion>) -> Self {
+        self.node().bind_attr(region, |a, region| {
+            super::host::set_in(
+                &mut a.props,
+                Prop::Accessibility(AccessibilityProp::LiveRegion(region)),
             )
         });
         self
@@ -1699,11 +1746,19 @@ pub trait Accessible: Element {
     /// `accessibilityActions`): `increment` and `decrement` for an
     /// adjustable element, `activate`, `longpress`, or the app's own with
     /// a label; [`Interactive::on_accessibility_action`] hears them.
-    fn accessibility_actions(mut self, actions: Vec<crate::AccessibilityActionDef>) -> Self {
-        super::host::set(
-            self.node(),
-            Prop::Accessibility(AccessibilityProp::Actions(actions)),
-        );
+    /// Bound to signals, the labels follow them in place (the interface's
+    /// language): the element and the screen reader's focus on it stay,
+    /// and the names its handler hears do not change.
+    fn accessibility_actions(
+        mut self,
+        actions: impl IntoReactive<Vec<crate::AccessibilityActionDef>>,
+    ) -> Self {
+        self.node().bind_attr(actions, |a, actions| {
+            super::host::set_in(
+                &mut a.props,
+                Prop::Accessibility(AccessibilityProp::Actions(actions)),
+            )
+        });
         self
     }
 }
@@ -2011,6 +2066,19 @@ pub trait Interactive: Element {
         self
     }
 
+    /// When its pans activate (TS: `panActivation`), decided on the main
+    /// thread as the finger moves: its native pan (`pan_values`,
+    /// `on_pan_start`) starts then, and only then, so a drawer's pan that
+    /// opens it to the right leaves the drags to the left to its content
+    /// (`PanActivation::default().direction(PanDirection::Right)`), and
+    /// one from the screen's edge takes only those
+    /// (`PanActivation::default().edge(PanEdge::Left)`). A claim on the pan
+    /// ([`TouchClaim::on_pan`](super::TouchClaim::on_pan)) sets it too.
+    fn pan_activation(mut self, activation: PanActivation) -> Self {
+        super::host::set(self.node(), Prop::PanActivation(Some(activation)));
+        self
+    }
+
     /// As the responder, refuses to hand the touches over to an element
     /// around it that claims them (TS: `onResponderTerminationRequest`
     /// returning false); a native scroll view that started dragging first
@@ -2227,8 +2295,8 @@ pub trait Interactive: Element {
     }
 
     /// Where the view goes as a link, carried to the platform as data
-    /// ([`Prop::Href`]). `nsh-base`'s `Link` sets it from its `href`;
-    /// apps use `Link`.
+    /// ([`Prop::Href`]). `nsh-base`'s `Link` sets it from its `href`, and
+    /// `TextView` on the span of each of its links; apps use those.
     #[doc(hidden)]
     fn __link_href(mut self, href: impl IntoReactive<Option<SharedString>>) -> Self {
         super::host::bind_prop(self.node(), href, |href: Option<SharedString>| {
@@ -2651,15 +2719,20 @@ impl View {
     /// indicator on the selected tab): along the main axis of its parent
     /// (vertical in a flex column, else horizontal) it spans that element's
     /// frame, inside its own margins on that axis, wherever the element is
-    /// inside its parent; across it, its style places it (`bottom(px(0.))`
-    /// and a height for an underline, top and bottom insets for a pill),
-    /// so its style makes it [`Styled::absolute`]. The core places it after
-    /// each layout, with no layout of its own and no JS: following another
-    /// element changes its frame alone, and a layout that moves the element
-    /// moves it in the same batch. While `target` is `None`, or no laid
-    /// out element carries it, its style alone places it; hidden
-    /// (`display: none`) and shown again, it is placed at once. A view
-    /// that follows nothing costs no work after layout.
+    /// inside its parent, in a list's row too; across it, its style places
+    /// it (`bottom(px(0.))` and a height for an underline, top and bottom
+    /// insets for a pill), so its style makes it [`Styled::absolute`]. The
+    /// core places it after each layout, with no layout of its own and no
+    /// JS: following another element changes its frame alone, and a layout
+    /// that moves the element moves it in the same batch. Scroll views and
+    /// lists in between count where they are scrolled, and it spans only
+    /// the part of the element they show: outside them, it follows their
+    /// scrolling a frame or so behind; in the same scroll view's content as the
+    /// element, it moves with it natively. While `target` is `None`, or no
+    /// laid out element carries it (a list's row gone, or scrolled out of
+    /// view), its style alone places it; hidden (`display: none`) and shown
+    /// again, it is placed at once. A view that follows nothing costs no
+    /// work after layout.
     pub fn follow(mut self, target: impl IntoReactive<Option<super::ElementRef>>) -> Self {
         let target = (target.into_reactive()).map(|t: Option<super::ElementRef>| {
             t.and_then(|t| t.target()).map(super::FollowTarget)
@@ -3041,6 +3114,39 @@ impl<C: Component> ComponentElement<C> {
             spec: ComponentSpec::of::<C>,
             props: Box::new(props),
             on_event: Vec::new(),
+            by_name: None,
+        });
+        Self {
+            node,
+            _component: PhantomData,
+        }
+    }
+
+    /// The element of `C` given `props`, made by the component its UI set
+    /// registered, as a TSX app's `<RichEditor>`: this code does not name
+    /// `C`'s own code, so a web runtime keeps it in the side module of the
+    /// part that registers it and loads that module when the element is
+    /// first mounted. Until the part is registered it shows nothing; it
+    /// then becomes the component, with the props and handlers set here.
+    /// Off WebAssembly, where nothing is loaded later, it is made by type,
+    /// as [`Self::__new`] makes it.
+    pub fn by_name(props: C::Props) -> Self {
+        if cfg!(not(target_arch = "wasm32")) {
+            return Self::new(props);
+        }
+        Self::named(props)
+    }
+
+    /// [`Self::by_name`] on every target (its tests).
+    pub(crate) fn named(props: C::Props) -> Self {
+        let mut node = ElNode::new(Tag::View);
+        node.kind = ElKind::Component(ComponentEl {
+            name: super::component::name_of::<C>(),
+            make: super::component::missing_instance,
+            spec: super::component::missing_spec,
+            props: Box::new(props),
+            on_event: Vec::new(),
+            by_name: Some(std::any::TypeId::of::<C>()),
         });
         Self {
             node,

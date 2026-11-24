@@ -33,6 +33,11 @@ pub struct Modifiers {
     pub shift: bool,
     /// Command on Apple platforms; the Super (Windows) key elsewhere.
     pub cmd: bool,
+    /// AltGr (the DOM's `getModifierState("AltGraph")`): the key's
+    /// character came from the layout's AltGr level, so Control and Alt are
+    /// held to type text rather than for a shortcut. Only key events set
+    /// it; shortcuts never name or match it.
+    pub alt_graph: bool,
 }
 
 /// A key, by what it is on the US layout.
@@ -732,6 +737,12 @@ pub struct KeyBinding {
     /// ([`Keymap::find_at`]). Other bindings of those keys give way to the
     /// focused control.
     pub for_focus: bool,
+    /// It comes before the views' bindings of its keystroke, not after
+    /// them: an app takes a key a focused component binds (a query editor's
+    /// mod+enter over the editor's own), for as long as it keeps the
+    /// binding. The root's table puts such bindings after the others
+    /// (`Core::keymap`), where the newest that may fire wins.
+    pub over_focused: bool,
 }
 
 impl KeyBinding {
@@ -751,6 +762,7 @@ impl KeyBinding {
             pass_through: false,
             window: None,
             for_focus: false,
+            over_focused: false,
         }
     }
 
@@ -772,6 +784,13 @@ impl KeyBinding {
     /// `for_focus` ([`Self::for_focus`]).
     pub fn focus_keys(mut self, for_focus: bool) -> KeyBinding {
         self.for_focus = for_focus;
+        self
+    }
+
+    /// The binding coming before the views' bindings of its keystroke when
+    /// `over_focused` ([`Self::over_focused`]).
+    pub fn over_focused(mut self, over_focused: bool) -> KeyBinding {
+        self.over_focused = over_focused;
         self
     }
 }
@@ -1081,6 +1100,7 @@ mod tests {
                 alt,
                 shift,
                 cmd,
+                alt_graph: false,
             },
             key,
         }

@@ -3889,6 +3889,7 @@ dependencies = [
  "nsh-testing",
  "nsh-updater",
  "plist",
+ "quick-xml",
  "ring",
  "semver",
  "serde",
@@ -3926,6 +3927,7 @@ dependencies = [
  "nsh-macros",
  "nsh-updater",
  "ordered-float",
+ "percent-encoding",
  "resvg",
  "rust-i18n",
  "rustc-hash 2.1.3",
@@ -4004,15 +4006,25 @@ version = "0.6.0"
 dependencies = [
  "block2",
  "dispatch2",
+ "js-sys",
+ "libc",
  "log",
+ "ndk-context",
  "nsh-core",
+ "nsh-engine",
  "nsh-platform-android",
  "nsh-platform-apple",
  "nsh-platform-ios",
+ "nsh-testing",
  "objc2",
+ "objc2-core-foundation",
  "objc2-foundation",
  "objc2-ui-kit",
+ "serde_json",
  "tokio",
+ "wasm-bindgen",
+ "web-sys",
+ "windows",
 ]
 
 [[package]]
@@ -4062,6 +4074,7 @@ dependencies = [
  "quickjs-jit",
  "quickjs-jit-stdlib",
  "rustc-hash 2.1.3",
+ "rustls",
  "serde",
  "serde_json",
  "syn 2.0.119",
@@ -4069,6 +4082,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.28.0",
  "url",
+ "webpki-roots 0.26.11",
  "zstd",
 ]
 
@@ -4401,6 +4415,7 @@ dependencies = [
  "tar",
  "thiserror 2.0.21",
  "zip",
+ "zstd",
 ]
 
 [[package]]
@@ -7662,7 +7677,7 @@ dependencies = [
  "cfg-expr",
  "heck",
  "pkg-config",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "version-compare",
 ]
 
@@ -7681,9 +7696,9 @@ dependencies = [
 
 [[package]]
 name = "taffy"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c8480887e8803986d96a7173729565520d4bbb721ad6b7ad6941a22897207aa"
+checksum = "cae92eb1b204bfd239b5c463e1bd2c3ce4913d2d3abfb5c64f5cfee9d65e5c68"
 dependencies = [
  "serde",
  "slotmap",
