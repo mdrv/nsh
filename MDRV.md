@@ -137,6 +137,13 @@ Keep patches minimal, independent and re-submit upstream when feasible;
 drop them from this file when they land. Eval notes and benchmarks live
 out of tree (`/x/m/v270/nsh/`, never committed).
 
+The compat checker (`target/nsh-compat/nsh-compat`, `cargo xtask compat`)
+pins this checkout's `nsh_core`, so its `events` case needs to know the
+pan payload for `onPanMove`: the checkout carries an uncommitted
+`nsh_has_pan_move` build-script cfg and a shared `pan_payload` in
+`src/apps.rs` for it. Port it to the compat fork before relying on a
+fresh clone.
+
 ## Consumers
 
 - `nsh-bevy-test` (`/g/nsh-bevy-test`) — Bevy 3D viewport embedded in an
