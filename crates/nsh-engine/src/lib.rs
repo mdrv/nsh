@@ -4300,11 +4300,26 @@ fn release_spare_ops(ops: &mut Vec<Op>) {
 fn app_access(app: &App) -> Access {
     match app {
         App::Js(bundle) => bundle.policy.access(),
-        App::Rust(root) => Policy {
-            declared: root.capabilities_ref().cloned(),
-            ..Policy::default()
+        App::Rust(root) => {
+            let mut access = Policy {
+                declared: root.capabilities_ref().cloned(),
+                ..Policy::default()
+            }
+            .access();
+            // A Rust root without a declaration is a standalone cargo
+            // build the runner never saw (`nsh.json` `capabilities` are
+            // compiled in only by the runners): it reaches what an app
+            // without a declaration does, overlays included — the
+            // developer's own native code, like every other window kind
+            // it opens. A declared root gets exactly what it lists,
+            // overlays only through `capabilities.windows`.
+            if root.capabilities_ref().is_none()
+                && let Some(windows) = access.declared.windows.as_mut()
+            {
+                windows.overlay = true;
+            }
+            access
         }
-        .access(),
     }
 }
 
