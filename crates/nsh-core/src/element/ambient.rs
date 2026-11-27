@@ -1298,7 +1298,7 @@ impl Drop for SpeechRecognition {
 
 /// The value function `name` of the embedding app returns for `args`
 /// (TS: `host.call`), to await in a task.
-pub(crate) fn host_call(
+pub fn host_call(
     name: String,
     args: crate::JsonValue,
 ) -> Answer<Result<crate::JsonValue, super::JsError>> {
